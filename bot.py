@@ -1,20 +1,20 @@
 import asyncio
 import logging
+import os
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiohttp import web
 
-# Вставте токен бота від @BotFather:
-BOT_TOKEN = "1871367738:AAHHWt3e1WE5p_nV4RfhtbD_Bo4-j192X88"
+# Токен береться із Environment Variables у Render або вкажіть вручну:
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "ТВІЙ_ТЕЛЕГРАМ_ТОКЕН")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Сховище для черги та активних чатів (у пам'яті)
-queue = []          # Черга користувачів, які шукають пару
-active_chats = {}   # Активні чати: {user_id: partner_id}
+queue = []
+active_chats = {}
 
-# Клавіатури
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -54,7 +54,6 @@ async def search_partner(message: types.Message):
         await message.answer("Ти вже в черзі пошуку. Зачекай трохи...")
         return
 
-    # Якщо в черзі хтось є — з'єднуємо
     if queue:
         partner_id = queue.pop(0)
         active_chats[user_id] = partner_id
@@ -97,7 +96,6 @@ async def premium_menu(message: types.Message):
         parse_mode="Markdown"
     )
 
-# Пересилання усіх типів повідомлень (текст, фото, відео, voice)
 @dp.message()
 async def relay_messages(message: types.Message):
     user_id = message.from_user.id
@@ -113,8 +111,23 @@ async def relay_messages(message: types.Message):
     except Exception:
         await message.answer("Не вдалося доставити повідомлення. Співрозмовник міг заблокувати бота.")
 
+# Простий веб-сервер для того, щоб Render бачив, що сервіс працює
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
 async def main():
     logging.basicConfig(level=logging.INFO)
+    
+    # Запускаємо веб-сервер для Render на призначеному порту
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
+    # Запускаємо бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
