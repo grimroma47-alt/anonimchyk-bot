@@ -4,6 +4,7 @@ import logging
 import os
 import time
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -28,6 +29,13 @@ if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
+
+# Оплата криптою через @CryptoBot (https://t.me/CryptoBot -> Crypto Pay -> Create App)
+CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN", "")
+CRYPTO_PAY_API = "https://pay.crypt.bot/api"
+# Орієнтовний курс USDT -> грн для нарахування балансу (онови за потреби)
+USD_UAH_RATE = float(os.getenv("USD_UAH_RATE", "41"))
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -40,6 +48,18 @@ users_db: dict[int, dict] = {}
 queue: list[int] = []
 active_chats: dict[int, int] = {}
 user_counter = 1000
+
+banned_users: set[int] = set()
+reports: list[dict] = []  # {"id", "from", "on", "time", "status"}
+report_counter = 0
+authorized_admins: set[int] = set()  # хто вже ввів пароль у цій сесії
+
+# Крипто-рахунки, очікують оплати: invoice_id -> {"user_id", "amount" (USDT), "credit" (грн)}
+pending_crypto_invoices: dict[str, dict] = {}
+
+# Пакети поповнення
+STAR_PACKAGES = [50, 100, 250, 500]  # Telegram Stars; 1 star = 1 грн на баланс
+CRYPTO_PACKAGES = [1, 5, 10, 20]  # USDT
 
 DAY = 86400
 
@@ -78,6 +98,13 @@ class ProfileStates(StatesGroup):
 
 class WalletStates(StatesGroup):
     change_nick = State()
+
+
+class AdminStates(StatesGroup):
+    password = State()
+    ban_id = State()
+    unban_id = State()
+    broadcast = State()
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +150,21 @@ def get_wallet_keyboard():
         inline_keyboard=[
             [InlineKeyboardButton(text="💳 Поповнити баланс", callback_data="deposit")],
             [InlineKeyboardButton(text=f"✏️ Змінити нік ({NICK_PRICE} грн)", callback_data="buy_nick")],
+        ]
+    )
+
+
+def get_admin_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
+            [InlineKeyboardButton(text="🚨 Скарги", callback_data="adm_reports_0")],
+            [
+                InlineKeyboardButton(text="⛔ Забанити", callback_data="adm_ban"),
+                InlineKeyboardButton(text="✅ Розбанити", callback_data="adm_unban"),
+            ],
+            [InlineKeyboardButton(text="📋 Список забанених", callback_data="adm_banlist")],
+            [InlineKeyboardButton(text="📢 Розсилка всім", callback_data="adm_broadcast")],
         ]
     )
 
@@ -181,6 +223,81 @@ def end_chat(user_id: int):
     if partner_id is not None:
         active_chats.pop(partner_id, None)
     return partner_id
+
+
+# ---------------------------------------------------------------------------
+# CryptoPay (@CryptoBot) — оплата криптою
+# ---------------------------------------------------------------------------
+async def create_crypto_invoice(user_id: int, amount_usdt: float) -> dict | None:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{CRYPTO_PAY_API}/createInvoice",
+                headers={"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN},
+                json={
+                    "asset": "USDT",
+                    "amount": str(amount_usdt),
+                    "description": f"Поповнення балансу боту (user {user_id})",
+                    "payload": str(user_id),
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json()
+    except Exception as e:
+        logging.warning("Помилка створення CryptoPay рахунку: %s", e)
+        return None
+    if not data.get("ok"):
+        logging.warning("CryptoPay createInvoice відмова: %s", data)
+        return None
+    return data["result"]
+
+
+async def check_and_credit_invoice(invoice_id: str) -> bool:
+    """Перевіряє статус рахунку і нараховує баланс, якщо оплачено. True, якщо нарахував."""
+    info = pending_crypto_invoices.get(invoice_id)
+    if info is None:
+        return False
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CRYPTO_PAY_API}/getInvoices",
+                headers={"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN},
+                params={"invoice_ids": invoice_id},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json()
+    except Exception as e:
+        logging.warning("Помилка перевірки CryptoPay: %s", e)
+        return False
+
+    if not data.get("ok"):
+        return False
+    items = data["result"]["items"]
+    if not items or items[0]["status"] != "paid":
+        return False
+
+    pending_crypto_invoices.pop(invoice_id, None)
+    u = init_user(info["user_id"])
+    u["balance"] += info["credit"]
+    return True
+
+
+async def crypto_poll_loop():
+    """Фоново перевіряє неоплачені крипто-рахунки й нараховує баланс автоматично."""
+    while True:
+        await asyncio.sleep(20)
+        if not CRYPTO_PAY_TOKEN or not pending_crypto_invoices:
+            continue
+        for invoice_id in list(pending_crypto_invoices.keys()):
+            info = pending_crypto_invoices.get(invoice_id)
+            if info is None:
+                continue
+            credited = await check_and_credit_invoice(invoice_id)
+            if credited:
+                await safe_send(
+                    info["user_id"],
+                    f"✅ Оплату {info['amount']} USDT отримано! Баланс поповнено на {info['credit']:.2f} грн.",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -324,13 +441,125 @@ async def wallet_handler(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "deposit")
 async def deposit_start(call: types.CallbackQuery):
-    # Раніше баланс поповнювався будь-яким числом безкоштовно — це було критичною дірою.
-    # Тут потрібна реальна оплата (LiqPay, Monobank, Telegram Payments). Поки що — через адміна.
+    buttons = [[InlineKeyboardButton(text="⭐ Telegram Stars", callback_data="dep_stars")]]
+    if CRYPTO_PAY_TOKEN:
+        buttons.append([InlineKeyboardButton(text="💎 Крипта (USDT/TON)", callback_data="dep_crypto")])
     await call.message.answer(
-        "💳 Для поповнення зверніться до адміністратора та вкажіть свій ID:\n"
-        f"<code>{call.from_user.id}</code>"
+        "💳 Оберіть спосіб поповнення балансу:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await call.answer()
+
+
+@dp.callback_query(F.data == "dep_stars")
+async def dep_stars_menu(call: types.CallbackQuery):
+    buttons = [
+        [InlineKeyboardButton(text=f"⭐ {a} → {a} грн", callback_data=f"dep_stars_{a}")]
+        for a in STAR_PACKAGES
+    ]
+    await call.message.answer(
+        "⭐ Оберіть пакет Telegram Stars:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("dep_stars_"))
+async def dep_stars_pay(call: types.CallbackQuery):
+    amount = int(call.data.rsplit("_", 1)[-1])
+    await bot.send_invoice(
+        chat_id=call.message.chat.id,
+        title=f"Поповнення на {amount} грн",
+        description=f"Купівля {amount} Telegram Stars для поповнення балансу бота",
+        payload=f"stars_{amount}_{call.from_user.id}",
+        provider_token="",  # для Stars (валюта XTR) токен провайдера не потрібен
+        currency="XTR",
+        prices=[types.LabeledPrice(label=f"{amount} Stars", amount=amount)],
+    )
+    await call.answer()
+
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: types.PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: types.Message):
+    payment = message.successful_payment
+    if payment.currency != "XTR":
+        return
+    amount = payment.total_amount  # для XTR це кількість зірок напряму
+    u = init_user(message.from_user.id)
+    u["balance"] += amount
+    await message.answer(
+        f"✅ Оплату отримано! Баланс поповнено на {amount} грн.", reply_markup=get_main_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "dep_crypto")
+async def dep_crypto_menu(call: types.CallbackQuery):
+    if not CRYPTO_PAY_TOKEN:
+        await call.answer("Оплата криптою зараз недоступна", show_alert=True)
+        return
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"{a} USDT (~{a * USD_UAH_RATE:.0f} грн)", callback_data=f"dep_crypto_{a}"
+            )
+        ]
+        for a in CRYPTO_PACKAGES
+    ]
+    await call.message.answer(
+        "💎 Оберіть суму поповнення в USDT:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("dep_crypto_"))
+async def dep_crypto_create(call: types.CallbackQuery):
+    amount = float(call.data.rsplit("_", 1)[-1])
+    result = await create_crypto_invoice(call.from_user.id, amount)
+    if result is None:
+        await call.message.answer("❌ Не вдалося створити рахунок. Спробуйте пізніше.")
+        await call.answer()
+        return
+
+    invoice_id = str(result["invoice_id"])
+    pay_url = result.get("pay_url") or result.get("bot_invoice_url") or result.get("mini_app_invoice_url")
+    credit = amount * USD_UAH_RATE
+    pending_crypto_invoices[invoice_id] = {
+        "user_id": call.from_user.id,
+        "amount": amount,
+        "credit": credit,
+    }
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатити", url=pay_url)],
+            [InlineKeyboardButton(text="✅ Перевірити оплату", callback_data=f"dep_check_{invoice_id}")],
+        ]
+    )
+    await call.message.answer(
+        f"Рахунок на {amount} USDT створено.\n"
+        f"Після оплати баланс поповниться автоматично (~{credit:.0f} грн), "
+        "або натисніть «Перевірити оплату».",
+        reply_markup=kb,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("dep_check_"))
+async def dep_check(call: types.CallbackQuery):
+    invoice_id = call.data[len("dep_check_"):]
+    if invoice_id not in pending_crypto_invoices:
+        await call.answer("Рахунок вже оброблено або не знайдено", show_alert=True)
+        return
+    credited = await check_and_credit_invoice(invoice_id)
+    if credited:
+        await call.message.answer("✅ Оплату підтверджено, баланс поповнено!")
+        await call.answer()
+    else:
+        await call.answer("Оплату ще не отримано. Спробуйте за хвилину.", show_alert=True)
 
 
 async def start_nick_change(call: types.CallbackQuery, state: FSMContext):
@@ -415,6 +644,11 @@ async def buy_item(call: types.CallbackQuery, state: FSMContext):
 async def search_partner(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
+
+    if user_id in banned_users:
+        await message.answer("⛔ Вас заблоковано в цьому боті.")
+        return
+
     u = init_user(user_id)
 
     if user_id in active_chats:
@@ -473,21 +707,239 @@ async def stop_chat(message: types.Message, state: FSMContext):
 @dp.message(F.text == BTN_REPORT)
 async def report_handler(message: types.Message):
     # Раніше ця кнопка не мала обробника, і текст "🚨 Поскаржитися" пересилався співрозмовнику.
+    global report_counter
     user_id = message.from_user.id
     partner_id = active_chats.get(user_id)
     if partner_id is None:
         await message.answer("Скарга можлива лише під час чату.", reply_markup=get_main_keyboard())
         return
+
+    report_counter += 1
+    reports.append(
+        {
+            "id": report_counter,
+            "from": user_id,
+            "on": partner_id,
+            "time": time.strftime("%d.%m.%Y %H:%M"),
+            "status": "нова",
+        }
+    )
+
     if ADMIN_ID:
         await safe_send(
             ADMIN_ID,
-            f"🚨 Скарга\nВід: <code>{user_id}</code>\nНа: <code>{partner_id}</code>",
+            f"🚨 Нова скарга #{report_counter}\nВід: <code>{user_id}</code>\nНа: <code>{partner_id}</code>\n\n"
+            "Переглянути список: /admin",
         )
     end_chat(user_id)
     await message.answer(
         "🚨 Скаргу надіслано, чат завершено. Дякуємо!", reply_markup=get_main_keyboard()
     )
     await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+
+
+# ---------------------------------------------------------------------------
+# Адмін-панель (прихована, тільки для ADMIN_ID + пароль)
+# ---------------------------------------------------------------------------
+@dp.message(Command("admin"))
+async def admin_entry(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if not ADMIN_ID or user_id != ADMIN_ID:
+        return  # для всіх інших ця команда ніби не існує
+
+    if not ADMIN_PASSWORD:
+        await message.answer("⚠️ Не задано ADMIN_PASSWORD у змінних середовища.")
+        return
+
+    if user_id in authorized_admins:
+        await message.answer("🔐 <b>Адмін-панель</b>", reply_markup=get_admin_keyboard())
+        return
+
+    await message.answer("🔐 Введіть пароль для доступу до адмін-панелі:")
+    await state.set_state(AdminStates.password)
+
+
+@dp.message(AdminStates.password, F.text)
+async def admin_password(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await state.clear()
+    if message.text.strip() != ADMIN_PASSWORD:
+        await message.answer("❌ Невірний пароль.")
+        return
+    authorized_admins.add(user_id)
+    await message.answer("✅ Доступ надано.\n\n🔐 <b>Адмін-панель</b>", reply_markup=get_admin_keyboard())
+
+
+def admin_only(func):
+    async def wrapper(call: types.CallbackQuery, *args, **kwargs):
+        if call.from_user.id != ADMIN_ID or call.from_user.id not in authorized_admins:
+            await call.answer("Доступ заборонено", show_alert=True)
+            return
+        return await func(call, *args, **kwargs)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+
+@dp.callback_query(F.data == "adm_stats")
+@admin_only
+async def adm_stats(call: types.CallbackQuery):
+    total_users = len(users_db)
+    premium_count = sum(1 for u in users_db.values() if is_premium(u))
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+        f"• Користувачів: {total_users}\n"
+        f"• У черзі пошуку: {len(queue)}\n"
+        f"• Активних чатів: {len(active_chats) // 2}\n"
+        f"• Premium: {premium_count}\n"
+        f"• Забанено: {len(banned_users)}\n"
+        f"• Скарг усього: {len(reports)}\n"
+    )
+    await call.message.answer(text)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_reports_"))
+@admin_only
+async def adm_reports(call: types.CallbackQuery):
+    page = int(call.data.split("_")[-1])
+    per_page = 5
+    pending = [r for r in reports if r["status"] == "нова"]
+
+    if not pending:
+        await call.message.answer("🚨 Нових скарг немає.")
+        await call.answer()
+        return
+
+    chunk = pending[page * per_page : (page + 1) * per_page]
+    if not chunk:
+        await call.answer("Більше немає скарг", show_alert=True)
+        return
+
+    lines = ["🚨 <b>Скарги (нові):</b>\n"]
+    buttons = []
+    for r in chunk:
+        lines.append(f"#{r['id']} — {r['time']}\nВід <code>{r['from']}</code> на <code>{r['on']}</code>\n")
+        buttons.append(
+            [
+                InlineKeyboardButton(text=f"⛔ Бан #{r['id']} (на кого скарга)", callback_data=f"adm_banrep_{r['id']}"),
+                InlineKeyboardButton(text=f"✅ Закрити #{r['id']}", callback_data=f"adm_closerep_{r['id']}"),
+            ]
+        )
+    if len(pending) > (page + 1) * per_page:
+        buttons.append([InlineKeyboardButton(text="➡️ Далі", callback_data=f"adm_reports_{page + 1}")])
+
+    await call.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_banrep_"))
+@admin_only
+async def adm_ban_from_report(call: types.CallbackQuery):
+    report_id = int(call.data.split("_")[-1])
+    rep = next((r for r in reports if r["id"] == report_id), None)
+    if rep is None:
+        await call.answer("Скаргу не знайдено", show_alert=True)
+        return
+    banned_users.add(rep["on"])
+    rep["status"] = "оброблена"
+    await safe_send(rep["on"], "⛔ Вас заблоковано адміністратором за скаргою.")
+    await call.message.answer(f"⛔ Користувача <code>{rep['on']}</code> забанено.")
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_closerep_"))
+@admin_only
+async def adm_close_report(call: types.CallbackQuery):
+    report_id = int(call.data.split("_")[-1])
+    rep = next((r for r in reports if r["id"] == report_id), None)
+    if rep is None:
+        await call.answer("Скаргу не знайдено", show_alert=True)
+        return
+    rep["status"] = "закрита"
+    await call.message.answer(f"✅ Скаргу #{report_id} закрито без дій.")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_ban")
+@admin_only
+async def adm_ban_start(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Введіть user_id, якого треба забанити:")
+    await state.set_state(AdminStates.ban_id)
+    await call.answer()
+
+
+@dp.message(AdminStates.ban_id, F.text)
+async def adm_ban_finish(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    try:
+        target = int(message.text.strip())
+    except ValueError:
+        await message.answer("Потрібно надіслати число (user_id).")
+        return
+    banned_users.add(target)
+    end_chat(target)
+    if target in queue:
+        queue.remove(target)
+    await message.answer(f"⛔ Користувача <code>{target}</code> забанено.")
+    await safe_send(target, "⛔ Вас заблоковано адміністратором.")
+
+
+@dp.callback_query(F.data == "adm_unban")
+@admin_only
+async def adm_unban_start(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Введіть user_id, якого треба розбанити:")
+    await state.set_state(AdminStates.unban_id)
+    await call.answer()
+
+
+@dp.message(AdminStates.unban_id, F.text)
+async def adm_unban_finish(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    try:
+        target = int(message.text.strip())
+    except ValueError:
+        await message.answer("Потрібно надіслати число (user_id).")
+        return
+    banned_users.discard(target)
+    await message.answer(f"✅ Користувача <code>{target}</code> розбанено.")
+    await safe_send(target, "✅ Вас розблоковано адміністратором.")
+
+
+@dp.callback_query(F.data == "adm_banlist")
+@admin_only
+async def adm_banlist(call: types.CallbackQuery):
+    if not banned_users:
+        await call.message.answer("Список забанених порожній.")
+    else:
+        ids = "\n".join(f"• <code>{uid}</code>" for uid in sorted(banned_users))
+        await call.message.answer(f"⛔ <b>Забанені користувачі:</b>\n{ids}")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_broadcast")
+@admin_only
+async def adm_broadcast_start(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Введіть текст розсилки для ВСІХ користувачів (або /cancel):")
+    await state.set_state(AdminStates.broadcast)
+    await call.answer()
+
+
+@dp.message(AdminStates.broadcast, F.text)
+async def adm_broadcast_finish(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    text = message.text
+    sent, failed = 0, 0
+    for uid in list(users_db.keys()):
+        ok = await safe_send(uid, f"📢 {esc(text)}")
+        sent += ok
+        failed += not ok
+    await message.answer(f"✅ Розіслано: {sent}. Не вдалося: {failed}.")
 
 
 # ---------------------------------------------------------------------------
@@ -534,11 +986,13 @@ async def start_web_server() -> web.AppRunner:
 async def main():
     logging.basicConfig(level=logging.INFO)
     runner = await start_web_server()
+    poll_task = asyncio.create_task(crypto_poll_loop())
     try:
         # Скидаємо webhook і старі апдейти, щоб менше конфліктувати при редеплої
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
+        poll_task.cancel()
         await bot.session.close()
         await runner.cleanup()
 
