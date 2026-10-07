@@ -303,3 +303,44 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+import asyncio
+import logging
+import os
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import CommandStart
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiohttp import web
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВІЙ_ТЕЛЕГРАМ_ТОКЕН")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# --- Фейковый веб-сервер для Render ---
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render автоматически передает порт через переменную окружения PORT
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+# --- Основной код бота ---
+# (Ваши хэндлеры start_handler, search_partner, stop_chat и т.д.)
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    
+    # Запускаем веб-сервер параллельно с ботом
+    await start_web_server()
+    
+    # Запускаем polling бота
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
