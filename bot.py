@@ -5,38 +5,42 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
-BOT_TOKEN = "ТВІЙ_ТЕЛЕГРАМ_ТОКЕН"
+BOT_TOKEN = "1871367738:AAE_pjFf44VESFaF1ecR7ElDLk7FiNfDKXk"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Бази даних у пам'яті
-users_profile = {}  # {user_id: {"gender": "...", "age": ...}}
-queue = []          # Черга користувачів
-active_chats = {}   # {user_id: partner_id}
+# База даних у пам'яті (у продакшені краще використовувати SQLite/PostgreSQL)
+users_db = {}
+# Формат: user_id: {
+#     "custom_id": "ID_1001", "nickname": "NoName", "gender": "Не вказано",
+#     "age": "Не вказано", "country": "Не вказано", "balance": 0.0,
+#     "is_premium": False, "archive": []
+# }
 
-# Створення станів для опитання (FSM)
-class Registration(StatesGroup):
+queue = []
+active_chats = {}
+user_counter = 1000
+
+# FSM для реєстрації/профілю, зміни ніку та поповнення
+class ProfileStates(StatesGroup):
     gender = State()
     age = State()
+    country = State()
 
-# Клавіатури
-def get_gender_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Хлопець 🧑"), KeyboardButton(text="Дівчина 👩")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
+class WalletStates(StatesGroup):
+    change_nick = State()
+    deposit_amount = State()
 
+# --- Клавіатури ---
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔍 Шукати співрозмовника")],
-            [KeyboardButton(text="👤 Мій профіль"), KeyboardButton(text="⭐ Преміум / Фільтри")]
+            [KeyboardButton(text="🏪 Магазин"), KeyboardButton(text="👛 Гаманець")],
+            [KeyboardButton(text="👤 Мій профіль / Архів"), KeyboardButton(text="⚙️ Налаштування")]
         ],
         resize_keyboard=True
     )
@@ -44,77 +48,197 @@ def get_main_keyboard():
 def get_chat_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="❌ Завершити чат")]
+            [KeyboardButton(text="❌ Завершити чат"), KeyboardButton(text="🚨 Поскаржитися")]
         ],
         resize_keyboard=True
     )
 
-# --- 1. СТАРТ ТА РЕЄСТРАЦІЯ ---
+def get_shop_keyboard():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1. Зміна нікнейму — 20 грн", callback_data="buy_nick")],
+        [InlineKeyboardButton(text="2. Пріоритет у пошуку (1 день) — 30 грн", callback_data="buy_prio_1d")],
+        [InlineKeyboardButton(text="3. VIP-значок у профілі — 40 грн", callback_data="buy_vip_badge")],
+        [InlineKeyboardButton(text="4. Розширений чорний список — 50 грн", callback_data="buy_blacklist")],
+        [InlineKeyboardButton(text="5. Доступ до фільтру за статтю (1 тиж) — 65 грн", callback_data="buy_gender_filter")],
+        [InlineKeyboardButton(text="6. Доступ до фільтру за віком (1 тиж) — 65 грн", callback_data="buy_age_filter")],
+        [InlineKeyboardButton(text="7. Premium на 1 тиждень — 80 грн", callback_data="buy_prem_1w")],
+        [InlineKeyboardButton(text="8. Premium на 1 місяць — 180 грн", callback_data="buy_prem_1m")],
+        [InlineKeyboardButton(text="9. Premium на 3 місяці — 350 грн", callback_data="buy_prem_3m")],
+        [InlineKeyboardButton(text="10. Безлімітний Premium (назавжди) — 850 грн", callback_data="buy_prem_forever")]
+    ])
+    return keyboard
 
+def get_wallet_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Поповнити баланс", callback_data="deposit")],
+        [InlineKeyboardButton(text="✏️ Змінити ID на нікнейм (20 грн)", callback_data="change_nick_btn")]
+    ])
+
+# --- Допоміжна функція реєстрації ---
+def init_user(user_id):
+    global user_counter
+    if user_id not in users_db:
+        user_counter += 1
+        users_db[user_id] = {
+            "custom_id": f"ID_{user_counter}",
+            "nickname": f"Користувач_{user_counter}",
+            "gender": "Не вказано",
+            "age": "Не вказано",
+            "country": "Не вказано",
+            "balance": 0.0,
+            "is_premium": False,
+            "archive": []  # Зберігає історію змін профілю
+        }
+
+# --- Обробники команд ---
 @dp.message(CommandStart())
-async def start_handler(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    
-    # Якщо користувач вже має профіль
-    if user_id in users_profile:
-        await message.answer(
-            "З поверненням до ANONimchyk! 🤫\nНатисни кнопку нижче, щоб розпочати пошук.",
-            reply_markup=get_main_keyboard()
-        )
-        return
-
-    # Якщо профілю немає — починаємо опитування
-    await state.set_state(Registration.gender)
+async def start_handler(message: types.Message):
+    init_user(message.from_user.id)
     await message.answer(
-        "Привіт! Ласкаво просимо до анонімного чату ANONimchyk 🤫\n\n"
-        "Перед початком давай познайомимося. **Обери свою стать:**",
-        reply_markup=get_gender_keyboard(),
+        f"Привіт, {message.from_user.first_name}! Вітаємо в анонімному чаті! 🤫\n\n"
+        f"Твій унікальний номер: **{users_db[message.from_user.id]['custom_id']}**\n"
+        "Заповни свій профіль, щоб отримувати кращі рекомендації в пошуку.",
+        reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
     )
 
-@dp.message(Registration.gender, F.text.in_(["Хлопець 🧑", "Дівчина 👩"]))
+# --- Профіль та Архів ---
+@dp.message(F.text == "👤 Мій профіль / Архів")
+async def profile_handler(message: types.Message, state: FSMContext):
+    init_user(message.from_user.id)
+    u = users_db[message.from_user.id]
+    
+    archive_text = "\n".join(u["archive"][-5:]) if u["archive"] else "Історія порожня"
+    
+    text = (
+        f"👤 **Твій профіль:**\n"
+        f"• **ID / Нік:** {u['nickname']} ({u['custom_id']})\n"
+        f"• **Стать:** {u['gender']}\n"
+        f"• **Вік:** {u['age']}\n"
+        f"• **Країна:** {u['country']}\n"
+        f"• **Преміум:** {'Так 💎' if u['is_premium'] else 'Ні ❌'}\n\n"
+        f"📜 **Архів останніх змін профілю:**\n{archive_text}\n\n"
+        "Хочеш оновити свої дані? Введи /edit_profile"
+    )
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("edit_profile"))
+async def edit_profile_start(message: types.Message, state: FSMContext):
+    await message.answer("Вкажи свою стать (Хлопець / Дівчина):")
+    await state.set_state(ProfileStates.gender)
+
+@dp.message(ProfileStates.gender)
 async def process_gender(message: types.Message, state: FSMContext):
     await state.update_data(gender=message.text)
-    await state.set_state(Registration.age)
+    await message.answer("Вкажи свій вік (наприклад, 18, 22 або <18):")
+    await state.set_state(ProfileStates.age)
+
+@dp.message(ProfileStates.age)
+async def process_age(message: types.Message, state: FSMContext):
+    await state.update_data(age=message.text)
+    await message.answer("Вкажи свою країну або місто:")
+    await state.set_state(ProfileStates.country)
+
+@dp.message(ProfileStates.country)
+async def process_country(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    u = users_db[message.from_user.id]
+    
+    # Збереження в архів
+    old_info = f"Стать: {u['gender']}, Вік: {u['age']}, Країна: {u['country']}"
+    u["archive"].append(old_info)
+    
+    # Оновлення нових даних
+    u["gender"] = data["gender"]
+    u["age"] = data["age"]
+    u["country"] = message.text
+    
+    await state.clear()
+    await message.answer("✅ Профіль успішно оновлено! Дані збережено в архів.", reply_markup=get_main_keyboard())
+
+# --- Гаманець ---
+@dp.message(F.text == "👛 Гаманець")
+async def wallet_handler(message: types.Message):
+    init_user(message.from_user.id)
+    u = users_db[message.from_user.id]
+    text = (
+        f"👛 **Твій Гаманець**\n\n"
+        f"• **Поточний баланс:** {u['balance']} грн\n"
+        f"• **Ваш ID/Нік:** {u['nickname']}\n\n"
+        "Тут ви можете поповнити баланс або змінити системний номер на свій нікнейм."
+    )
+    await message.answer(text, reply_markup=get_wallet_keyboard(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "deposit")
+async def deposit_start(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Введіть суму в гривнях для поповнення (наприклад: 50, 100, 200):")
+    await state.set_state(WalletStates.deposit_amount)
+    await call.answer()
+
+@dp.message(WalletStates.deposit_amount)
+async def deposit_finish(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        if amount <= 0:
+            raise ValueError
+        users_db[message.from_user.id]["balance"] += amount
+        await message.answer(f"✅ Успішно! Ваш баланс поповнено на {amount} грн.", reply_markup=get_main_keyboard())
+        await state.clear()
+    except ValueError:
+        await message.answer("Будь ласка, введіть коректне число більше 0.")
+
+@dp.callback_query(F.data == "change_nick_btn")
+async def change_nick_start(call: types.CallbackQuery, state: FSMContext):
+    u = users_db[call.from_user.id]
+    if u["balance"] < 20:
+        await call.message.answer("❌ Недостатньо коштів! Зміна ніку коштує 20 грн. Поповніть гаманець.")
+    else:
+        await call.message.answer("Введіть свій новий бажаний нікнейм:")
+        await state.set_state(WalletStates.change_nick)
+    await call.answer()
+
+@dp.message(WalletStates.change_nick)
+async def change_nick_finish(message: types.Message, state: FSMContext):
+    u = users_db[message.from_user.id]
+    u["balance"] -= 20
+    u["nickname"] = message.text
+    await message.answer(f"🎉 Ваш нікнейм успішно змінено на: **{u['nickname']}** (Списано 20 грн).", parse_mode="Markdown")
+    await state.clear()
+
+# --- Магазин (10 товарів) ---
+@dp.message(F.text == "🏪 Магазин")
+async def shop_handler(message: types.Message):
     await message.answer(
-        "Чудово! Тепер **вкажи свій вік** (введи число від 12 до 99):",
-        reply_markup=ReplyKeyboardRemove(),
+        "🏪 **Магазин послуг та товарів**\n\nОберіть потрібну позицію для купівлі:",
+        reply_markup=get_shop_keyboard(),
         parse_mode="Markdown"
     )
 
-@dp.message(Registration.gender)
-async def process_gender_invalid(message: types.Message):
-    await message.answer("Будь ласка, обери варіант з кнопки нижче 👇", reply_markup=get_gender_keyboard())
-
-@dp.message(Registration.age)
-async def process_age(message: types.Message, state: FSMContext):
-    if not message.text.isdigit() or not (12 <= int(message.text) <= 99):
-        await message.answer("Будь ласка, введи коректний вік числом (від 12 до 99):")
-        return
-
-    user_data = await state.get_data()
-    users_profile[message.from_user.id] = {
-        "gender": user_data["gender"],
-        "age": int(message.text)
+@dp.callback_query(F.data.startswith("buy_"))
+async def buy_item(call: types.CallbackQuery):
+    prices = {
+        "buy_nick": 20, "buy_prio_1d": 30, "buy_vip_badge": 40,
+        "buy_blacklist": 50, "buy_gender_filter": 65, "buy_age_filter": 65,
+        "buy_prem_1w": 80, "buy_prem_1m": 180, "buy_prem_3m": 350, "buy_prem_forever": 850
     }
-    
-    await state.clear()
-    await message.answer(
-        "Реєстрацію успішно завершено! 🎉\nТепер ти можеш шукати співрозмовників.",
-        reply_markup=get_main_keyboard()
-    )
+    item_code = call.data
+    price = prices.get(item_code, 0)
+    u = users_db[call.from_user.id]
 
-# --- 2. ПОШУК ТА ЧАТ ---
+    if u["balance"] < price:
+        await call.message.answer(f"❌ Недостатньо коштів. Ціна: {price} грн. Ваш баланс: {u['balance']} грн.")
+    else:
+        u["balance"] -= price
+        if "prem" in item_code:
+            u["is_premium"] = True
+        await call.message.answer(f"🎉 Вітаємо з покупкою! Списано {price} грн. Дякуємо за підтримку!")
+    await call.answer()
 
-@dp.message(Command("search"))
+# --- Пошук та Чат ---
 @dp.message(F.text == "🔍 Шукати співрозмовника")
-async def search_partner(message: types.Message, state: FSMContext):
+async def search_partner(message: types.Message):
     user_id = message.from_user.id
-
-    # Перевірка реєстрації
-    if user_id not in users_profile:
-        await start_handler(message, state)
-        return
+    init_user(user_id)
 
     if user_id in active_chats:
         await message.answer("Ти вже перебуваєш у чаті!")
@@ -129,13 +253,15 @@ async def search_partner(message: types.Message, state: FSMContext):
         active_chats[user_id] = partner_id
         active_chats[partner_id] = user_id
 
-        await bot.send_message(user_id, "Партнера знайдено! Приємного спілкування 🤫", reply_markup=get_chat_keyboard())
-        await bot.send_message(partner_id, "Партнера знайдено! Приємного спілкування 🤫", reply_markup=get_chat_keyboard())
+        p_info = users_db[partner_id]
+        u_info = users_db[user_id]
+
+        await bot.send_message(user_id, f"Партнера знайдено! 🤫\nІнфо: {p_info['gender']}, {p_info['age']} років, {p_info['country']}", reply_markup=get_chat_keyboard())
+        await bot.send_message(partner_id, f"Партнера знайдено! 🤫\nІнфо: {u_info['gender']}, {u_info['age']} років, {u_info['country']}", reply_markup=get_chat_keyboard())
     else:
         queue.append(user_id)
-        await message.answer("Шукаємо співрозмовника... Зачекай ⏳", reply_markup=ReplyKeyboardRemove())
+        await message.answer("Шукаємо співрозмовника... Зачекай ⏳")
 
-@dp.message(Command("stop"))
 @dp.message(F.text == "❌ Завершити чат")
 async def stop_chat(message: types.Message):
     user_id = message.from_user.id
@@ -156,48 +282,20 @@ async def stop_chat(message: types.Message):
     await message.answer("Чат завершено.", reply_markup=get_main_keyboard())
     await bot.send_message(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
 
-# --- 3. ПРОФІЛЬ ТА ПРЕМІУМ ---
-
-@dp.message(F.text == "👤 Мій профіль")
-async def show_profile(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if user_id not in users_profile:
-        await start_handler(message, state)
-        return
-    
-    prof = users_profile[user_id]
-    await message.answer(f"Твій профіль:\n• Стать: {prof['gender']}\n• Вік: {prof['age']}")
-
-@dp.message(F.text == "⭐ Преміум / Фільтри")
-async def premium_menu(message: types.Message):
-    await message.answer(
-        "💎 **Преміум підписка** дозволяє обирати стать та вік співрозмовника!\n\n"
-        "Обери тариф:\n"
-        "1️⃣ **1 тиждень** — $2.99\n"
-        "2️⃣ **1 місяць** — $7.99\n"
-        "3️⃣ **1 рік** — $39.99",
-        parse_mode="Markdown"
-    )
-
-# --- 4. ПЕРЕСИЛАННЯ ПОВІДОМЛЕНЬ ---
-
+# --- Пересилання повідомлень ---
 @dp.message()
-async def relay_messages(message: types.Message, state: FSMContext):
+async def relay_messages(message: types.Message):
     user_id = message.from_user.id
-
-    if user_id not in users_profile:
-        await start_handler(message, state)
-        return
 
     if user_id not in active_chats:
-        await message.answer("Щоб відправляти повідомлення, спочатку знайди співрозмовника!", reply_markup=get_main_keyboard())
+        await message.answer("Скористайтеся меню нижче:", reply_markup=get_main_keyboard())
         return
 
     partner_id = active_chats[user_id]
     try:
         await message.copy_to(chat_id=partner_id)
     except Exception:
-        await message.answer("Не вдалося доставити повідомлення. Співрозмовник міг заблокувати бота.")
+        await message.answer("Не вдалося доставити повідомлення.")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
