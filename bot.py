@@ -76,6 +76,7 @@ SHOP = {
     "blacklist": ("Розширений чорний список", 50, "blacklist", None),
     "gender_filter": ("Фільтр за статтю (1 тиждень)", 65, "gender_filter", 7 * DAY),
     "age_filter": ("Фільтр за віком (1 тиждень)", 65, "age_filter", 7 * DAY),
+    "country_filter": ("Фільтр за країною (1 тиждень)", 65, "country_filter", 7 * DAY),
     "prem_1w": ("Premium на 1 тиждень", 80, "premium", 7 * DAY),
     "prem_1m": ("Premium на 1 місяць", 180, "premium", 30 * DAY),
     "prem_3m": ("Premium на 3 місяці", 350, "premium", 90 * DAY),
@@ -150,6 +151,25 @@ LINK_REGEX = re.compile(
 )
 
 # ---------------------------------------------------------------------------
+# Чорний список (особисте блокування співрозмовників)
+# ---------------------------------------------------------------------------
+BLACKLIST_LIMIT_FREE = int(os.getenv("BLACKLIST_LIMIT_FREE", "20"))
+BLACKLIST_LIMIT_PLUS = int(os.getenv("BLACKLIST_LIMIT_PLUS", "100"))  # з перком "blacklist" або Premium
+
+# ---------------------------------------------------------------------------
+# Реальні фільтри пошуку: стать, вік, країна (потребують перку або Premium)
+# ---------------------------------------------------------------------------
+# (ключ, підпис, предикат(вік:int) -> bool)
+AGE_RANGES = [
+    ("lt18", "До 18", lambda a: a < 18),
+    ("18-22", "18-22", lambda a: 18 <= a <= 22),
+    ("23-27", "23-27", lambda a: 23 <= a <= 27),
+    ("28-32", "28-32", lambda a: 28 <= a <= 32),
+    ("32-36", "32-36", lambda a: 32 <= a <= 36),
+    ("gt36", "Понад 36", lambda a: a > 36),
+]
+
+# ---------------------------------------------------------------------------
 # Щоденний бонус: кожен день — трохи грн, кожен 5-й день поспіль — подарунок
 # ---------------------------------------------------------------------------
 DAILY_BONUS_AMOUNT = float(os.getenv("DAILY_BONUS_AMOUNT", "2"))  # грн за звичайний день
@@ -211,6 +231,8 @@ BTN_GIFT = "🎁 Подарувати"
 BTN_DAILY = "🎁 Щоденний бонус"
 BTN_LOTTERY = "🎰 Рулетка"
 BTN_TOP = "🏆 Топ дарувальників"
+BTN_FILTERS = "🎯 Фільтри пошуку"
+BTN_BLACKLIST_ADD = "🚫 Чорний список"
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +259,10 @@ class AdminStates(StatesGroup):
     broadcast = State()
 
 
+class FilterStates(StatesGroup):
+    country = State()
+
+
 # ---------------------------------------------------------------------------
 # Клавіатури
 # ---------------------------------------------------------------------------
@@ -247,7 +273,7 @@ def get_main_keyboard():
             [KeyboardButton(text=BTN_SHOP), KeyboardButton(text=BTN_WALLET)],
             [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
             [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_LOTTERY)],
-            [KeyboardButton(text=BTN_TOP)],
+            [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_FILTERS)],
         ],
         resize_keyboard=True,
     )
@@ -258,6 +284,7 @@ def get_chat_keyboard():
         keyboard=[
             [KeyboardButton(text=BTN_GIFT)],
             [KeyboardButton(text=BTN_STOP), KeyboardButton(text=BTN_REPORT)],
+            [KeyboardButton(text=BTN_BLACKLIST_ADD)],
         ],
         resize_keyboard=True,
     )
@@ -333,6 +360,95 @@ def get_rating_keyboard(partner_id: int):
     )
 
 
+def get_settings_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=BTN_FILTERS, callback_data="filters_menu")],
+            [InlineKeyboardButton(text="📋 Чорний список", callback_data="bl_view")],
+        ]
+    )
+
+
+def filter_active(u: dict, perk: str) -> bool:
+    """Чи доступний юзеру цей фільтр (куплений перк або Premium)."""
+    return is_premium(u) or has_perk(u, perk)
+
+
+def get_filters_menu_keyboard(u: dict):
+    gender_on = filter_active(u, "gender_filter")
+    age_on = filter_active(u, "age_filter")
+    country_on = filter_active(u, "country_filter")
+
+    gender_val = u.get("filter_gender") or "будь-яка"
+    ranges = u.get("filter_age_ranges") or set()
+    age_val = (
+        ", ".join(label for key, label, _ in AGE_RANGES if key in ranges) if ranges else "будь-який"
+    )
+    country_val = u.get("filter_country") or "будь-яка"
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{'👫' if gender_on else '🔒'} Стать: {gender_val if gender_on else 'куплено в магазині'}",
+                callback_data="f_gender_menu" if gender_on else "buy_gender_filter",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"{'🎂' if age_on else '🔒'} Вік: {age_val if age_on else 'куплено в магазині'}",
+                callback_data="f_age_menu" if age_on else "buy_age_filter",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"{'🌍' if country_on else '🔒'} Країна: {country_val if country_on else 'куплено в магазині'}",
+                callback_data="f_country_menu" if country_on else "buy_country_filter",
+            )
+        ],
+        [InlineKeyboardButton(text="🔄 Скинути всі фільтри", callback_data="f_reset")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_filter_gender_keyboard(u: dict):
+    current = u.get("filter_gender")
+    def mark(v):
+        return "✅ " if current == v else ""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"{mark('Хлопець')}Хлопець", callback_data="fg_Хлопець")],
+            [InlineKeyboardButton(text=f"{mark('Дівчина')}Дівчина", callback_data="fg_Дівчина")],
+            [InlineKeyboardButton(text="🔄 Будь-яка (скинути)", callback_data="fg_reset")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="filters_menu")],
+        ]
+    )
+
+
+def get_filter_age_keyboard(u: dict):
+    selected = u.get("filter_age_ranges") or set()
+    rows = []
+    for key, label, _ in AGE_RANGES:
+        mark = "✅ " if key in selected else ""
+        rows.append([InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"fa_{key}")])
+    rows.append([InlineKeyboardButton(text="🔄 Скинути", callback_data="fa_reset")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="filters_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_blacklist_keyboard(u: dict):
+    bl = u.get("blacklist") or set()
+    if not bl:
+        return None
+    rows = []
+    for uid in sorted(bl):
+        other = users_db.get(uid)
+        label = other["nickname"] if other else str(uid)
+        rows.append(
+            [InlineKeyboardButton(text=f"❌ Прибрати: {label}", callback_data=f"bl_remove_{uid}")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def get_admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -379,6 +495,10 @@ def init_user(user_id: int) -> dict:
             "reports_received": 0,  # скільки скарг отримав (для автобану)
             "rating_up": 0,  # 👍 після чатів
             "rating_down": 0,  # 👎 після чатів
+            "blacklist": set(),  # user_id, яких ця людина заблокувала особисто
+            "filter_gender": None,  # бажана стать співрозмовника (None = будь-яка)
+            "filter_age_ranges": set(),  # ключі з AGE_RANGES (порожньо = будь-який вік)
+            "filter_country": None,  # бажана країна співрозмовника (None = будь-яка)
         }
     return users_db[user_id]
 
@@ -389,6 +509,43 @@ def has_perk(u: dict, perk: str) -> bool:
 
 def is_premium(u: dict) -> bool:
     return has_perk(u, "premium")
+
+
+def get_age_int(u: dict) -> int | None:
+    age = u.get("age")
+    return int(age) if isinstance(age, str) and age.isdigit() else None
+
+
+def age_in_ranges(age: int, range_keys: set) -> bool:
+    if not range_keys:
+        return True
+    for key, _label, pred in AGE_RANGES:
+        if key in range_keys and pred(age):
+            return True
+    return False
+
+
+def passes_filters(viewer: dict, candidate: dict) -> bool:
+    """Чи підходить candidate під активні фільтри пошуку viewer (стать/вік/країна)."""
+    if filter_active(viewer, "gender_filter"):
+        want = viewer.get("filter_gender")
+        if want and candidate.get("gender") != want:
+            return False
+    if filter_active(viewer, "age_filter"):
+        wanted_ranges = viewer.get("filter_age_ranges") or set()
+        if wanted_ranges:
+            c_age = get_age_int(candidate)
+            if c_age is None or not age_in_ranges(c_age, wanted_ranges):
+                return False
+    if filter_active(viewer, "country_filter"):
+        want_country = viewer.get("filter_country")
+        if want_country and candidate.get("country", "").strip().lower() != want_country.strip().lower():
+            return False
+    return True
+
+
+def is_blacklisted(a: dict, a_id: int, b: dict, b_id: int) -> bool:
+    return b_id in (a.get("blacklist") or set()) or a_id in (b.get("blacklist") or set())
 
 
 def short_info(u: dict) -> str:
@@ -665,8 +822,206 @@ async def settings_handler(message: types.Message, state: FSMContext):
         f"За кожного друга, що запустить бота за твоїм посиланням — "
         f"+{REFERRAL_BONUS:.0f} грн на баланс.\n"
         f"Твоє посилання:\n<code>{esc(ref_link)}</code>\n"
-        f"Запрошено людей: {u.get('referral_count', 0)}"
+        f"Запрошено людей: {u.get('referral_count', 0)}",
+        reply_markup=get_settings_keyboard(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Фільтри пошуку (стать / вік / країна)
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_FILTERS)
+@dp.message(Command("filters"))
+async def filters_command(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    await message.answer(
+        "🎯 <b>Фільтри пошуку</b>\n\n"
+        "Обери, яких співрозмовників шукати. Фільтри, позначені 🔒, "
+        "потрібно спочатку розблокувати в магазині (або купити Premium — тоді доступні всі).",
+        reply_markup=get_filters_menu_keyboard(u),
+    )
+
+
+@dp.callback_query(F.data == "filters_menu")
+async def filters_menu_cb(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    u = init_user(call.from_user.id)
+    try:
+        await call.message.edit_text(
+            "🎯 <b>Фільтри пошуку</b>\n\nОбери, яких співрозмовників шукати:",
+            reply_markup=get_filters_menu_keyboard(u),
+        )
+    except TelegramAPIError:
+        await call.message.answer(
+            "🎯 <b>Фільтри пошуку</b>\n\nОбери, яких співрозмовників шукати:",
+            reply_markup=get_filters_menu_keyboard(u),
+        )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "f_gender_menu")
+async def f_gender_menu(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    if not filter_active(u, "gender_filter"):
+        await call.answer("Спочатку розблокуй цей фільтр у магазині", show_alert=True)
+        return
+    await call.message.edit_text(
+        "👫 Яку стать співрозмовника шукати?", reply_markup=get_filter_gender_keyboard(u)
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("fg_"))
+async def fg_set(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    if not filter_active(u, "gender_filter"):
+        await call.answer("Спочатку розблокуй цей фільтр у магазині", show_alert=True)
+        return
+    value = call.data[len("fg_"):]
+    u["filter_gender"] = None if value == "reset" else value
+    await call.message.edit_text(
+        "👫 Яку стать співрозмовника шукати?", reply_markup=get_filter_gender_keyboard(u)
+    )
+    await call.answer("Збережено ✅")
+
+
+@dp.callback_query(F.data == "f_age_menu")
+async def f_age_menu(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    if not filter_active(u, "age_filter"):
+        await call.answer("Спочатку розблокуй цей фільтр у магазині", show_alert=True)
+        return
+    await call.message.edit_text(
+        "🎂 Обери бажані діапазони віку (можна декілька):", reply_markup=get_filter_age_keyboard(u)
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("fa_"))
+async def fa_toggle(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    if not filter_active(u, "age_filter"):
+        await call.answer("Спочатку розблокуй цей фільтр у магазині", show_alert=True)
+        return
+    value = call.data[len("fa_"):]
+    u.setdefault("filter_age_ranges", set())
+    if value == "reset":
+        u["filter_age_ranges"] = set()
+    elif value in u["filter_age_ranges"]:
+        u["filter_age_ranges"].discard(value)
+    else:
+        u["filter_age_ranges"].add(value)
+    await call.message.edit_text(
+        "🎂 Обери бажані діапазони віку (можна декілька):", reply_markup=get_filter_age_keyboard(u)
+    )
+    await call.answer("Збережено ✅")
+
+
+@dp.callback_query(F.data == "f_country_menu")
+async def f_country_menu(call: types.CallbackQuery, state: FSMContext):
+    u = init_user(call.from_user.id)
+    if not filter_active(u, "country_filter"):
+        await call.answer("Спочатку розблокуй цей фільтр у магазині", show_alert=True)
+        return
+    current = u.get("filter_country") or "будь-яка"
+    await call.message.answer(
+        f"🌍 Поточний фільтр країни: <b>{esc(current)}</b>\n\n"
+        "Введи назву країни (як у профілі), яку шукати, або /cancel.\n"
+        "Щоб скинути — напиши «скинути»."
+    )
+    await state.set_state(FilterStates.country)
+    await call.answer()
+
+
+@dp.message(FilterStates.country, F.text)
+async def f_country_set(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    text = message.text.strip()
+    if text.lower() in ("скинути", "/reset"):
+        u["filter_country"] = None
+        await message.answer("🔄 Фільтр країни скинуто.", reply_markup=get_main_keyboard())
+        return
+    u["filter_country"] = text[:50]
+    await message.answer(
+        f"✅ Фільтр країни встановлено: <b>{esc(u['filter_country'])}</b>", reply_markup=get_main_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "f_reset")
+async def f_reset(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    u["filter_gender"] = None
+    u["filter_age_ranges"] = set()
+    u["filter_country"] = None
+    await call.message.edit_text(
+        "🎯 <b>Фільтри пошуку</b>\n\nВсі фільтри скинуто. Обери, яких співрозмовників шукати:",
+        reply_markup=get_filters_menu_keyboard(u),
+    )
+    await call.answer("Скинуто ✅")
+
+
+# ---------------------------------------------------------------------------
+# Чорний список
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data == "bl_view")
+async def bl_view(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    kb = get_blacklist_keyboard(u)
+    if kb is None:
+        await call.message.answer("📋 Твій чорний список порожній.")
+        await call.answer()
+        return
+    limit = BLACKLIST_LIMIT_PLUS if (is_premium(u) or has_perk(u, "blacklist")) else BLACKLIST_LIMIT_FREE
+    await call.message.answer(
+        f"📋 <b>Чорний список</b> ({len(u.get('blacklist', set()))}/{limit})\n\n"
+        "Ці користувачі більше не з'являться в твоєму пошуку. Натисни, щоб прибрати когось зі списку:",
+        reply_markup=kb,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("bl_remove_"))
+async def bl_remove(call: types.CallbackQuery):
+    target_id = int(call.data[len("bl_remove_"):])
+    u = init_user(call.from_user.id)
+    u.get("blacklist", set()).discard(target_id)
+    kb = get_blacklist_keyboard(u)
+    if kb is None:
+        await call.message.edit_text("📋 Твій чорний список порожній.")
+    else:
+        await call.message.edit_reply_markup(reply_markup=kb)
+    await call.answer("Прибрано ✅")
+
+
+@dp.message(F.text == BTN_BLACKLIST_ADD)
+async def blacklist_add_in_chat(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await message.answer(
+            "Додавати в чорний список можна лише під час чату.", reply_markup=get_main_keyboard()
+        )
+        return
+
+    u = init_user(user_id)
+    u.setdefault("blacklist", set())
+    limit = BLACKLIST_LIMIT_PLUS if (is_premium(u) or has_perk(u, "blacklist")) else BLACKLIST_LIMIT_FREE
+    if partner_id not in u["blacklist"] and len(u["blacklist"]) >= limit:
+        await message.answer(
+            f"❌ Чорний список заповнено ({limit}). Розшир його в магазині або онови Premium."
+        )
+        return
+
+    u["blacklist"].add(partner_id)
+    end_chat(user_id)
+    await message.answer(
+        "🚫 Користувача додано в чорний список — більше не з'явиться в пошуку. Чат завершено.",
+        reply_markup=get_main_keyboard(),
+    )
+    await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -1112,8 +1467,18 @@ async def search_partner(message: types.Message, state: FSMContext):
         await message.answer("Ти вже в черзі пошуку. Зачекай трохи... ⏳")
         return
 
-    if queue:
-        partner_id = queue.pop(0)
+    match_index = None
+    for i, candidate_id in enumerate(queue):
+        p_candidate = init_user(candidate_id)
+        if is_blacklisted(u, user_id, p_candidate, candidate_id):
+            continue
+        if not passes_filters(u, p_candidate) or not passes_filters(p_candidate, u):
+            continue
+        match_index = i
+        break
+
+    if match_index is not None:
+        partner_id = queue.pop(match_index)
         active_chats[user_id] = partner_id
         active_chats[partner_id] = user_id
         p = init_user(partner_id)
@@ -1663,6 +2028,7 @@ async def setup_bot_commands():
         types.BotCommand(command="stop", description="❌ Завершити чат"),
         types.BotCommand(command="cancel", description="⬅️ Скасувати поточну дію"),
         types.BotCommand(command="top", description="🏆 Топ дарувальників подарунків"),
+        types.BotCommand(command="filters", description="🎯 Фільтри пошуку"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
 
