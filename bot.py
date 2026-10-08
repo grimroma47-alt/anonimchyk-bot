@@ -62,6 +62,25 @@ authorized_admins: set[int] = set()  # хто вже ввів пароль у ц
 # Крипто-рахунки, очікують оплати: invoice_id -> {"user_id", "amount" (USDT), "credit" (грн)}
 pending_crypto_invoices: dict[str, dict] = {}
 
+# ---------------------------------------------------------------------------
+# Групові кімнати за інтересами (фіксовані теми, невеликі групи, лише текст)
+# ---------------------------------------------------------------------------
+ROOM_TOPICS = {
+    "music": "🎵 Музика",
+    "movies": "🎬 Кіно та серіали",
+    "games": "🎮 Ігри",
+    "travel": "✈️ Подорожі",
+    "it": "💻 IT та технології",
+    "sport": "⚽ Спорт",
+    "books": "📚 Книги",
+    "pets": "🐾 Тварини",
+}
+ROOM_CAPACITY = int(os.getenv("ROOM_CAPACITY", "8"))  # макс. учасників в одній кімнаті
+
+rooms: dict[str, dict] = {}  # room_id -> {"topic": ключ з ROOM_TOPICS, "members": set[int]}
+user_room: dict[int, str] = {}  # user_id -> room_id (в якій кімнаті зараз людина)
+room_counter = 0
+
 # Пакети поповнення
 STAR_PACKAGES = [50, 100, 250, 500]  # Telegram Stars; 1 star = 1 грн на баланс
 CRYPTO_PACKAGES = [1, 5, 10, 20]  # USDT
@@ -242,6 +261,9 @@ BTN_LOTTERY = "🎰 Рулетка"
 BTN_TOP = "🏆 Топ дарувальників"
 BTN_FILTERS = "🎯 Фільтри пошуку"
 BTN_BLACKLIST_ADD = "🚫 Чорний список"
+BTN_ROOMS = "👥 Кімнати за інтересами"
+BTN_ROOM_LEAVE = "🚪 Вийти з кімнати"
+BTN_ROOM_REPORT = "🚨 Поскаржитися на учасника"
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +305,37 @@ def get_main_keyboard():
             [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
             [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_LOTTERY)],
             [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_FILTERS)],
+            [KeyboardButton(text=BTN_ROOMS)],
         ],
         resize_keyboard=True,
     )
+
+
+def get_room_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_ROOM_REPORT)],
+            [KeyboardButton(text=BTN_ROOM_LEAVE)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def topic_online_count(topic_key: str) -> int:
+    return sum(len(r["members"]) for r in rooms.values() if r["topic"] == topic_key)
+
+
+def get_room_topics_keyboard():
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{title} — {topic_online_count(key)} 👥 онлайн",
+                callback_data=f"room_join_{key}",
+            )
+        ]
+        for key, title in ROOM_TOPICS.items()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_chat_keyboard():
@@ -583,6 +633,19 @@ def end_chat(user_id: int):
         if partner_id in users_db:
             users_db[partner_id]["last_partner_id"] = user_id
     return partner_id
+
+
+def remove_from_room(user_id: int):
+    """Прибирає користувача з його групової кімнати (якщо є) і чистить порожні кімнати."""
+    room_id = user_room.pop(user_id, None)
+    if room_id is None:
+        return
+    room = rooms.get(room_id)
+    if room is None:
+        return
+    room["members"].discard(user_id)
+    if not room["members"]:
+        rooms.pop(room_id, None)
 
 
 def get_post_chat_keyboard(partner_id: int):
@@ -1484,6 +1547,170 @@ async def lottery_spin_handler(call: types.CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
+# Групові кімнати за інтересами
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_ROOMS)
+@dp.message(Command("rooms"))
+async def rooms_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+
+    if user_id in banned_users:
+        await message.answer("⛔ Вас заблоковано в цьому боті.")
+        return
+    if user_id in user_room:
+        await message.answer("Ти вже в кімнаті. Спочатку вийди з неї.", reply_markup=get_room_keyboard())
+        return
+    if user_id in active_chats:
+        await message.answer("Спочатку заверши приватний чат.", reply_markup=get_chat_keyboard())
+        return
+
+    await message.answer(
+        "👥 <b>Кімнати за інтересами</b>\n\n"
+        f"Обери тему — потрапиш у групу до {ROOM_CAPACITY} людей, які говорять про те саме. "
+        "У кімнатах поки підтримується лише текст — це для безпеки спілкування в групі.",
+        reply_markup=get_room_topics_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("room_join_"))
+async def room_join(call: types.CallbackQuery):
+    user_id = call.from_user.id
+
+    if user_id in banned_users:
+        await call.answer("⛔ Вас заблоковано в цьому боті.", show_alert=True)
+        return
+    if user_id in user_room:
+        await call.answer("Ти вже в кімнаті. Спочатку вийди з неї.", show_alert=True)
+        return
+    if user_id in active_chats or user_id in queue:
+        await call.answer("Спочатку заверши приватний чат або пошук.", show_alert=True)
+        return
+
+    topic_key = call.data[len("room_join_"):]
+    if topic_key not in ROOM_TOPICS:
+        await call.answer("Невідома тема", show_alert=True)
+        return
+
+    global room_counter
+    target_room_id = None
+    for rid, r in rooms.items():
+        if r["topic"] == topic_key and len(r["members"]) < ROOM_CAPACITY:
+            target_room_id = rid
+            break
+    if target_room_id is None:
+        room_counter += 1
+        target_room_id = f"room_{room_counter}"
+        rooms[target_room_id] = {"topic": topic_key, "members": set()}
+
+    room = rooms[target_room_id]
+    u = init_user(user_id)
+
+    for member_id in room["members"]:
+        await safe_send(member_id, f"🆕 <b>{esc(u['nickname'])}</b> приєднався до кімнати!")
+
+    room["members"].add(user_id)
+    user_room[user_id] = target_room_id
+
+    await call.message.answer(
+        f"✅ Ти приєднався до кімнати: <b>{esc(ROOM_TOPICS[topic_key])}</b> "
+        f"({len(room['members'])}/{ROOM_CAPACITY} 👥)\n\n"
+        "Просто пиши текстом — повідомлення побачать усі учасники кімнати.",
+        reply_markup=get_room_keyboard(),
+    )
+    await call.answer()
+
+
+@dp.message(F.text == BTN_ROOM_LEAVE)
+async def room_leave(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    room_id = user_room.get(user_id)
+    if room_id is None:
+        await message.answer("Ти зараз не в кімнаті.", reply_markup=get_main_keyboard())
+        return
+
+    room = rooms.get(room_id)
+    u = init_user(user_id)
+    remove_from_room(user_id)
+
+    if room:
+        for member_id in room["members"]:
+            await safe_send(member_id, f"🚪 <b>{esc(u['nickname'])}</b> покинув кімнату.")
+
+    await message.answer("Ти вийшов з кімнати.", reply_markup=get_main_keyboard())
+
+
+@dp.message(F.text == BTN_ROOM_REPORT)
+async def room_report_start(message: types.Message):
+    user_id = message.from_user.id
+    room_id = user_room.get(user_id)
+    if room_id is None:
+        await message.answer("Ти зараз не в кімнаті.", reply_markup=get_main_keyboard())
+        return
+    room = rooms.get(room_id)
+    others = [uid for uid in room["members"] if uid != user_id] if room else []
+    if not others:
+        await message.answer("У кімнаті, крім тебе, нікого немає.")
+        return
+
+    rows = [
+        [InlineKeyboardButton(text=users_db[uid]["nickname"], callback_data=f"roomrep_{uid}")]
+        for uid in others
+    ]
+    await message.answer(
+        "🚨 На кого з учасників кімнати поскаржитись?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("roomrep_"))
+async def room_report_submit(call: types.CallbackQuery):
+    global report_counter
+    target_id = int(call.data[len("roomrep_"):])
+    user_id = call.from_user.id
+
+    report_counter += 1
+    reports.append(
+        {
+            "id": report_counter,
+            "from": user_id,
+            "on": target_id,
+            "time": time.strftime("%d.%m.%Y %H:%M"),
+            "status": "нова",
+        }
+    )
+
+    p = init_user(target_id)
+    p["reports_received"] = p.get("reports_received", 0) + 1
+    auto_banned = False
+    if p["reports_received"] >= AUTO_BAN_REPORTS and target_id not in banned_users:
+        banned_users.add(target_id)
+        auto_banned = True
+        if target_id in queue:
+            queue.remove(target_id)
+        remove_from_room(target_id)
+        end_chat(target_id)
+        await safe_send(
+            target_id, f"⛔ Вас автоматично заблоковано після {AUTO_BAN_REPORTS} скарг."
+        )
+
+    if ADMIN_ID:
+        extra = (
+            f"\n\n⛔ Автобан: досягнуто {AUTO_BAN_REPORTS} скарг, користувача заблоковано автоматично."
+            if auto_banned
+            else ""
+        )
+        await safe_send(
+            ADMIN_ID,
+            f"🚨 Скарга з кімнати #{report_counter}\nВід: <code>{user_id}</code>\nНа: <code>{target_id}</code>{extra}",
+        )
+
+    await call.message.answer("🚨 Скаргу надіслано, дякуємо!")
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
 # Пошук та чат
 # ---------------------------------------------------------------------------
 @dp.message(F.text == BTN_SEARCH)
@@ -1502,6 +1729,9 @@ async def search_partner(message: types.Message, state: FSMContext):
         return
     if user_id in queue:
         await message.answer("Ти вже в черзі пошуку. Зачекай трохи... ⏳")
+        return
+    if user_id in user_room:
+        await message.answer("Спочатку вийди з групової кімнати.", reply_markup=get_room_keyboard())
         return
 
     match_index = None
@@ -1740,6 +1970,7 @@ async def report_handler(message: types.Message):
         auto_banned = True
         if partner_id in queue:
             queue.remove(partner_id)
+        remove_from_room(partner_id)
         await safe_send(
             partner_id, f"⛔ Вас автоматично заблоковано після {AUTO_BAN_REPORTS} скарг."
         )
@@ -1953,6 +2184,7 @@ async def adm_stats(call: types.CallbackQuery):
         f"• Запрошень за реферальною програмою: {total_referrals}\n"
         f"• Автобан після {AUTO_BAN_REPORTS} скарг (users у режимі спостереження: "
         f"{sum(1 for u in users_db.values() if 0 < u.get('reports_received', 0) < AUTO_BAN_REPORTS)})\n"
+        f"• Активних кімнат: {len(rooms)} (учасників: {sum(len(r['members']) for r in rooms.values())})\n"
     )
     await call.message.answer(text)
     await call.answer()
@@ -2002,6 +2234,10 @@ async def adm_ban_from_report(call: types.CallbackQuery):
         return
     banned_users.add(rep["on"])
     rep["status"] = "оброблена"
+    end_chat(rep["on"])
+    remove_from_room(rep["on"])
+    if rep["on"] in queue:
+        queue.remove(rep["on"])
     await safe_send(rep["on"], "⛔ Вас заблоковано адміністратором за скаргою.")
     await call.message.answer(f"⛔ Користувача <code>{rep['on']}</code> забанено.")
     await call.answer()
@@ -2040,6 +2276,7 @@ async def adm_ban_finish(message: types.Message, state: FSMContext):
         return
     banned_users.add(target)
     end_chat(target)
+    remove_from_room(target)
     if target in queue:
         queue.remove(target)
     await message.answer(f"⛔ Користувача <code>{target}</code> забанено.")
@@ -2109,6 +2346,33 @@ async def adm_broadcast_finish(message: types.Message, state: FSMContext):
 async def relay_messages(message: types.Message):
     user_id = message.from_user.id
 
+    room_id = user_room.get(user_id)
+    if room_id is not None:
+        room = rooms.get(room_id)
+        if room is None:
+            user_room.pop(user_id, None)
+        else:
+            if not message.text:
+                await message.answer(
+                    "📷 У кімнатах поки підтримується лише текст — це для безпеки спілкування в групі."
+                )
+                return
+            if LINK_REGEX.search(message.text):
+                await message.answer(
+                    "🚫 Повідомлення з посиланнями або контактами заборонено."
+                )
+                return
+            u = init_user(user_id)
+            broadcast_text = f"<b>{esc(u['nickname'])}:</b> {esc(message.text)}"
+            for member_id in list(room["members"]):
+                if member_id == user_id:
+                    continue
+                ok = await safe_send(member_id, broadcast_text)
+                if not ok:
+                    room["members"].discard(member_id)
+                    user_room.pop(member_id, None)
+            return
+
     partner_id = active_chats.get(user_id)
     if partner_id is None:
         await message.answer("Скористайтеся меню нижче:", reply_markup=get_main_keyboard())
@@ -2159,6 +2423,7 @@ async def setup_bot_commands():
         types.BotCommand(command="cancel", description="⬅️ Скасувати поточну дію"),
         types.BotCommand(command="top", description="🏆 Топ дарувальників подарунків"),
         types.BotCommand(command="filters", description="🎯 Фільтри пошуку"),
+        types.BotCommand(command="rooms", description="👥 Кімнати за інтересами"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
 
