@@ -103,6 +103,43 @@ GIFT_CATALOG = {
 GIFT_RECIPIENT_SHARE = float(os.getenv("GIFT_RECIPIENT_SHARE", "0.25"))  # 0.25 = 25%
 
 gift_revenue_total = 0.0  # сумарний дохід адміна з подарунків (для статистики)
+lottery_revenue_total = 0.0  # дохід адміна з рулетки (ставки мінус виплати)
+BOT_USERNAME = ""  # заповнюється при старті (main()), для реферальних посилань
+
+# ---------------------------------------------------------------------------
+# Реферальна програма
+# ---------------------------------------------------------------------------
+REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "15"))  # грн авторові запрошення
+
+# ---------------------------------------------------------------------------
+# Рулетка
+# ---------------------------------------------------------------------------
+LOTTERY_COST = float(os.getenv("LOTTERY_COST", "15"))  # грн за один спін
+# (шанс у %, тип виграшу, множник для money / None для gift)
+LOTTERY_TABLE = [
+    (45, "nothing", None),
+    (25, "money", 1.5),
+    (10, "money", 3),
+    (12, "gift", None),
+    (6, "money", 5),
+    (2, "money", 20),
+]
+
+
+def spin_lottery():
+    r = random.uniform(0, 100)
+    cumulative = 0.0
+    for weight, kind, mult in LOTTERY_TABLE:
+        cumulative += weight
+        if r <= cumulative:
+            return kind, mult
+    return "nothing", None
+
+
+# ---------------------------------------------------------------------------
+# Продаж подарунка назад (частковий викуп)
+# ---------------------------------------------------------------------------
+GIFT_SELLBACK_SHARE = float(os.getenv("GIFT_SELLBACK_SHARE", "0.5"))  # 50% від ціни
 
 # ---------------------------------------------------------------------------
 # Щоденний бонус: кожен день — трохи грн, кожен 5-й день поспіль — подарунок
@@ -164,6 +201,7 @@ BTN_STOP = "❌ Завершити чат"
 BTN_REPORT = "🚨 Поскаржитися"
 BTN_GIFT = "🎁 Подарувати"
 BTN_DAILY = "🎁 Щоденний бонус"
+BTN_LOTTERY = "🎰 Рулетка"
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +237,7 @@ def get_main_keyboard():
             [KeyboardButton(text=BTN_SEARCH)],
             [KeyboardButton(text=BTN_SHOP), KeyboardButton(text=BTN_WALLET)],
             [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
-            [KeyboardButton(text=BTN_DAILY)],
+            [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_LOTTERY)],
         ],
         resize_keyboard=True,
     )
@@ -269,6 +307,7 @@ def get_wallet_keyboard():
         inline_keyboard=[
             [InlineKeyboardButton(text="💳 Поповнити баланс", callback_data="deposit")],
             [InlineKeyboardButton(text=f"✏️ Змінити нік ({NICK_PRICE} грн)", callback_data="buy_nick")],
+            [InlineKeyboardButton(text="🎒 Інвентар подарунків", callback_data="inv_open")],
         ]
     )
 
@@ -314,6 +353,8 @@ def init_user(user_id: int) -> dict:
             "checkin_streak": 0,  # скільки днів поспіль заходив за бонусом
             "total_chats": 0,  # скільки разів знайшов співрозмовника (для рівня)
             "gifts_sent_count": 0,  # скільки подарунків подарував (для досягнень)
+            "referred_by": None,  # хто запросив цього користувача
+            "referral_count": 0,  # скільки людей запросив сам
         }
     return users_db[user_id]
 
@@ -430,7 +471,29 @@ async def crypto_poll_loop():
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    u = init_user(message.from_user.id)
+    user_id = message.from_user.id
+    is_new_user = user_id not in users_db
+    u = init_user(user_id)
+
+    # Реферальне посилання: /start ref_<id>
+    if is_new_user:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) == 2 and parts[1].startswith("ref_"):
+            try:
+                referrer_id = int(parts[1][len("ref_"):])
+            except ValueError:
+                referrer_id = None
+            if referrer_id and referrer_id != user_id and referrer_id in users_db:
+                u["referred_by"] = referrer_id
+                ref = users_db[referrer_id]
+                ref["referral_count"] = ref.get("referral_count", 0) + 1
+                ref["balance"] += REFERRAL_BONUS
+                await safe_send(
+                    referrer_id,
+                    f"👥 За вашим запрошенням приєднався новий користувач!\n"
+                    f"+{REFERRAL_BONUS:.0f} грн на баланс. Дякуємо! 🎉",
+                )
+
     await message.answer(
         f"Привіт, {esc(message.from_user.first_name)}! Вітаємо в анонімному чаті! 🤫\n\n"
         f"Твій унікальний номер: <b>{u['custom_id']}</b>\n"
@@ -555,10 +618,21 @@ async def process_country(message: types.Message, state: FSMContext):
 @dp.message(F.text == BTN_SETTINGS)
 async def settings_handler(message: types.Message, state: FSMContext):
     await state.clear()
+    u = init_user(message.from_user.id)
+    ref_link = (
+        f"https://t.me/{BOT_USERNAME}?start=ref_{message.from_user.id}"
+        if BOT_USERNAME
+        else "(посилання буде доступне трохи пізніше)"
+    )
     await message.answer(
         "⚙️ <b>Налаштування</b>\n\n"
         "/edit_profile — змінити профіль\n"
-        "/cancel — скасувати поточну дію"
+        "/cancel — скасувати поточну дію\n\n"
+        "👥 <b>Запрошуй друзів і заробляй:</b>\n"
+        f"За кожного друга, що запустить бота за твоїм посиланням — "
+        f"+{REFERRAL_BONUS:.0f} грн на баланс.\n"
+        f"Твоє посилання:\n<code>{esc(ref_link)}</code>\n"
+        f"Запрошено людей: {u.get('referral_count', 0)}"
     )
 
 
@@ -868,6 +942,122 @@ async def buy_gift_item(call: types.CallbackQuery):
     await call.answer()
 
 
+@dp.callback_query(F.data == "inv_open")
+async def inventory_open(call: types.CallbackQuery):
+    """Інвентар подарунків: перегляд і продаж назад (частковий викуп)."""
+    u = init_user(call.from_user.id)
+    owned = {k: c for k, c in u.get("gifts", {}).items() if c > 0}
+    if not owned:
+        await call.message.answer(
+            "🎒 Твій інвентар порожній.\nКупити подарунок можна в магазині — 🏪 Магазин.",
+        )
+        await call.answer()
+        return
+
+    rows = []
+    for key, count in owned.items():
+        title, price = GIFT_CATALOG[key]
+        sellback = round(price * GIFT_SELLBACK_SHARE, 2)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{title} ×{count} — продати за {sellback:.0f} грн",
+                    callback_data=f"sellgift_{key}",
+                )
+            ]
+        )
+    await call.message.answer(
+        "🎒 <b>Інвентар подарунків</b>\n\n"
+        f"Продаж подарунка назад повертає {GIFT_SELLBACK_SHARE * 100:.0f}% його ціни на баланс.\n"
+        "Обери, що продати:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("sellgift_"))
+async def sell_gift_item(call: types.CallbackQuery):
+    """Продаж подарунка з інвентарю назад системі за частину ціни."""
+    key = call.data[len("sellgift_"):]
+    item = GIFT_CATALOG.get(key)
+    if item is None:
+        await call.answer("Невідомий подарунок", show_alert=True)
+        return
+
+    u = init_user(call.from_user.id)
+    have = u.get("gifts", {}).get(key, 0)
+    if have <= 0:
+        await call.answer("У тебе немає такого подарунка", show_alert=True)
+        return
+
+    title, price = item
+    sellback = round(price * GIFT_SELLBACK_SHARE, 2)
+    u["gifts"][key] = have - 1
+    u["balance"] += sellback
+
+    await call.message.answer(
+        f"✅ Продано: <b>{esc(title)}</b>. На баланс нараховано {sellback:.2f} грн."
+    )
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Рулетка (лотерея за грн)
+# ---------------------------------------------------------------------------
+def get_lottery_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🎲 Крутити", callback_data="lottery_spin")]]
+    )
+
+
+@dp.message(F.text == BTN_LOTTERY)
+async def lottery_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    await message.answer(
+        "🎰 <b>Рулетка</b>\n\n"
+        f"Один спін коштує {LOTTERY_COST:.0f} грн.\n"
+        "Можливі призи: трохи грошей, великий виграш грошей або випадковий подарунок!\n"
+        f"Твій баланс: {u['balance']:.2f} грн.",
+        reply_markup=get_lottery_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "lottery_spin")
+async def lottery_spin_handler(call: types.CallbackQuery):
+    global lottery_revenue_total
+    u = init_user(call.from_user.id)
+
+    if u["balance"] < LOTTERY_COST:
+        await call.answer(
+            f"❌ Недостатньо коштів. Ціна спіну: {LOTTERY_COST:.0f} грн.", show_alert=True
+        )
+        return
+
+    u["balance"] -= LOTTERY_COST
+    lottery_revenue_total += LOTTERY_COST
+
+    kind, mult = spin_lottery()
+    if kind == "nothing":
+        text = "😔 На цей раз нічого не випало. Спробуй ще раз!"
+    elif kind == "money":
+        win = round(LOTTERY_COST * mult, 2)
+        u["balance"] += win
+        lottery_revenue_total -= win
+        text = f"🎉 Виграш: <b>{win:.2f} грн</b>! Зараховано на баланс."
+    else:  # gift
+        key = random.choice(list(GIFT_CATALOG.keys()))
+        title, gift_price = GIFT_CATALOG[key]
+        u.setdefault("gifts", {})
+        u["gifts"][key] = u["gifts"].get(key, 0) + 1
+        lottery_revenue_total -= gift_price
+        text = f"🎁 Виграш: подарунок <b>{esc(title)}</b>! Додано в інвентар."
+
+    text += f"\n\n💰 Баланс: {u['balance']:.2f} грн."
+    await call.message.answer(text, reply_markup=get_lottery_keyboard())
+    await call.answer()
+
+
 # ---------------------------------------------------------------------------
 # Пошук та чат
 # ---------------------------------------------------------------------------
@@ -1150,6 +1340,7 @@ def admin_only(func):
 async def adm_stats(call: types.CallbackQuery):
     total_users = len(users_db)
     premium_count = sum(1 for u in users_db.values() if is_premium(u))
+    total_referrals = sum(u.get("referral_count", 0) for u in users_db.values())
     text = (
         "📊 <b>Статистика</b>\n\n"
         f"• Користувачів: {total_users}\n"
@@ -1159,6 +1350,8 @@ async def adm_stats(call: types.CallbackQuery):
         f"• Забанено: {len(banned_users)}\n"
         f"• Скарг усього: {len(reports)}\n"
         f"• Дохід з подарунків: {gift_revenue_total:.2f} грн\n"
+        f"• Дохід з рулетки: {lottery_revenue_total:.2f} грн\n"
+        f"• Запрошень за реферальною програмою: {total_referrals}\n"
     )
     await call.message.answer(text)
     await call.answer()
@@ -1349,13 +1542,41 @@ async def start_web_server() -> web.AppRunner:
     return runner
 
 
+async def setup_bot_commands():
+    """Перекладає меню команд '/' на українську (замість заглушок command1, command2...)."""
+    default_commands = [
+        types.BotCommand(command="start", description="🚀 Почати / перезапустити бота"),
+        types.BotCommand(command="edit_profile", description="✏️ Редагувати профіль"),
+        types.BotCommand(command="stop", description="❌ Завершити чат"),
+        types.BotCommand(command="cancel", description="⬅️ Скасувати поточну дію"),
+    ]
+    await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
+
+    if ADMIN_ID:
+        admin_commands = default_commands + [
+            types.BotCommand(command="admin", description="🔐 Адмін-панель"),
+            types.BotCommand(command="addbalance", description="💰 Поповнити баланс користувачу"),
+        ]
+        try:
+            await bot.set_my_commands(
+                admin_commands, scope=types.BotCommandScopeChat(chat_id=ADMIN_ID)
+            )
+        except TelegramAPIError as e:
+            # адмін ще жодного разу не писав боту — Telegram не дає встановити команди для нього
+            logging.warning("Не вдалося встановити адмін-команди: %s", e)
+
+
 async def main():
+    global BOT_USERNAME
     logging.basicConfig(level=logging.INFO)
     runner = await start_web_server()
     poll_task = asyncio.create_task(crypto_poll_loop())
     try:
         # Скидаємо webhook і старі апдейти, щоб менше конфліктувати при редеплої
         await bot.delete_webhook(drop_pending_updates=True)
+        await setup_bot_commands()
+        me = await bot.get_me()
+        BOT_USERNAME = me.username or ""
         await dp.start_polling(bot)
     finally:
         poll_task.cancel()
