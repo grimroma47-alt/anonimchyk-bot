@@ -146,7 +146,11 @@ reconnect_requests: dict[int, int] = {}  # acceptor_id -> requester_id (очік
 # вже перевірений код реконнекту і тримати ризик нового коду ізольованим.
 # ---------------------------------------------------------------------------
 friend_add_requests: dict[int, int] = {}  # acceptor_id -> requester_id (запит у друзі)
-friend_chat_requests: dict[int, int] = {}  # acceptor_id -> requester_id (запит на чат з другом)
+# Переписка з друзями працює як "скринька" — окремо від анонімного чату.
+# (chat_id отримувача, message_id у нього) -> id друга, який надіслав.
+# Потрібно, щоб відповідь свайпом (Reply) пішла саме тому другові.
+friend_msg_map: dict[tuple[int, int], int] = {}
+FRIEND_MSG_MAP_LIMIT = 50000  # щоб пам'ять не росла безкінечно
 
 # ---------------------------------------------------------------------------
 # Рулетка
@@ -310,6 +314,10 @@ class SupportStates(StatesGroup):
     message = State()
 
 
+class FriendStates(StatesGroup):
+    write = State()
+
+
 # ---------------------------------------------------------------------------
 # Клавіатури
 # ---------------------------------------------------------------------------
@@ -376,7 +384,7 @@ def get_friends_keyboard(u: dict):
         name = f["nickname"] if f else str(fid)
         rows.append(
             [
-                InlineKeyboardButton(text=f"💬 {name}", callback_data=f"friend_chat_{fid}"),
+                InlineKeyboardButton(text=f"✍️ {name}", callback_data=f"fmsg_{fid}"),
                 InlineKeyboardButton(text="❌", callback_data=f"friend_remove_{fid}"),
             ]
         )
@@ -2667,184 +2675,4 @@ async def adm_broadcast_finish(message: types.Message, state: FSMContext):
     sent, failed = 0, 0
     for uid in list(users_db.keys()):
         ok = await safe_send(uid, f"📢 {esc(text)}")
-        sent += ok
-        failed += not ok
-    await message.answer(f"✅ Розіслано: {sent}. Не вдалося: {failed}.")
-
-
-@dp.callback_query(F.data.startswith("adm_reply_"))
-@admin_only
-async def adm_reply_start(call: types.CallbackQuery, state: FSMContext):
-    target_id = int(call.data[len("adm_reply_"):])
-    await state.update_data(support_target=target_id)
-    await state.set_state(AdminStates.support_reply)
-    await call.message.answer(
-        f"✍️ Введіть відповідь для користувача <code>{target_id}</code> (або /cancel):"
-    )
-    await call.answer()
-
-
-@dp.message(AdminStates.support_reply, F.text)
-async def adm_reply_finish(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    data = await state.get_data()
-    target_id = data.get("support_target")
-    await state.clear()
-    if not target_id:
-        await message.answer("Помилка: не знайдено отримувача.")
-        return
-    ok = await safe_send(target_id, f"📩 <b>Відповідь від підтримки:</b>\n{esc(message.text)}")
-    if ok:
-        await message.answer("✅ Відповідь надіслано користувачу.")
-    else:
-        await message.answer("❌ Не вдалося надіслати — користувач недоступний.")
-
-
-# ---------------------------------------------------------------------------
-# Пересилання повідомлень (завжди останнім!)
-# ---------------------------------------------------------------------------
-@dp.message()
-async def relay_messages(message: types.Message):
-    user_id = message.from_user.id
-
-    room_id = user_room.get(user_id)
-    if room_id is not None:
-        room = rooms.get(room_id)
-        if room is None:
-            user_room.pop(user_id, None)
-        else:
-            if not message.text:
-                await message.answer(
-                    "📷 У кімнатах поки підтримується лише текст — це для безпеки спілкування в групі."
-                )
-                return
-            if LINK_REGEX.search(message.text):
-                await message.answer(
-                    "🚫 Повідомлення з посиланнями або контактами заборонено."
-                )
-                return
-            u = init_user(user_id)
-            broadcast_text = f"<b>{esc(u['nickname'])}:</b> {esc(message.text)}"
-            for member_id in list(room["members"]):
-                if member_id == user_id:
-                    continue
-                ok = await safe_send(member_id, broadcast_text)
-                if not ok:
-                    room["members"].discard(member_id)
-                    user_room.pop(member_id, None)
-            return
-
-    partner_id = active_chats.get(user_id)
-    if partner_id is None:
-        await message.answer("Скористайтеся меню нижче:", reply_markup=get_main_keyboard())
-        return
-
-    text_to_check = message.text or message.caption
-    if text_to_check and LINK_REGEX.search(text_to_check):
-        await message.answer(
-            "🚫 Повідомлення з посиланнями або контактами заборонено — спілкуйтесь анонімно в боті."
-        )
-        return
-
-    try:
-        await message.copy_to(chat_id=partner_id)
-    except TelegramAPIError:
-        end_chat(user_id)
-        await message.answer(
-            "Не вдалося доставити повідомлення, чат завершено.", reply_markup=get_main_keyboard()
-        )
-
-
-# ---------------------------------------------------------------------------
-# Веб-сервер для Render (інакше "No open ports detected")
-# ---------------------------------------------------------------------------
-async def handle_ping(request: web.Request):
-    return web.Response(text="Bot is running!")
-
-
-async def start_web_server() -> web.AppRunner:
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/health", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info("Веб-сервер запущено на порту %s", port)
-    return runner
-
-
-async def setup_bot_commands():
-    """Перекладає меню команд '/' на українську (замість заглушок command1, command2...)."""
-    default_commands = [
-        types.BotCommand(command="start", description="🚀 Почати / перезапустити бота"),
-        types.BotCommand(command="edit_profile", description="✏️ Редагувати профіль"),
-        types.BotCommand(command="stop", description="❌ Завершити чат"),
-        types.BotCommand(command="cancel", description="⬅️ Скасувати поточну дію"),
-        types.BotCommand(command="top", description="🏆 Топ дарувальників подарунків"),
-        types.BotCommand(command="filters", description="🎯 Фільтри пошуку"),
-        types.BotCommand(command="rooms", description="👥 Кімнати за інтересами"),
-        types.BotCommand(command="help", description="🆘 Допомога / зв'язок з адміном"),
-        types.BotCommand(command="friends", description="👫 Друзі"),
-    ]
-    await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
-
-    if ADMIN_ID:
-        admin_commands = default_commands + [
-            types.BotCommand(command="admin", description="🔐 Адмін-панель"),
-            types.BotCommand(command="addbalance", description="💰 Поповнити баланс користувачу"),
-        ]
-        try:
-            await bot.set_my_commands(
-                admin_commands, scope=types.BotCommandScopeChat(chat_id=ADMIN_ID)
-            )
-        except TelegramAPIError as e:
-            # адмін ще жодного разу не писав боту — Telegram не дає встановити команди для нього
-            logging.warning("Не вдалося встановити адмін-команди: %s", e)
-
-
-async def main():
-    global BOT_USERNAME
-    logging.basicConfig(level=logging.INFO)
-    runner = await start_web_server()
-    poll_task = asyncio.create_task(crypto_poll_loop())
-    try:
-        # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
-        # Telegram API не вбивала весь процес (і "Application exited early" на Render).
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Не вдалося скинути webhook: %s", e)
-
-        try:
-            await setup_bot_commands()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Не вдалося встановити команди бота: %s", e)
-
-        try:
-            me = await bot.get_me()
-            BOT_USERNAME = me.username or ""
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Не вдалося отримати інформацію про бота (get_me): %s", e)
-
-        # Якщо polling впаде (напр. TelegramConflictError через старий інстанс),
-        # логуємо чітку причину і пробуємо знову, а не завершуємо процес.
-        while True:
-            try:
-                await dp.start_polling(bot)
-                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001
-                logging.error("Помилка під час polling, перезапуск через 5с: %s", e)
-                await asyncio.sleep(5)
-    finally:
-        poll_task.cancel()
-        await bot.session.close()
-        await runner.cleanup()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        sent += o
