@@ -104,6 +104,57 @@ GIFT_RECIPIENT_SHARE = float(os.getenv("GIFT_RECIPIENT_SHARE", "0.25"))  # 0.25 
 
 gift_revenue_total = 0.0  # сумарний дохід адміна з подарунків (для статистики)
 
+# ---------------------------------------------------------------------------
+# Щоденний бонус: кожен день — трохи грн, кожен 5-й день поспіль — подарунок
+# ---------------------------------------------------------------------------
+DAILY_BONUS_AMOUNT = float(os.getenv("DAILY_BONUS_AMOUNT", "2"))  # грн за звичайний день
+DAILY_GIFT_EVERY = 5  # кожні N днів поспіль — подарунок замість грошей
+DAILY_GIFT_MAX_PRICE = 25  # дарується щось із каталогу дешевше цієї суми
+
+# ---------------------------------------------------------------------------
+# Рівні за кількістю чатів
+# ---------------------------------------------------------------------------
+LEVELS = [
+    (0, "🔰 Новачок"),
+    (10, "⭐ Активний"),
+    (30, "🏅 Досвідчений"),
+    (75, "👑 Легенда"),
+]
+
+
+def get_level_title(u: dict) -> str:
+    chats = u.get("total_chats", 0)
+    title = LEVELS[0][1]
+    for threshold, name in LEVELS:
+        if chats >= threshold:
+            title = name
+    return title
+
+
+# ---------------------------------------------------------------------------
+# Досягнення
+# ---------------------------------------------------------------------------
+ACHIEVEMENTS = {
+    "chat10": ("💬 Балакун", lambda u: u.get("total_chats", 0) >= 10),
+    "chat50": ("🗣️ Легенда спілкування", lambda u: u.get("total_chats", 0) >= 50),
+    "gift10": ("🎁 Щедра душа", lambda u: u.get("gifts_sent_count", 0) >= 10),
+    "streak5": ("🔥 На хвилі", lambda u: u.get("checkin_streak", 0) >= 5),
+    "premium": ("💎 Преміум-підписник", lambda u: is_premium(u)),
+}
+
+
+def get_earned_achievements(u: dict) -> list[str]:
+    return [title for title, check in ACHIEVEMENTS.values() if check(u)]
+
+
+def today_str() -> str:
+    return date.today().isoformat()
+
+
+def yesterday_str() -> str:
+    return (date.today() - timedelta(days=1)).isoformat()
+
+
 BTN_SEARCH = "🔍 Шукати співрозмовника"
 BTN_SHOP = "🏪 Магазин"
 BTN_WALLET = "👛 Гаманець"
@@ -112,6 +163,7 @@ BTN_SETTINGS = "⚙️ Налаштування"
 BTN_STOP = "❌ Завершити чат"
 BTN_REPORT = "🚨 Поскаржитися"
 BTN_GIFT = "🎁 Подарувати"
+BTN_DAILY = "🎁 Щоденний бонус"
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +199,7 @@ def get_main_keyboard():
             [KeyboardButton(text=BTN_SEARCH)],
             [KeyboardButton(text=BTN_SHOP), KeyboardButton(text=BTN_WALLET)],
             [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
+            [KeyboardButton(text=BTN_DAILY)],
         ],
         resize_keyboard=True,
     )
@@ -257,6 +310,10 @@ def init_user(user_id: int) -> dict:
             "perks": {},  # перк -> час закінчення (float('inf') = назавжди)
             "gifts": {},  # ключ подарунка -> кількість в інвентарі
             "archive": [],
+            "last_checkin_date": None,  # дата останнього щоденного бонусу (YYYY-MM-DD)
+            "checkin_streak": 0,  # скільки днів поспіль заходив за бонусом
+            "total_chats": 0,  # скільки разів знайшов співрозмовника (для рівня)
+            "gifts_sent_count": 0,  # скільки подарунків подарував (для досягнень)
         }
     return users_db[user_id]
 
@@ -423,6 +480,9 @@ async def profile_handler(message: types.Message, state: FSMContext):
     else:
         gifts_text = "порожньо"
 
+    earned = get_earned_achievements(u)
+    achievements_text = ", ".join(earned) if earned else "ще немає — спілкуйся й даруй подарунки!"
+
     text = (
         "👤 <b>Твій профіль:</b>\n"
         f"• <b>ID / Нік:</b> {esc(u['nickname'])} ({u['custom_id']})\n"
@@ -430,7 +490,10 @@ async def profile_handler(message: types.Message, state: FSMContext):
         f"• <b>Вік:</b> {esc(u['age'])}\n"
         f"• <b>Країна:</b> {esc(u['country'])}\n"
         f"• <b>Преміум:</b> {'Так 💎' if is_premium(u) else 'Ні ❌'}\n"
-        f"• <b>VIP-значок:</b> {'Так ⭐' if has_perk(u, 'vip_badge') else 'Ні'}\n\n"
+        f"• <b>VIP-значок:</b> {'Так ⭐' if has_perk(u, 'vip_badge') else 'Ні'}\n"
+        f"• <b>Рівень:</b> {get_level_title(u)} ({u.get('total_chats', 0)} чатів)\n"
+        f"• <b>Серія входів:</b> {u.get('checkin_streak', 0)} 🔥\n\n"
+        f"🏆 <b>Досягнення:</b> {achievements_text}\n\n"
         f"🎒 <b>Інвентар подарунків:</b> {gifts_text}\n\n"
         f"📜 <b>Архів останніх змін профілю:</b>\n{archive_text}\n\n"
         "Хочеш оновити дані? Введи /edit_profile"
@@ -497,6 +560,51 @@ async def settings_handler(message: types.Message, state: FSMContext):
         "/edit_profile — змінити профіль\n"
         "/cancel — скасувати поточну дію"
     )
+
+
+# ---------------------------------------------------------------------------
+# Щоденний бонус
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_DAILY)
+async def daily_checkin(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    today = today_str()
+
+    if u.get("last_checkin_date") == today:
+        streak = u.get("checkin_streak", 0)
+        left = DAILY_GIFT_EVERY - (streak % DAILY_GIFT_EVERY)
+        await message.answer(
+            f"✅ Бонус за сьогодні вже отримано. Серія: {streak} 🔥\n"
+            f"Повертайся завтра! До подарунка дня лишилось: {left}."
+        )
+        return
+
+    if u.get("last_checkin_date") == yesterday_str():
+        u["checkin_streak"] = u.get("checkin_streak", 0) + 1
+    else:
+        u["checkin_streak"] = 1  # серія перервалась або це перший вхід
+
+    u["last_checkin_date"] = today
+    streak = u["checkin_streak"]
+
+    if streak % DAILY_GIFT_EVERY == 0:
+        cheap_keys = [k for k, (_, p) in GIFT_CATALOG.items() if p <= DAILY_GIFT_MAX_PRICE]
+        key = random.choice(cheap_keys)
+        title, _price = GIFT_CATALOG[key]
+        u.setdefault("gifts", {})
+        u["gifts"][key] = u["gifts"].get(key, 0) + 1
+        await message.answer(
+            f"🔥 Серія {streak} днів поспіль!\n"
+            f"🎁 Подарунок дня: <b>{esc(title)}</b> додано в інвентар!"
+        )
+    else:
+        u["balance"] += DAILY_BONUS_AMOUNT
+        left = DAILY_GIFT_EVERY - (streak % DAILY_GIFT_EVERY)
+        await message.answer(
+            f"✅ Щоденний бонус: +{DAILY_BONUS_AMOUNT:.0f} грн.\n"
+            f"Серія: {streak} 🔥 (до подарунка лишилось {left} дн.)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +904,10 @@ async def search_partner(message: types.Message, state: FSMContext):
             queue.append(user_id)
             await message.answer("Співрозмовник виявився недоступним. Шукаємо далі... ⏳")
             return
+
+        u["total_chats"] = u.get("total_chats", 0) + 1
+        p["total_chats"] = p.get("total_chats", 0) + 1
+
         await message.answer(
             f"Партнера знайдено! 🤫\nІнфо: {short_info(p)}", reply_markup=get_chat_keyboard()
         )
@@ -973,6 +1085,7 @@ async def send_gift_item(call: types.CallbackQuery):
 
     title, price = item
     u["gifts"][key] = have - 1
+    u["gifts_sent_count"] = u.get("gifts_sent_count", 0) + 1
 
     recipient_amount = round(price * GIFT_RECIPIENT_SHARE, 2)
     admin_amount = round(price - recipient_amount, 2)
