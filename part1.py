@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import os
+import functools
 import random
 import re
 import time
@@ -73,6 +74,8 @@ user_counter = 1000
 banned_users: set[int] = set()
 reports: list[dict] = []  # {"id", "from", "on", "time", "status"}
 report_counter = 0
+ads: list[dict] = []  # реклама в черзі пошуку: {"id","text","url","active","shows","created"}
+ad_counter = 0
 authorized_admins: set[int] = set()  # хто вже ввів пароль у цій сесії
 
 # Крипто-рахунки, очікують оплати: invoice_id -> {"user_id", "amount" (USDT), "credit" (грн)}
@@ -337,6 +340,8 @@ class AdminStates(StatesGroup):
     unban_id = State()
     broadcast = State()
     support_reply = State()
+    ad_text = State()
+    ad_url = State()
 
 
 class FilterStates(StatesGroup):
@@ -607,6 +612,7 @@ def get_admin_keyboard():
             ],
             [InlineKeyboardButton(text="📋 Список забанених", callback_data="adm_banlist")],
             [InlineKeyboardButton(text="📢 Розсилка всім", callback_data="adm_broadcast")],
+            [InlineKeyboardButton(text="📣 Реклама в пошуку", callback_data="adm_ads")],
         ]
     )
 
@@ -1115,6 +1121,8 @@ def _make_snapshot() -> bytes:
             "pending_crypto_invoices": pending_crypto_invoices,
             "gift_revenue_total": gift_revenue_total,
             "lottery_revenue_total": lottery_revenue_total,
+            "ads": ads,
+            "ad_counter": ad_counter,
         },
         protocol=4,
     )
@@ -1124,7 +1132,7 @@ def _apply_snapshot(blob: bytes):
     import copy
     import pickle
 
-    global user_counter, report_counter, gift_revenue_total, lottery_revenue_total
+    global user_counter, report_counter, gift_revenue_total, lottery_revenue_total, ad_counter
     data = pickle.loads(blob)
 
     users_db.clear()
@@ -1139,6 +1147,9 @@ def _apply_snapshot(blob: bytes):
     report_counter = data.get("report_counter", report_counter)
     gift_revenue_total = data.get("gift_revenue_total", gift_revenue_total)
     lottery_revenue_total = data.get("lottery_revenue_total", lottery_revenue_total)
+    ads.clear()
+    ads.extend(data.get("ads", []))
+    ad_counter = data.get("ad_counter", ad_counter)
 
     # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
     saved_counter = user_counter
