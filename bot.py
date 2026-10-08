@@ -141,11 +141,6 @@ REFERRAL_PREMIUM_DAYS = int(os.getenv("REFERRAL_PREMIUM_DAYS", "5"))  # днів
 reconnect_requests: dict[int, int] = {}  # acceptor_id -> requester_id (очікує відповіді)
 
 # ---------------------------------------------------------------------------
-# Друзі (додаються за взаємною згодою з активного чату)
-# ---------------------------------------------------------------------------
-friend_add_requests: dict[int, int] = {}  # acceptor_id -> requester_id (запит у друзі)
-
-# ---------------------------------------------------------------------------
 # Рулетка
 # ---------------------------------------------------------------------------
 LOTTERY_COST = float(os.getenv("LOTTERY_COST", "15"))  # грн за один спін
@@ -269,8 +264,6 @@ BTN_BLACKLIST_ADD = "🚫 Чорний список"
 BTN_ROOMS = "👥 Кімнати за інтересами"
 BTN_ROOM_LEAVE = "🚪 Вийти з кімнати"
 BTN_ROOM_REPORT = "🚨 Поскаржитися на учасника"
-BTN_FRIENDS = "👫 Друзі"
-BTN_ADD_FRIEND = "🤝 Додати в друзі"
 BTN_HELP = "🆘 Допомога"
 
 
@@ -318,7 +311,7 @@ def get_main_keyboard():
             [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
             [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_LOTTERY)],
             [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_FILTERS)],
-            [KeyboardButton(text=BTN_ROOMS), KeyboardButton(text=BTN_FRIENDS)],
+            [KeyboardButton(text=BTN_ROOMS)],
             [KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
@@ -355,29 +348,12 @@ def get_room_topics_keyboard():
 def get_chat_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_GIFT), KeyboardButton(text=BTN_ADD_FRIEND)],
+            [KeyboardButton(text=BTN_GIFT)],
             [KeyboardButton(text=BTN_STOP), KeyboardButton(text=BTN_REPORT)],
             [KeyboardButton(text=BTN_BLACKLIST_ADD)],
         ],
         resize_keyboard=True,
     )
-
-
-def get_friends_keyboard(u: dict):
-    friends = u.get("friends") or set()
-    if not friends:
-        return None
-    rows = []
-    for fid in sorted(friends):
-        f = users_db.get(fid)
-        name = f["nickname"] if f else str(fid)
-        rows.append(
-            [
-                InlineKeyboardButton(text=f"💬 {name}", callback_data=f"friend_chat_{fid}"),
-                InlineKeyboardButton(text="❌", callback_data=f"friend_remove_{fid}"),
-            ]
-        )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_gift_menu_keyboard():
@@ -590,7 +566,6 @@ def init_user(user_id: int) -> dict:
             "filter_age_ranges": set(),  # ключі з AGE_RANGES (порожньо = будь-який вік)
             "filter_country": None,  # бажана країна співрозмовника (None = будь-яка)
             "last_partner_id": None,  # останній співрозмовник (для реконнекту)
-            "friends": set(),  # user_id друзів (додані за взаємною згодою)
         }
     return users_db[user_id]
 
@@ -2029,134 +2004,6 @@ async def reconnect_decline(call: types.CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
-# Друзі
-# ---------------------------------------------------------------------------
-@dp.message(F.text == BTN_ADD_FRIEND)
-async def add_friend_start(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-    partner_id = active_chats.get(user_id)
-    if partner_id is None:
-        await message.answer("Додавати в друзі можна лише під час чату.", reply_markup=get_main_keyboard())
-        return
-
-    u = init_user(user_id)
-    if partner_id in (u.get("friends") or set()):
-        await message.answer("Ви вже друзі! 👫")
-        return
-
-    friend_add_requests[partner_id] = user_id
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Прийняти", callback_data="friend_accept"),
-                InlineKeyboardButton(text="❌ Відхилити", callback_data="friend_decline"),
-            ]
-        ]
-    )
-    ok = await safe_send(
-        partner_id, f"🤝 <b>{esc(u['nickname'])}</b> хоче додати тебе в друзі. Прийняти?", reply_markup=kb
-    )
-    if ok:
-        await message.answer("🤝 Запит надіслано!")
-    else:
-        friend_add_requests.pop(partner_id, None)
-        await message.answer("❌ Не вдалося надіслати запит.")
-
-
-@dp.callback_query(F.data == "friend_accept")
-async def friend_accept(call: types.CallbackQuery):
-    acceptor_id = call.from_user.id
-    requester_id = friend_add_requests.pop(acceptor_id, None)
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-
-    if requester_id is None:
-        await call.answer("Запит уже неактуальний.", show_alert=True)
-        return
-
-    u = init_user(acceptor_id)
-    p = init_user(requester_id)
-    u.setdefault("friends", set()).add(requester_id)
-    p.setdefault("friends", set()).add(acceptor_id)
-
-    await call.message.answer(
-        f"🤝 Тепер ви з <b>{esc(p['nickname'])}</b> у друзях! Знайдеш їх у вкладці «{BTN_FRIENDS}»."
-    )
-    await safe_send(requester_id, f"🤝 <b>{esc(u['nickname'])}</b> прийняв твій запит у друзі!")
-    await call.answer()
-
-
-@dp.callback_query(F.data == "friend_decline")
-async def friend_decline(call: types.CallbackQuery):
-    acceptor_id = call.from_user.id
-    requester_id = friend_add_requests.pop(acceptor_id, None)
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-
-    if requester_id is not None:
-        await safe_send(requester_id, "❌ Запит у друзі відхилено.")
-    await call.answer("Відхилено.")
-
-
-@dp.message(F.text == BTN_FRIENDS)
-@dp.message(Command("friends"))
-async def friends_list(message: types.Message, state: FSMContext):
-    await state.clear()
-    u = init_user(message.from_user.id)
-    kb = get_friends_keyboard(u)
-    if kb is None:
-        await message.answer(
-            "👫 У тебе поки немає друзів.\n"
-            "Додай когось під час чату кнопкою «🤝 Додати в друзі» — за взаємною згодою."
-        )
-        return
-    await message.answer(
-        "👫 <b>Твої друзі</b>\n\n"
-        "Натисни «💬», щоб запросити людину в чат (вона має підтвердити), "
-        "або «❌», щоб прибрати з друзів.",
-        reply_markup=kb,
-    )
-
-
-@dp.callback_query(F.data.startswith("friend_chat_"))
-async def friend_chat_request(call: types.CallbackQuery):
-    target_id = int(call.data[len("friend_chat_"):])
-    error = await try_send_chat_invite(call.from_user.id, target_id)
-    if error:
-        await call.answer(error, show_alert=True)
-    else:
-        await call.answer("Запит надіслано! Чекай на відповідь.", show_alert=True)
-
-
-@dp.callback_query(F.data.startswith("friend_remove_"))
-async def friend_remove(call: types.CallbackQuery):
-    target_id = int(call.data[len("friend_remove_"):])
-    u = init_user(call.from_user.id)
-    u.get("friends", set()).discard(target_id)
-    p = users_db.get(target_id)
-    if p:
-        p.get("friends", set()).discard(call.from_user.id)
-
-    kb = get_friends_keyboard(u)
-    if kb is None:
-        try:
-            await call.message.edit_text("👫 У тебе більше немає друзів у списку.")
-        except TelegramAPIError:
-            await call.message.answer("👫 У тебе більше немає друзів у списку.")
-    else:
-        try:
-            await call.message.edit_reply_markup(reply_markup=kb)
-        except TelegramAPIError:
-            pass
-    await call.answer("Прибрано з друзів.")
-
-
-# ---------------------------------------------------------------------------
 # Лідерборд найщедріших дарувальників
 # ---------------------------------------------------------------------------
 async def show_top_gifters(message: types.Message):
@@ -2681,3 +2528,79 @@ async def start_web_server() -> web.AppRunner:
     await runner.setup()
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info("Веб-сервер запущено на порту %s", port)
+    return runner
+
+
+async def setup_bot_commands():
+    """Перекладає меню команд '/' на українську (замість заглушок command1, command2...)."""
+    default_commands = [
+        types.BotCommand(command="start", description="🚀 Почати / перезапустити бота"),
+        types.BotCommand(command="edit_profile", description="✏️ Редагувати профіль"),
+        types.BotCommand(command="stop", description="❌ Завершити чат"),
+        types.BotCommand(command="cancel", description="⬅️ Скасувати поточну дію"),
+        types.BotCommand(command="top", description="🏆 Топ дарувальників подарунків"),
+        types.BotCommand(command="filters", description="🎯 Фільтри пошуку"),
+        types.BotCommand(command="rooms", description="👥 Кімнати за інтересами"),
+        types.BotCommand(command="help", description="🆘 Допомога / зв'язок з адміном"),
+    ]
+    await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
+
+    if ADMIN_ID:
+        admin_commands = default_commands + [
+            types.BotCommand(command="admin", description="🔐 Адмін-панель"),
+            types.BotCommand(command="addbalance", description="💰 Поповнити баланс користувачу"),
+        ]
+        try:
+            await bot.set_my_commands(
+                admin_commands, scope=types.BotCommandScopeChat(chat_id=ADMIN_ID)
+            )
+        except TelegramAPIError as e:
+            # адмін ще жодного разу не писав боту — Telegram не дає встановити команди для нього
+            logging.warning("Не вдалося встановити адмін-команди: %s", e)
+
+
+async def main():
+    global BOT_USERNAME
+    logging.basicConfig(level=logging.INFO)
+    runner = await start_web_server()
+    poll_task = asyncio.create_task(crypto_poll_loop())
+    try:
+        # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
+        # Telegram API не вбивала весь процес (і "Application exited early" на Render).
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Не вдалося скинути webhook: %s", e)
+
+        try:
+            await setup_bot_commands()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Не вдалося встановити команди бота: %s", e)
+
+        try:
+            me = await bot.get_me()
+            BOT_USERNAME = me.username or ""
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Не вдалося отримати інформацію про бота (get_me): %s", e)
+
+        # Якщо polling впаде (напр. TelegramConflictError через старий інстанс),
+        # логуємо чітку причину і пробуємо знову, а не завершуємо процес.
+        while True:
+            try:
+                await dp.start_polling(bot)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logging.error("Помилка під час polling, перезапуск через 5с: %s", e)
+                await asyncio.sleep(5)
+    finally:
+        poll_task.cancel()
+        await bot.session.close()
+        await runner.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
