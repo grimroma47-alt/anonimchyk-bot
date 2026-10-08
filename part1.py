@@ -193,6 +193,8 @@ GIFT_SELLBACK_SHARE = float(os.getenv("GIFT_SELLBACK_SHARE", "0.5"))  # 50% ві
 # Автобан за скарги та антиспам-фільтр (посилання/контакти в чаті)
 # ---------------------------------------------------------------------------
 AUTO_BAN_REPORTS = int(os.getenv("AUTO_BAN_REPORTS", "3"))  # скарг до автобану
+UNBAN_BASE_PRICE = float(os.getenv("UNBAN_BASE_PRICE", "70"))  # перше платне розблокування, грн
+UNBAN_PRICE_STEP = float(os.getenv("UNBAN_PRICE_STEP", "70"))  # +стільки грн за кожен наступний бан
 LINK_REGEX = re.compile(
     r"(https?://\S+|t\.me/\S+|www\.\S+|@[a-zA-Z0-9_]{5,32})", re.IGNORECASE
 )
@@ -474,11 +476,18 @@ def get_rating_keyboard(partner_id: int):
     )
 
 
-def get_settings_keyboard():
+def get_settings_keyboard(u: dict | None = None):
+    protect_on = bool(u and u.get("protect_media"))
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=BTN_FILTERS, callback_data="filters_menu")],
             [InlineKeyboardButton(text="📋 Чорний список", callback_data="bl_view")],
+            [
+                InlineKeyboardButton(
+                    text=f"🔒 Захист моїх медіа: {'увімк ✅' if protect_on else 'вимк'} (💎)",
+                    callback_data="toggle_protect",
+                )
+            ],
         ]
     )
 
@@ -616,6 +625,9 @@ def init_user(user_id: int) -> dict:
             "last_partner_id": None,  # останній співрозмовник (для реконнекту)
             "friends": set(),  # user_id друзів (додані за взаємною згодою)
             "topup_total": 0.0,  # скільки грн поповнено реальними оплатами (для бонусу)
+            "protect_media": False,  # Premium: заборонити співрозмовникам пересилати/зберігати мої повідомлення
+            "ban_type": None,  # "auto" — автобан за скарги (можна викупити), "admin" — бан адміном
+            "ban_count": 0,  # скільки разів отримував автобан (від цього росте ціна розблокування)
         }
     return users_db[user_id]
 
@@ -678,6 +690,42 @@ async def safe_send(chat_id: int, text: str, **kwargs) -> bool:
     except TelegramAPIError as e:
         logging.warning("Не вдалося надіслати %s: %s", chat_id, e)
         return False
+
+
+def should_protect(u: dict | None) -> bool:
+    """Чи захищати повідомлення цієї людини від пересилання/збереження (Premium + увімкнено)."""
+    return bool(u and u.get("protect_media") and is_premium(u))
+
+
+def unban_price(u: dict) -> float:
+    """Ціна розблокування росте з кожним автобаном: 70, 140, 210... (налаштовується)."""
+    n = max(int(u.get("ban_count") or 1), 1)
+    return UNBAN_BASE_PRICE + UNBAN_PRICE_STEP * (n - 1)
+
+
+def register_auto_ban(u: dict):
+    u["ban_type"] = "auto"
+    u["ban_count"] = int(u.get("ban_count") or 0) + 1
+
+
+def banned_notice(user_id: int):
+    """Текст і кнопки для заблокованого користувача."""
+    u = init_user(user_id)
+    if u.get("ban_type") != "auto":
+        return "⛔ Вас заблоковано в цьому боті.", None
+    price = unban_price(u)
+    text = (
+        "🚨 Вас заблоковано через велику кількість скарг на ваш акаунт.\n\n"
+        f"Щоб відновити доступ, можна придбати розблокування за <b>{price:.0f} грн</b> з балансу.\n\n"
+        "⚠️ Після кожного наступного блокування ціна розблокування зростатиме."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🔓 Розблокування ({price:.0f} грн)", callback_data="unban_buy")],
+            [InlineKeyboardButton(text="💳 Поповнити баланс", callback_data="topup_open")],
+        ]
+    )
+    return text, kb
 
 
 def calc_topup_bonus(total_before: float, amount: float) -> float:
@@ -1371,7 +1419,7 @@ async def settings_handler(message: types.Message, state: FSMContext):
         f"А кожні {REFERRAL_PREMIUM_EVERY} запрошених — {REFERRAL_PREMIUM_DAYS} днів Premium у подарунок 💎\n"
         f"Твоє посилання:\n<code>{esc(ref_link)}</code>\n"
         f"Запрошено людей: {u.get('referral_count', 0)}",
-        reply_markup=get_settings_keyboard(),
+        reply_markup=get_settings_keyboard(u),
     )
 
 
