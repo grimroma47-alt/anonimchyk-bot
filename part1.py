@@ -45,6 +45,22 @@ USD_UAH_RATE = float(os.getenv("USD_UAH_RATE", "41"))
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
+# Хто й коли востаннє щось робив у боті — для кнопки "Онлайн".
+# Тримаємо лише в пам'яті (не в базі), щоб не записувати базу щохвилини.
+last_seen: dict[int, float] = {}
+ONLINE_WINDOW = int(os.getenv("ONLINE_WINDOW", "300"))  # "онлайн" = активний за останні N секунд
+
+
+@dp.update.outer_middleware()
+async def track_last_seen(handler, event, data):
+    try:
+        user = data.get("event_from_user")
+        if user is not None:
+            last_seen[user.id] = time.time()
+    except Exception:  # noqa: BLE001 — облік онлайну ніколи не має ламати обробку повідомлень
+        pass
+    return await handler(event, data)
+
 # ---------------------------------------------------------------------------
 # "База даних" у пам'яті (скидається при кожному перезапуску Render!)
 # Для постійного зберігання підключи PostgreSQL (Render Postgres) або SQLite з диском.
@@ -294,6 +310,7 @@ BTN_ROOM_REPORT = "🚨 Поскаржитися на учасника"
 BTN_HELP = "🆘 Допомога"
 BTN_FRIENDS = "👫 Друзі"
 BTN_TOPUP = "💳 Поповнити баланс"
+BTN_ONLINE = "👥 Онлайн"
 BTN_ADD_FRIEND = "🤝 Додати в друзі"
 
 
@@ -349,8 +366,9 @@ def get_main_keyboard():
             [KeyboardButton(text=BTN_SHOP), KeyboardButton(text=BTN_DAILY)],
             [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
             [KeyboardButton(text=BTN_ROOMS), KeyboardButton(text=BTN_FRIENDS)],
-            [KeyboardButton(text=BTN_FILTERS), KeyboardButton(text=BTN_LOTTERY)],
-            [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_HELP)],
+            [KeyboardButton(text=BTN_FILTERS), KeyboardButton(text=BTN_ONLINE)],
+            [KeyboardButton(text=BTN_LOTTERY), KeyboardButton(text=BTN_TOP)],
+            [KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )
