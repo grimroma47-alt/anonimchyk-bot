@@ -4,7 +4,10 @@ import asyncio
 import html
 import logging
 import os
+import random
+import re
 import time
+from datetime import date, timedelta
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, types
@@ -164,6 +167,7 @@ def get_gift_menu_keyboard():
         inline_keyboard=[
             [InlineKeyboardButton(text="💰 Гроші з балансу", callback_data="gift_money")],
             [InlineKeyboardButton(text="🎁 Подарунок з інвентарю", callback_data="gift_inventory")],
+            [InlineKeyboardButton(text="🛒 Магазин подарунків", callback_data="gift_catalog")],
         ]
     )
 
@@ -738,10 +742,21 @@ async def buy_gift_item(call: types.CallbackQuery):
     u.setdefault("gifts", {})
     u["gifts"][key] = u["gifts"].get(key, 0) + 1
 
-    await call.message.answer(
-        f"🎁 Куплено: <b>{esc(title)}</b>! Тепер у твоєму інвентарі. "
-        "Подарувати його можна будь-якому співрозмовнику під час чату."
-    )
+    # Якщо зараз в активному чаті — пропонуємо подарувати щойно куплене одразу
+    if call.from_user.id in active_chats:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"🎁 Подарувати {title} зараз", callback_data=f"sendgift_{key}")]
+            ]
+        )
+        await call.message.answer(
+            f"🎁 Куплено: <b>{esc(title)}</b>! Додано в інвентар.", reply_markup=kb
+        )
+    else:
+        await call.message.answer(
+            f"🎁 Куплено: <b>{esc(title)}</b>! Тепер у твоєму інвентарі. "
+            "Подарувати його можна будь-якому співрозмовнику під час чату."
+        )
     await call.answer()
 
 
@@ -901,6 +916,18 @@ async def gift_money_finish(message: types.Message, state: FSMContext):
     await safe_send(partner_id, f"🎁 Співрозмовник подарував вам {amount:.2f} грн!")
 
 
+@dp.callback_query(F.data == "gift_catalog")
+async def gift_catalog_in_chat(call: types.CallbackQuery):
+    if call.from_user.id not in active_chats:
+        await call.answer("Чат вже завершено", show_alert=True)
+        return
+    await call.message.answer(
+        "🛒 <b>Магазин подарунків</b>\n\nКупи подарунок — одразу запропоную подарувати його співрозмовнику:",
+        reply_markup=get_gift_catalog_keyboard(),
+    )
+    await call.answer()
+
+
 @dp.callback_query(F.data == "gift_inventory")
 async def gift_inventory_menu(call: types.CallbackQuery):
     if call.from_user.id not in active_chats:
@@ -909,8 +936,13 @@ async def gift_inventory_menu(call: types.CallbackQuery):
     u = init_user(call.from_user.id)
     kb = get_gift_inventory_keyboard(u)
     if not kb.inline_keyboard:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🛒 Відкрити магазин подарунків", callback_data="gift_catalog")]
+            ]
+        )
         await call.message.answer(
-            "У тебе ще немає подарунків в інвентарі. Купи їх у 🏪 Магазині (там же, де перки)."
+            "У тебе ще немає подарунків в інвентарі.", reply_markup=kb
         )
         await call.answer()
         return
