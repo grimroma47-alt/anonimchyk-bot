@@ -815,6 +815,8 @@ def _db_connect():
 
     url = urlparse(DATABASE_URL)
     sslmode = (parse_qs(url.query).get("sslmode") or ["require"])[0]
+    host = url.hostname or "localhost"
+    port = url.port or 5432
     if sslmode == "disable":
         ssl_context = None
     elif sslmode in ("verify-ca", "verify-full"):
@@ -825,11 +827,24 @@ def _db_connect():
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
+    if sslmode not in ("verify-ca", "verify-full"):
+        # Перетворюємо назву сервера на IP-адресу (спершу IPv4): бібліотека на Render
+        # падала з "... does not appear to be an IPv4 or IPv6 address" на назві сервера.
+        import socket
+
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        except socket.gaierror:
+            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        if not infos:
+            raise ConnectionError(f"Не вдалося знайти IP-адресу сервера бази {host}")
+        host = infos[0][4][0]
+
     return pg8000.native.Connection(
         user=unquote(url.username or ""),
         password=unquote(url.password or ""),
-        host=url.hostname or "localhost",
-        port=url.port or 5432,
+        host=host,
+        port=port,
         database=(url.path or "/postgres").lstrip("/") or "postgres",
         ssl_context=ssl_context,
         timeout=30,
