@@ -142,6 +142,14 @@ def spin_lottery():
 GIFT_SELLBACK_SHARE = float(os.getenv("GIFT_SELLBACK_SHARE", "0.5"))  # 50% від ціни
 
 # ---------------------------------------------------------------------------
+# Автобан за скарги та антиспам-фільтр (посилання/контакти в чаті)
+# ---------------------------------------------------------------------------
+AUTO_BAN_REPORTS = int(os.getenv("AUTO_BAN_REPORTS", "3"))  # скарг до автобану
+LINK_REGEX = re.compile(
+    r"(https?://\S+|t\.me/\S+|www\.\S+|@[a-zA-Z0-9_]{5,32})", re.IGNORECASE
+)
+
+# ---------------------------------------------------------------------------
 # Щоденний бонус: кожен день — трохи грн, кожен 5-й день поспіль — подарунок
 # ---------------------------------------------------------------------------
 DAILY_BONUS_AMOUNT = float(os.getenv("DAILY_BONUS_AMOUNT", "2"))  # грн за звичайний день
@@ -202,6 +210,7 @@ BTN_REPORT = "🚨 Поскаржитися"
 BTN_GIFT = "🎁 Подарувати"
 BTN_DAILY = "🎁 Щоденний бонус"
 BTN_LOTTERY = "🎰 Рулетка"
+BTN_TOP = "🏆 Топ дарувальників"
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +247,7 @@ def get_main_keyboard():
             [KeyboardButton(text=BTN_SHOP), KeyboardButton(text=BTN_WALLET)],
             [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
             [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_LOTTERY)],
+            [KeyboardButton(text=BTN_TOP)],
         ],
         resize_keyboard=True,
     )
@@ -312,6 +322,17 @@ def get_wallet_keyboard():
     )
 
 
+def get_rating_keyboard(partner_id: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👍", callback_data=f"rate_up_{partner_id}"),
+                InlineKeyboardButton(text="👎", callback_data=f"rate_down_{partner_id}"),
+            ]
+        ]
+    )
+
+
 def get_admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -355,6 +376,9 @@ def init_user(user_id: int) -> dict:
             "gifts_sent_count": 0,  # скільки подарунків подарував (для досягнень)
             "referred_by": None,  # хто запросив цього користувача
             "referral_count": 0,  # скільки людей запросив сам
+            "reports_received": 0,  # скільки скарг отримав (для автобану)
+            "rating_up": 0,  # 👍 після чатів
+            "rating_down": 0,  # 👎 після чатів
         }
     return users_db[user_id]
 
@@ -388,6 +412,15 @@ def end_chat(user_id: int):
     if partner_id is not None:
         active_chats.pop(partner_id, None)
     return partner_id
+
+
+async def send_rating_request(chat_id: int, partner_id: int):
+    """Пропонує оцінити співрозмовника 👍/👎 після завершення чату."""
+    await safe_send(
+        chat_id,
+        "Оціни співрозмовника, будь ласка:",
+        reply_markup=get_rating_keyboard(partner_id),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1127,6 +1160,60 @@ async def stop_chat(message: types.Message, state: FSMContext):
 
     await message.answer("Чат завершено.", reply_markup=get_main_keyboard())
     await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+    await send_rating_request(user_id, partner_id)
+    await send_rating_request(partner_id, user_id)
+
+
+@dp.callback_query(F.data.startswith("rate_up_"))
+async def rate_up_handler(call: types.CallbackQuery):
+    target_id = int(call.data[len("rate_up_"):])
+    u = init_user(target_id)
+    u["rating_up"] = u.get("rating_up", 0) + 1
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer("Дякуємо за оцінку! 👍")
+
+
+@dp.callback_query(F.data.startswith("rate_down_"))
+async def rate_down_handler(call: types.CallbackQuery):
+    target_id = int(call.data[len("rate_down_"):])
+    u = init_user(target_id)
+    u["rating_down"] = u.get("rating_down", 0) + 1
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer("Дякуємо за оцінку! 👎")
+
+
+# ---------------------------------------------------------------------------
+# Лідерборд найщедріших дарувальників
+# ---------------------------------------------------------------------------
+async def show_top_gifters(message: types.Message):
+    top = sorted(
+        users_db.items(), key=lambda kv: kv[1].get("gifts_sent_count", 0), reverse=True
+    )[:10]
+    top = [(uid, u) for uid, u in top if u.get("gifts_sent_count", 0) > 0]
+
+    if not top:
+        await message.answer("Поки що ніхто не дарував подарунків. Будь першим! 🎁")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 <b>Топ дарувальників подарунків</b>\n"]
+    for i, (uid, u) in enumerate(top, start=1):
+        rank = medals[i - 1] if i <= 3 else f"{i}."
+        lines.append(f"{rank} {esc(u['nickname'])} — {u.get('gifts_sent_count', 0)} 🎁")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(F.text == BTN_TOP)
+@dp.message(Command("top"))
+async def top_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    await show_top_gifters(message)
 
 
 @dp.message(F.text == BTN_REPORT)
@@ -1150,10 +1237,27 @@ async def report_handler(message: types.Message):
         }
     )
 
+    p = init_user(partner_id)
+    p["reports_received"] = p.get("reports_received", 0) + 1
+    auto_banned = False
+    if p["reports_received"] >= AUTO_BAN_REPORTS and partner_id not in banned_users:
+        banned_users.add(partner_id)
+        auto_banned = True
+        if partner_id in queue:
+            queue.remove(partner_id)
+        await safe_send(
+            partner_id, f"⛔ Вас автоматично заблоковано після {AUTO_BAN_REPORTS} скарг."
+        )
+
     if ADMIN_ID:
+        extra = (
+            f"\n\n⛔ Автобан: досягнуто {AUTO_BAN_REPORTS} скарг, користувача заблоковано автоматично."
+            if auto_banned
+            else ""
+        )
         await safe_send(
             ADMIN_ID,
-            f"🚨 Нова скарга #{report_counter}\nВід: <code>{user_id}</code>\nНа: <code>{partner_id}</code>\n\n"
+            f"🚨 Нова скарга #{report_counter}\nВід: <code>{user_id}</code>\nНа: <code>{partner_id}</code>{extra}\n\n"
             "Переглянути список: /admin",
         )
     end_chat(user_id)
@@ -1352,6 +1456,8 @@ async def adm_stats(call: types.CallbackQuery):
         f"• Дохід з подарунків: {gift_revenue_total:.2f} грн\n"
         f"• Дохід з рулетки: {lottery_revenue_total:.2f} грн\n"
         f"• Запрошень за реферальною програмою: {total_referrals}\n"
+        f"• Автобан після {AUTO_BAN_REPORTS} скарг (users у режимі спостереження: "
+        f"{sum(1 for u in users_db.values() if 0 < u.get('reports_received', 0) < AUTO_BAN_REPORTS)})\n"
     )
     await call.message.answer(text)
     await call.answer()
@@ -1513,6 +1619,13 @@ async def relay_messages(message: types.Message):
         await message.answer("Скористайтеся меню нижче:", reply_markup=get_main_keyboard())
         return
 
+    text_to_check = message.text or message.caption
+    if text_to_check and LINK_REGEX.search(text_to_check):
+        await message.answer(
+            "🚫 Повідомлення з посиланнями або контактами заборонено — спілкуйтесь анонімно в боті."
+        )
+        return
+
     try:
         await message.copy_to(chat_id=partner_id)
     except TelegramAPIError:
@@ -1549,6 +1662,7 @@ async def setup_bot_commands():
         types.BotCommand(command="edit_profile", description="✏️ Редагувати профіль"),
         types.BotCommand(command="stop", description="❌ Завершити чат"),
         types.BotCommand(command="cancel", description="⬅️ Скасувати поточну дію"),
+        types.BotCommand(command="top", description="🏆 Топ дарувальників подарунків"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
 
