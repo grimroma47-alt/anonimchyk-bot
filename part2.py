@@ -397,7 +397,7 @@ async def unban_buy(call: types.CallbackQuery):
     if ADMIN_ID:
         await safe_send(
             ADMIN_ID,
-            f"🔓 Користувач <code>{user_id}</code> викупив розблокування за {price:.0f} грн "
+            f"🔓 Користувач {admin_label(user_id)} викупив розблокування за {price:.0f} грн "
             f"(автобан №{u.get('ban_count', 1)}).",
         )
     await call.answer()
@@ -619,7 +619,7 @@ async def room_report_submit(call: types.CallbackQuery):
         )
         await safe_send(
             ADMIN_ID,
-            f"🚨 Скарга з кімнати #{report_counter}\nВід: <code>{user_id}</code>\nНа: <code>{target_id}</code>{extra}",
+            f"🚨 Скарга з кімнати #{report_counter}\nВід: {admin_label(user_id)}\nНа: {admin_label(target_id)}{extra}",
         )
 
     await call.message.answer("🚨 Скаргу надіслано, дякуємо!")
@@ -1107,7 +1107,7 @@ async def report_handler(message: types.Message):
         )
         await safe_send(
             ADMIN_ID,
-            f"🚨 Нова скарга #{report_counter}\nВід: <code>{user_id}</code>\nНа: <code>{partner_id}</code>{extra}\n\n"
+            f"🚨 Нова скарга #{report_counter}\nВід: {admin_label(user_id)}\nНа: {admin_label(partner_id)}{extra}\n\n"
             "Переглянути список: /admin",
         )
     end_chat(user_id)
@@ -1334,7 +1334,7 @@ async def adm_reports(call: types.CallbackQuery):
     lines = ["🚨 <b>Скарги (нові):</b>\n"]
     buttons = []
     for r in chunk:
-        lines.append(f"#{r['id']} — {r['time']}\nВід <code>{r['from']}</code> на <code>{r['on']}</code>\n")
+        lines.append(f"#{r['id']} — {r['time']}\nВід {admin_label(r['from'])}\nНа {admin_label(r['on'])}\n")
         buttons.append(
             [
                 InlineKeyboardButton(text=f"⛔ Бан #{r['id']} (на кого скарга)", callback_data=f"adm_banrep_{r['id']}"),
@@ -1364,7 +1364,7 @@ async def adm_ban_from_report(call: types.CallbackQuery):
     if rep["on"] in queue:
         queue.remove(rep["on"])
     await safe_send(rep["on"], "⛔ Вас заблоковано адміністратором за скаргою.")
-    await call.message.answer(f"⛔ Користувача <code>{rep['on']}</code> забанено.")
+    await call.message.answer(f"⛔ Користувача {admin_label(rep['on'])} забанено.")
     await call.answer()
 
 
@@ -1384,7 +1384,7 @@ async def adm_close_report(call: types.CallbackQuery):
 @dp.callback_query(F.data == "adm_ban")
 @admin_only
 async def adm_ban_start(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer("Введіть user_id, якого треба забанити:")
+    await call.message.answer("Введіть ID користувача, якого треба забанити (наш ID_1001 або Telegram ID):")
     await state.set_state(AdminStates.ban_id)
     await call.answer()
 
@@ -1394,10 +1394,9 @@ async def adm_ban_finish(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.clear()
-    try:
-        target = int(message.text.strip())
-    except ValueError:
-        await message.answer("Потрібно надіслати число (user_id).")
+    target = resolve_user_id(message.text)
+    if target is None:
+        await message.answer("Не знайшов такого користувача. Надішли Telegram ID або наш ID (напр. ID_1001).")
         return
     banned_users.add(target)
     init_user(target)["ban_type"] = "admin"
@@ -1405,14 +1404,14 @@ async def adm_ban_finish(message: types.Message, state: FSMContext):
     remove_from_room(target)
     if target in queue:
         queue.remove(target)
-    await message.answer(f"⛔ Користувача <code>{target}</code> забанено.")
+    await message.answer(f"⛔ Користувача {admin_label(target)} забанено.")
     await safe_send(target, "⛔ Вас заблоковано адміністратором.")
 
 
 @dp.callback_query(F.data == "adm_unban")
 @admin_only
 async def adm_unban_start(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer("Введіть user_id, якого треба розбанити:")
+    await call.message.answer("Введіть ID користувача, якого треба розбанити (наш ID_1001 або Telegram ID):")
     await state.set_state(AdminStates.unban_id)
     await call.answer()
 
@@ -1422,16 +1421,15 @@ async def adm_unban_finish(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.clear()
-    try:
-        target = int(message.text.strip())
-    except ValueError:
-        await message.answer("Потрібно надіслати число (user_id).")
+    target = resolve_user_id(message.text)
+    if target is None:
+        await message.answer("Не знайшов такого користувача. Надішли Telegram ID або наш ID (напр. ID_1001).")
         return
     banned_users.discard(target)
     if target in users_db:
         users_db[target]["ban_type"] = None
         users_db[target]["reports_received"] = 0
-    await message.answer(f"✅ Користувача <code>{target}</code> розбанено.")
+    await message.answer(f"✅ Користувача {admin_label(target)} розбанено.")
     await safe_send(target, "✅ Вас розблоковано адміністратором.")
 
 
