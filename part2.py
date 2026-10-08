@@ -318,6 +318,92 @@ async def topup_pay_crypto(call: types.CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
+# Захист медіа (Premium) і платне розблокування після автобану
+# ---------------------------------------------------------------------------
+async def _toggle_protect(user_id: int) -> str:
+    u = init_user(user_id)
+    if not is_premium(u):
+        return (
+            "🔒 <b>Захист медіа</b> доступний з Premium 💎\n\n"
+            "Співрозмовники не зможуть пересилати й зберігати твої фото, відео та повідомлення. "
+            f"Premium можна придбати в «{BTN_SHOP}»."
+        )
+    u["protect_media"] = not u.get("protect_media")
+    request_save()
+    if u["protect_media"]:
+        return (
+            "🔒 Захист медіа <b>увімкнено</b>.\n"
+            "Співрозмовники та друзі не зможуть пересилати чи зберігати твої повідомлення й медіа "
+            "(на більшості телефонів — і робити скріншоти)."
+        )
+    return "🔓 Захист медіа <b>вимкнено</b>."
+
+
+@dp.callback_query(F.data == "toggle_protect")
+async def toggle_protect_button(call: types.CallbackQuery):
+    text = await _toggle_protect(call.from_user.id)
+    try:
+        await call.message.edit_reply_markup(reply_markup=get_settings_keyboard(init_user(call.from_user.id)))
+    except TelegramAPIError:
+        pass
+    await call.message.answer(text)
+    await call.answer()
+
+
+@dp.message(Command("silent"))
+async def silent_command(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(await _toggle_protect(message.from_user.id))
+
+
+@dp.callback_query(F.data == "unban_buy")
+async def unban_buy(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    u = init_user(user_id)
+    if user_id not in banned_users:
+        await call.answer("Ти не заблокований 🙂", show_alert=True)
+        return
+    if u.get("ban_type") != "auto":
+        await call.answer("Цей бан можна зняти лише через адміністратора (🆘 Допомога).", show_alert=True)
+        return
+
+    price = unban_price(u)
+    if u["balance"] < price:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="💳 Поповнити баланс", callback_data="topup_open")]]
+        )
+        await call.message.answer(
+            f"❌ Недостатньо коштів. Розблокування коштує {price:.0f} грн, на балансі {u['balance']:.2f} грн.",
+            reply_markup=kb,
+        )
+        await call.answer()
+        return
+
+    u["balance"] -= price
+    banned_users.discard(user_id)
+    u["ban_type"] = None
+    u["reports_received"] = 0
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    next_price = UNBAN_BASE_PRICE + UNBAN_PRICE_STEP * int(u.get("ban_count") or 1)
+    await call.message.answer(
+        f"✅ Доступ відновлено! Списано {price:.0f} грн.\n"
+        f"Будь ласка, дотримуйся правил — наступне розблокування коштуватиме {next_price:.0f} грн.",
+        reply_markup=get_main_keyboard(),
+    )
+    if ADMIN_ID:
+        await safe_send(
+            ADMIN_ID,
+            f"🔓 Користувач <code>{user_id}</code> викупив розблокування за {price:.0f} грн "
+            f"(автобан №{u.get('ban_count', 1)}).",
+        )
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
 # Рулетка (лотерея за грн)
 # ---------------------------------------------------------------------------
 def get_lottery_keyboard():
@@ -384,7 +470,8 @@ async def rooms_menu(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
 
     if user_id in banned_users:
-        await message.answer("⛔ Вас заблоковано в цьому боті.")
+        ban_text, ban_kb = banned_notice(user_id)
+        await message.answer(ban_text, reply_markup=ban_kb)
         return
     if user_id in user_room:
         await message.answer("Ти вже в кімнаті. Спочатку вийди з неї.", reply_markup=get_room_keyboard())
@@ -514,14 +601,15 @@ async def room_report_submit(call: types.CallbackQuery):
     auto_banned = False
     if p["reports_received"] >= AUTO_BAN_REPORTS and target_id not in banned_users:
         banned_users.add(target_id)
+        register_auto_ban(p)
+        request_save()
         auto_banned = True
         if target_id in queue:
             queue.remove(target_id)
         remove_from_room(target_id)
         end_chat(target_id)
-        await safe_send(
-            target_id, f"⛔ Вас автоматично заблоковано після {AUTO_BAN_REPORTS} скарг."
-        )
+        ban_text, ban_kb = banned_notice(target_id)
+        await safe_send(target_id, ban_text, reply_markup=ban_kb)
 
     if ADMIN_ID:
         extra = (
@@ -547,7 +635,8 @@ async def search_partner(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
 
     if user_id in banned_users:
-        await message.answer("⛔ Вас заблоковано в цьому боті.")
+        ban_text, ban_kb = banned_notice(user_id)
+        await message.answer(ban_text, reply_markup=ban_kb)
         return
 
     u = init_user(user_id)
@@ -883,14 +972,17 @@ async def deliver_friend_message(sender_id: int, target_id: int, message: types.
         inline_keyboard=[[InlineKeyboardButton(text="↩️ Відповісти", callback_data=f"fmsg_{sender_id}")]]
     )
     header = f"💌 <b>{esc(u['nickname'])}</b> (друг):"
+    protect = should_protect(u)
     try:
         if message.text:
-            sent = await bot.send_message(target_id, f"{header}\n{esc(message.text)}", reply_markup=kb)
+            sent = await bot.send_message(
+                target_id, f"{header}\n{esc(message.text)}", reply_markup=kb, protect_content=protect
+            )
             _remember_friend_msg(target_id, sent.message_id, sender_id)
         else:
             head = await bot.send_message(target_id, header)
             _remember_friend_msg(target_id, head.message_id, sender_id)
-            copied = await message.copy_to(chat_id=target_id, reply_markup=kb)
+            copied = await message.copy_to(chat_id=target_id, reply_markup=kb, protect_content=protect)
             _remember_friend_msg(target_id, copied.message_id, sender_id)
     except TelegramAPIError:
         return "Не вдалося доставити — друг зараз недоступний."
@@ -998,13 +1090,14 @@ async def report_handler(message: types.Message):
     auto_banned = False
     if p["reports_received"] >= AUTO_BAN_REPORTS and partner_id not in banned_users:
         banned_users.add(partner_id)
+        register_auto_ban(p)
+        request_save()
         auto_banned = True
         if partner_id in queue:
             queue.remove(partner_id)
         remove_from_room(partner_id)
-        await safe_send(
-            partner_id, f"⛔ Вас автоматично заблоковано після {AUTO_BAN_REPORTS} скарг."
-        )
+        ban_text, ban_kb = banned_notice(partner_id)
+        await safe_send(partner_id, ban_text, reply_markup=ban_kb)
 
     if ADMIN_ID:
         extra = (
@@ -1264,6 +1357,7 @@ async def adm_ban_from_report(call: types.CallbackQuery):
         await call.answer("Скаргу не знайдено", show_alert=True)
         return
     banned_users.add(rep["on"])
+    init_user(rep["on"])["ban_type"] = "admin"
     rep["status"] = "оброблена"
     end_chat(rep["on"])
     remove_from_room(rep["on"])
@@ -1306,6 +1400,7 @@ async def adm_ban_finish(message: types.Message, state: FSMContext):
         await message.answer("Потрібно надіслати число (user_id).")
         return
     banned_users.add(target)
+    init_user(target)["ban_type"] = "admin"
     end_chat(target)
     remove_from_room(target)
     if target in queue:
@@ -1333,6 +1428,9 @@ async def adm_unban_finish(message: types.Message, state: FSMContext):
         await message.answer("Потрібно надіслати число (user_id).")
         return
     banned_users.discard(target)
+    if target in users_db:
+        users_db[target]["ban_type"] = None
+        users_db[target]["reports_received"] = 0
     await message.answer(f"✅ Користувача <code>{target}</code> розбанено.")
     await safe_send(target, "✅ Вас розблоковано адміністратором.")
 
@@ -1481,7 +1579,7 @@ async def relay_messages(message: types.Message):
         return
 
     try:
-        await message.copy_to(chat_id=partner_id)
+        await message.copy_to(chat_id=partner_id, protect_content=should_protect(users_db.get(user_id)))
     except TelegramAPIError:
         end_chat(user_id)
         await message.answer(
@@ -1521,6 +1619,7 @@ async def setup_bot_commands():
         types.BotCommand(command="rooms", description="👥 Кімнати за інтересами"),
         types.BotCommand(command="help", description="🆘 Допомога / зв'язок з адміном"),
         types.BotCommand(command="friends", description="👫 Друзі"),
+        types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
 
@@ -1546,6 +1645,7 @@ async def main():
     await load_state_from_db()
     poll_task = asyncio.create_task(crypto_poll_loop())
     save_task = asyncio.create_task(persistence_loop())
+    lease_task = asyncio.create_task(lease_heartbeat_loop())
     try:
         # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
         # Telegram API не вбивала весь процес (і "Application exited early" на Render).
@@ -1579,7 +1679,9 @@ async def main():
     finally:
         poll_task.cancel()
         save_task.cancel()
+        lease_task.cancel()
         await save_state_to_db()  # фінальне збереження при зупинці (деплой/перезапуск)
+        await release_lease()  # тепер нова копія може забрати свіжі дані
         await bot.session.close()
         await runner.cleanup()
 
