@@ -153,6 +153,171 @@ async def sell_gift_item(call: types.CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
+# Поповнення на довільну суму (велика кнопка в меню) + бонус за кожні 500 грн
+# ---------------------------------------------------------------------------
+TOPUP_AMOUNT_REGEX = re.compile(r"^\s*(\d{1,6})(?:[.,]0+)?\s*(?:грн|uah|₴)?\s*$", re.IGNORECASE)
+
+
+def get_topup_amounts_keyboard():
+    row1 = [
+        InlineKeyboardButton(text=f"{a} грн", callback_data=f"topup_amt_{a}") for a in TOPUP_QUICK_AMOUNTS[:3]
+    ]
+    row2 = [
+        InlineKeyboardButton(text=f"{a} грн", callback_data=f"topup_amt_{a}") for a in TOPUP_QUICK_AMOUNTS[3:]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[row for row in (row1, row2) if row])
+
+
+async def topup_ask_amount(message: types.Message, user_id: int, state: FSMContext):
+    u = init_user(user_id)
+    await state.set_state(TopupStates.amount)
+    text = (
+        "💳 <b>Поповнення балансу</b>\n\n"
+        f"Напиши суму в гривнях ({TOPUP_MIN}–{TOPUP_MAX}) або обери готову нижче.\n"
+    )
+    if TOPUP_BONUS_STEP > 0 and TOPUP_BONUS_AMOUNT > 0:
+        text += (
+            f"\n🎁 За кожні <b>{TOPUP_BONUS_STEP:.0f} грн</b> поповнень — бонус "
+            f"<b>+{TOPUP_BONUS_AMOUNT:.0f} грн</b>!\n{topup_progress_text(u)}"
+        )
+    await message.answer(text, reply_markup=get_topup_amounts_keyboard())
+
+
+async def topup_show_methods(message: types.Message, user_id: int, amount: int):
+    u = init_user(user_id)
+    total = float(u.get("topup_total") or 0.0)
+    bonus = calc_topup_bonus(total, amount)
+    text = f"💳 Сума поповнення: <b>{amount} грн</b>\n"
+    if bonus:
+        text += f"🎉 Ця оплата принесе бонус <b>+{bonus:.0f} грн</b>!\n"
+    elif TOPUP_BONUS_STEP > 0 and TOPUP_BONUS_AMOUNT > 0:
+        left = TOPUP_BONUS_STEP - ((total + amount) % TOPUP_BONUS_STEP)
+        text += f"🎁 Після цієї оплати до бонусу лишиться {left:.0f} грн.\n"
+    text += "\nОбери спосіб оплати:"
+
+    buttons = [[InlineKeyboardButton(text=f"⭐ Telegram Stars ({amount} ⭐)", callback_data=f"topup_stars_{amount}")]]
+    if CRYPTO_PAY_TOKEN:
+        usdt = round(amount / USD_UAH_RATE, 2)
+        buttons.append(
+            [InlineKeyboardButton(text=f"💎 Крипта (~{usdt} USDT)", callback_data=f"topup_crypto_{amount}")]
+        )
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+def _parse_topup_amount(raw: str) -> int | None:
+    try:
+        amount = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if not (TOPUP_MIN <= amount <= TOPUP_MAX):
+        return None
+    return amount
+
+
+@dp.message(F.text == BTN_TOPUP)
+@dp.message(Command("topup"))
+async def topup_start(message: types.Message, state: FSMContext):
+    await topup_ask_amount(message, message.from_user.id, state)
+
+
+@dp.callback_query(F.data == "topup_open")
+async def topup_open(call: types.CallbackQuery, state: FSMContext):
+    await topup_ask_amount(call.message, call.from_user.id, state)
+    await call.answer()
+
+
+def _is_topup_amount_text(message: types.Message) -> bool:
+    return bool(message.text and TOPUP_AMOUNT_REGEX.match(message.text))
+
+
+@dp.message(TopupStates.amount, _is_topup_amount_text)
+async def topup_amount_entered(message: types.Message, state: FSMContext):
+    m = TOPUP_AMOUNT_REGEX.match(message.text)
+    amount = _parse_topup_amount(m.group(1)) if m else None
+    if amount is None:
+        await message.answer(f"Сума має бути від {TOPUP_MIN} до {TOPUP_MAX} грн. Спробуй ще раз або /cancel.")
+        return
+    await state.clear()
+    await topup_show_methods(message, message.from_user.id, amount)
+
+
+@dp.callback_query(F.data.startswith("topup_amt_"))
+async def topup_amount_button(call: types.CallbackQuery, state: FSMContext):
+    amount = _parse_topup_amount(call.data[len("topup_amt_"):])
+    if amount is None:
+        await call.answer("Недоступна сума.", show_alert=True)
+        return
+    await state.clear()
+    await topup_show_methods(call.message, call.from_user.id, amount)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("topup_stars_"))
+async def topup_pay_stars(call: types.CallbackQuery):
+    amount = _parse_topup_amount(call.data[len("topup_stars_"):])
+    if amount is None:
+        await call.answer("Недоступна сума.", show_alert=True)
+        return
+    try:
+        await bot.send_invoice(
+            chat_id=call.message.chat.id,
+            title=f"Поповнення на {amount} грн",
+            description=f"Купівля {amount} Telegram Stars для поповнення балансу бота",
+            payload=f"stars_{amount}_{call.from_user.id}",
+            provider_token="",  # для Stars (валюта XTR) токен провайдера не потрібен
+            currency="XTR",
+            prices=[types.LabeledPrice(label=f"{amount} Stars", amount=amount)],
+        )
+    except TelegramAPIError as e:
+        logging.warning("Не вдалося створити рахунок Stars на %s: %s", amount, e)
+        await call.message.answer(
+            "❌ Telegram не прийняв рахунок на таку суму в Stars. Спробуй меншу суму або оплату криптою."
+        )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("topup_crypto_"))
+async def topup_pay_crypto(call: types.CallbackQuery):
+    if not CRYPTO_PAY_TOKEN:
+        await call.answer("Оплата криптою зараз недоступна", show_alert=True)
+        return
+    amount = _parse_topup_amount(call.data[len("topup_crypto_"):])
+    if amount is None:
+        await call.answer("Недоступна сума.", show_alert=True)
+        return
+    usdt = round(amount / USD_UAH_RATE, 2)
+    result = await create_crypto_invoice(call.from_user.id, usdt)
+    if result is None:
+        await call.message.answer(
+            "❌ Не вдалося створити рахунок. Можливо, сума замала для крипти — спробуй більшу або Stars."
+        )
+        await call.answer()
+        return
+
+    invoice_id = str(result["invoice_id"])
+    pay_url = result.get("pay_url") or result.get("bot_invoice_url") or result.get("mini_app_invoice_url")
+    pending_crypto_invoices[invoice_id] = {
+        "user_id": call.from_user.id,
+        "amount": usdt,
+        "credit": float(amount),  # зараховуємо рівно ту суму в грн, яку людина обрала
+    }
+    request_save()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатити", url=pay_url)],
+            [InlineKeyboardButton(text="✅ Перевірити оплату", callback_data=f"dep_check_{invoice_id}")],
+        ]
+    )
+    await call.message.answer(
+        f"Рахунок на {usdt} USDT створено.\n"
+        f"Після оплати баланс поповниться на {amount} грн автоматично, "
+        "або натисни «Перевірити оплату».",
+        reply_markup=kb,
+    )
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
 # Рулетка (лотерея за грн)
 # ---------------------------------------------------------------------------
 def get_lottery_keyboard():
