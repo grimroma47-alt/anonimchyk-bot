@@ -712,6 +712,7 @@ async def search_partner(message: types.Message, state: FSMContext):
         else:
             queue.append(user_id)
         await message.answer("Шукаємо співрозмовника... Зачекай ⏳")
+        await maybe_show_ad(user_id)
 
 
 @dp.message(F.text == BTN_STOP)
@@ -1303,12 +1304,15 @@ async def admin_password(message: types.Message, state: FSMContext):
 
 
 def admin_only(func):
+    # functools.wraps — щоб aiogram бачив справжні параметри функції (call, state тощо)
+    # і не передавав у неї зайвих аргументів.
+    @functools.wraps(func)
     async def wrapper(call: types.CallbackQuery, *args, **kwargs):
         if call.from_user.id != ADMIN_ID or call.from_user.id not in authorized_admins:
             await call.answer("Доступ заборонено", show_alert=True)
             return
         return await func(call, *args, **kwargs)
-    wrapper.__name__ = func.__name__
+
     return wrapper
 
 
@@ -1516,6 +1520,196 @@ async def adm_reply_finish(message: types.Message, state: FSMContext):
         await message.answer("✅ Відповідь надіслано користувачу.")
     else:
         await message.answer("❌ Не вдалося надіслати — користувач недоступний.")
+
+
+# ---------------------------------------------------------------------------
+# Реклама в черзі пошуку (керується з адмінки; Premium — без реклами)
+# ---------------------------------------------------------------------------
+ADS_COOLDOWN = int(os.getenv("ADS_COOLDOWN", "300"))  # не частіше ніж раз на N секунд для людини
+AD_MAX_LEN = 300
+ad_last_shown: dict[int, float] = {}
+
+
+def pick_ad_for(user_id: int, now: float | None = None) -> dict | None:
+    """Яку рекламу показати людині (або None): без Premium, з паузою між показами."""
+    now = time.time() if now is None else now
+    u = init_user(user_id)
+    if is_premium(u):
+        return None
+    active = [a for a in ads if a.get("active")]
+    if not active:
+        return None
+    if now - ad_last_shown.get(user_id, 0) < ADS_COOLDOWN:
+        return None
+    return random.choice(active)
+
+
+def _ad_keyboard(ad: dict):
+    if not ad.get("url"):
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👉 Перейти", url=ad["url"])]])
+
+
+def _ad_text(ad: dict) -> str:
+    return f"📣 <i>Реклама</i>\n\n{esc(ad['text'])}"
+
+
+async def maybe_show_ad(user_id: int):
+    try:
+        ad = pick_ad_for(user_id)
+        if ad is None:
+            return
+        if await safe_send(user_id, _ad_text(ad), reply_markup=_ad_keyboard(ad)):
+            ad["shows"] = ad.get("shows", 0) + 1
+            ad_last_shown[user_id] = time.time()
+    except Exception as e:  # noqa: BLE001 — реклама ніколи не має ламати пошук
+        logging.warning("Не вдалося показати рекламу: %s", e)
+
+
+def normalize_ad_url(raw: str) -> str | None:
+    raw = (raw or "").strip()
+    if raw.startswith("@") and len(raw) > 1:
+        return f"https://t.me/{raw[1:]}"
+    if raw.startswith("t.me/"):
+        return f"https://{raw}"
+    if raw.startswith(("https://", "http://")) and " " not in raw:
+        return raw
+    return None
+
+
+def ads_admin_view():
+    lines = ["📣 <b>Реклама в черзі пошуку</b>", "Показується тим, хто чекає співрозмовника (крім Premium)."]
+    rows = []
+    if not ads:
+        lines.append("\nПоки немає жодного оголошення.")
+    for ad in ads:
+        status = "✅ активна" if ad.get("active") else "⏸ на паузі"
+        link = f"\n🔗 {esc(ad['url'])}" if ad.get("url") else ""
+        lines.append(
+            f"\n<b>#{ad['id']}</b> — {status}, показів: {ad.get('shows', 0)}\n{esc(ad['text'][:150])}{link}"
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{'⏸ Пауза' if ad.get('active') else '▶️ Увімкнути'} #{ad['id']}",
+                    callback_data=f"adm_adtoggle_{ad['id']}",
+                ),
+                InlineKeyboardButton(text=f"🗑 Видалити #{ad['id']}", callback_data=f"adm_addel_{ad['id']}"),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="➕ Додати оголошення", callback_data="adm_adnew")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "adm_ads")
+@admin_only
+async def adm_ads(call: types.CallbackQuery):
+    text, kb = ads_admin_view()
+    await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_adnew")
+@admin_only
+async def adm_ad_new(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.ad_text)
+    await call.message.answer(
+        f"✍️ Надішли текст реклами: 2–3 рядки, до {AD_MAX_LEN} символів (або /cancel)."
+    )
+    await call.answer()
+
+
+@dp.message(AdminStates.ad_text, F.text)
+async def adm_ad_text(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = message.text.strip()
+    if len(text) > AD_MAX_LEN:
+        await message.answer(f"Задовго: {len(text)} символів, максимум {AD_MAX_LEN}. Скороти і надішли ще раз.")
+        return
+    await state.update_data(ad_text=text)
+    await state.set_state(AdminStates.ad_url)
+    await message.answer(
+        "🔗 Тепер надішли посилання для кнопки «👉 Перейти»:\n"
+        "• https://... або @username каналу/бота\n"
+        "• або <code>-</code>, якщо реклама без посилання."
+    )
+
+
+@dp.message(AdminStates.ad_url, F.text)
+async def adm_ad_url(message: types.Message, state: FSMContext):
+    global ad_counter
+    if message.from_user.id != ADMIN_ID:
+        return
+    raw = message.text.strip()
+    url = None
+    if raw != "-":
+        url = normalize_ad_url(raw)
+        if url is None:
+            await message.answer("Не схоже на посилання. Надішли https://..., @username або «-».")
+            return
+    data = await state.get_data()
+    await state.clear()
+    ad_counter += 1
+    ad = {
+        "id": ad_counter,
+        "text": data.get("ad_text", ""),
+        "url": url,
+        "active": True,
+        "shows": 0,
+        "created": time.strftime("%d.%m.%Y"),
+    }
+    ads.append(ad)
+    request_save()
+    await message.answer("✅ Оголошення додано. Ось як його бачитимуть користувачі:")
+    ok = await safe_send(message.chat.id, _ad_text(ad), reply_markup=_ad_keyboard(ad))
+    if not ok:
+        ad["active"] = False
+        await message.answer("⚠️ Telegram не прийняв це оголошення (ймовірно, погане посилання) — поставив на паузу.")
+    text, kb = ads_admin_view()
+    await message.answer(text, reply_markup=kb)
+
+
+def _find_ad(call_data: str, prefix: str) -> dict | None:
+    try:
+        ad_id = int(call_data[len(prefix):])
+    except ValueError:
+        return None
+    return next((a for a in ads if a["id"] == ad_id), None)
+
+
+@dp.callback_query(F.data.startswith("adm_adtoggle_"))
+@admin_only
+async def adm_ad_toggle(call: types.CallbackQuery):
+    ad = _find_ad(call.data, "adm_adtoggle_")
+    if ad is None:
+        await call.answer("Оголошення не знайдено", show_alert=True)
+        return
+    ad["active"] = not ad.get("active")
+    request_save()
+    text, kb = ads_admin_view()
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramAPIError:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer("Увімкнено" if ad["active"] else "На паузі")
+
+
+@dp.callback_query(F.data.startswith("adm_addel_"))
+@admin_only
+async def adm_ad_delete(call: types.CallbackQuery):
+    ad = _find_ad(call.data, "adm_addel_")
+    if ad is None:
+        await call.answer("Оголошення не знайдено", show_alert=True)
+        return
+    ads.remove(ad)
+    request_save()
+    text, kb = ads_admin_view()
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramAPIError:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer("Видалено")
 
 
 # ---------------------------------------------------------------------------
