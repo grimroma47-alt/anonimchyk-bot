@@ -80,7 +80,9 @@ SHOP = {
     "prem_1w": ("Premium на 1 тиждень", 80, "premium", 7 * DAY),
     "prem_1m": ("Premium на 1 місяць", 180, "premium", 30 * DAY),
     "prem_3m": ("Premium на 3 місяці", 350, "premium", 90 * DAY),
-    "prem_forever": ("Безлімітний Premium (назавжди)", 850, "premium", None),
+    "prem_6m": ("Premium на 6 місяців", 600, "premium", 180 * DAY),
+    "prem_1y": ("Premium на 1 рік", 950, "premium", 365 * DAY),
+    "prem_forever": ("Безлімітний Premium (назавжди)", 1400, "premium", None),
 }
 NICK_PRICE = SHOP["nick"][1]
 
@@ -111,6 +113,13 @@ BOT_USERNAME = ""  # заповнюється при старті (main()), дл
 # Реферальна програма
 # ---------------------------------------------------------------------------
 REFERRAL_BONUS = float(os.getenv("REFERRAL_BONUS", "15"))  # грн авторові запрошення
+REFERRAL_PREMIUM_EVERY = int(os.getenv("REFERRAL_PREMIUM_EVERY", "5"))  # кожні N запрошених
+REFERRAL_PREMIUM_DAYS = int(os.getenv("REFERRAL_PREMIUM_DAYS", "5"))  # днів Premium у подарунок
+
+# ---------------------------------------------------------------------------
+# Реконнект з минулим співрозмовником (за згодою обох сторін)
+# ---------------------------------------------------------------------------
+reconnect_requests: dict[int, int] = {}  # acceptor_id -> requester_id (очікує відповіді)
 
 # ---------------------------------------------------------------------------
 # Рулетка
@@ -499,6 +508,7 @@ def init_user(user_id: int) -> dict:
             "filter_gender": None,  # бажана стать співрозмовника (None = будь-яка)
             "filter_age_ranges": set(),  # ключі з AGE_RANGES (порожньо = будь-який вік)
             "filter_country": None,  # бажана країна співрозмовника (None = будь-яка)
+            "last_partner_id": None,  # останній співрозмовник (для реконнекту)
         }
     return users_db[user_id]
 
@@ -564,19 +574,36 @@ async def safe_send(chat_id: int, text: str, **kwargs) -> bool:
 
 
 def end_chat(user_id: int):
-    """Розриває чат і повертає ID співрозмовника (або None)."""
+    """Розриває чат, запам'ятовує останнього співрозмовника (для реконнекту) і повертає його ID."""
     partner_id = active_chats.pop(user_id, None)
     if partner_id is not None:
         active_chats.pop(partner_id, None)
+        if user_id in users_db:
+            users_db[user_id]["last_partner_id"] = partner_id
+        if partner_id in users_db:
+            users_db[partner_id]["last_partner_id"] = user_id
     return partner_id
 
 
-async def send_rating_request(chat_id: int, partner_id: int):
-    """Пропонує оцінити співрозмовника 👍/👎 після завершення чату."""
+def get_post_chat_keyboard(partner_id: int):
+    """Оцінка співрозмовника + запит на повторний зв'язок після завершення чату."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👍", callback_data=f"rate_up_{partner_id}"),
+                InlineKeyboardButton(text="👎", callback_data=f"rate_down_{partner_id}"),
+            ],
+            [InlineKeyboardButton(text="🔄 Запросити повторний зв'язок", callback_data="reconnect_request")],
+        ]
+    )
+
+
+async def send_post_chat_menu(chat_id: int, partner_id: int):
+    """Пропонує оцінити співрозмовника й за бажанням надіслати запит на реконект."""
     await safe_send(
         chat_id,
         "Оціни співрозмовника, будь ласка:",
-        reply_markup=get_rating_keyboard(partner_id),
+        reply_markup=get_post_chat_keyboard(partner_id),
     )
 
 
@@ -683,6 +710,15 @@ async def start_handler(message: types.Message, state: FSMContext):
                     f"👥 За вашим запрошенням приєднався новий користувач!\n"
                     f"+{REFERRAL_BONUS:.0f} грн на баланс. Дякуємо! 🎉",
                 )
+                if ref["referral_count"] % REFERRAL_PREMIUM_EVERY == 0:
+                    now = time.time()
+                    start = max(now, ref["perks"].get("premium", 0))
+                    ref["perks"]["premium"] = start + REFERRAL_PREMIUM_DAYS * DAY
+                    await safe_send(
+                        referrer_id,
+                        f"🎉 Ти запросив вже {ref['referral_count']} друзів!\n"
+                        f"У подарунок — {REFERRAL_PREMIUM_DAYS} днів Premium 💎",
+                    )
 
     await message.answer(
         f"Привіт, {esc(message.from_user.first_name)}! Вітаємо в анонімному чаті! 🤫\n\n"
@@ -821,6 +857,7 @@ async def settings_handler(message: types.Message, state: FSMContext):
         "👥 <b>Запрошуй друзів і заробляй:</b>\n"
         f"За кожного друга, що запустить бота за твоїм посиланням — "
         f"+{REFERRAL_BONUS:.0f} грн на баланс.\n"
+        f"А кожні {REFERRAL_PREMIUM_EVERY} запрошених — {REFERRAL_PREMIUM_DAYS} днів Premium у подарунок 💎\n"
         f"Твоє посилання:\n<code>{esc(ref_link)}</code>\n"
         f"Запрошено людей: {u.get('referral_count', 0)}",
         reply_markup=get_settings_keyboard(),
@@ -1525,8 +1562,8 @@ async def stop_chat(message: types.Message, state: FSMContext):
 
     await message.answer("Чат завершено.", reply_markup=get_main_keyboard())
     await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
-    await send_rating_request(user_id, partner_id)
-    await send_rating_request(partner_id, user_id)
+    await send_post_chat_menu(user_id, partner_id)
+    await send_post_chat_menu(partner_id, user_id)
 
 
 @dp.callback_query(F.data.startswith("rate_up_"))
@@ -1551,6 +1588,99 @@ async def rate_down_handler(call: types.CallbackQuery):
     except TelegramAPIError:
         pass
     await call.answer("Дякуємо за оцінку! 👎")
+
+
+# ---------------------------------------------------------------------------
+# Реконнект з минулим співрозмовником (за згодою обох сторін)
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data == "reconnect_request")
+async def reconnect_request(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    u = init_user(user_id)
+    target_id = u.get("last_partner_id")
+
+    if not target_id or target_id not in users_db:
+        await call.answer("Немає з ким відновлювати зв'язок.", show_alert=True)
+        return
+    if user_id in banned_users or target_id in banned_users:
+        await call.answer("Недоступно.", show_alert=True)
+        return
+    if user_id in active_chats or target_id in active_chats:
+        await call.answer("Хтось із вас зараз уже в іншому чаті.", show_alert=True)
+        return
+
+    p = init_user(target_id)
+    if is_blacklisted(u, user_id, p, target_id):
+        await call.answer("Недоступно.", show_alert=True)
+        return
+
+    reconnect_requests[target_id] = user_id
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Прийняти", callback_data="reconnect_accept"),
+                InlineKeyboardButton(text="❌ Відхилити", callback_data="reconnect_decline"),
+            ]
+        ]
+    )
+    ok = await safe_send(
+        target_id, "🔄 Твій минулий співрозмовник хоче поновити чат. Прийняти?", reply_markup=kb
+    )
+    if ok:
+        await call.answer("Запит надіслано! Чекай на відповідь.", show_alert=True)
+    else:
+        reconnect_requests.pop(target_id, None)
+        await call.answer("Не вдалося надіслати запит — співрозмовник недоступний.", show_alert=True)
+
+
+@dp.callback_query(F.data == "reconnect_accept")
+async def reconnect_accept(call: types.CallbackQuery):
+    acceptor_id = call.from_user.id
+    requester_id = reconnect_requests.pop(acceptor_id, None)
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+
+    if requester_id is None:
+        await call.answer("Запит уже неактуальний.", show_alert=True)
+        return
+    if requester_id in active_chats or acceptor_id in active_chats:
+        await call.answer("Хтось із вас вже в іншому чаті.", show_alert=True)
+        return
+    if requester_id in banned_users or acceptor_id in banned_users:
+        await call.answer("Недоступно.", show_alert=True)
+        return
+
+    if requester_id in queue:
+        queue.remove(requester_id)
+    if acceptor_id in queue:
+        queue.remove(acceptor_id)
+
+    active_chats[requester_id] = acceptor_id
+    active_chats[acceptor_id] = requester_id
+
+    await call.message.answer("✅ Чат відновлено!", reply_markup=get_chat_keyboard())
+    await safe_send(
+        requester_id, "✅ Співрозмовник прийняв запит — чат відновлено!", reply_markup=get_chat_keyboard()
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "reconnect_decline")
+async def reconnect_decline(call: types.CallbackQuery):
+    acceptor_id = call.from_user.id
+    requester_id = reconnect_requests.pop(acceptor_id, None)
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+
+    if requester_id is not None:
+        await safe_send(requester_id, "❌ Співрозмовник відхилив запит на повторний зв'язок.")
+    await call.answer("Відхилено.")
 
 
 # ---------------------------------------------------------------------------
