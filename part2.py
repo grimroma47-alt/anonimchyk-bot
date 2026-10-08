@@ -1377,7 +1377,10 @@ async def main():
     global BOT_USERNAME
     logging.basicConfig(level=logging.INFO)
     runner = await start_web_server()
+    # Дані з бази завантажуємо ДО того, як бот почне приймати повідомлення.
+    await load_state_from_db()
     poll_task = asyncio.create_task(crypto_poll_loop())
+    save_task = asyncio.create_task(persistence_loop())
     try:
         # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
         # Telegram API не вбивала весь процес (і "Application exited early" на Render).
@@ -1410,6 +1413,8 @@ async def main():
                 await asyncio.sleep(5)
     finally:
         poll_task.cancel()
+        save_task.cancel()
+        await save_state_to_db()  # фінальне збереження при зупинці (деплой/перезапуск)
         await bot.session.close()
         await runner.cleanup()
 
