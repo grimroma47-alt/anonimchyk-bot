@@ -85,6 +85,13 @@ room_counter = 0
 STAR_PACKAGES = [50, 100, 250, 500]  # Telegram Stars; 1 star = 1 грн на баланс
 CRYPTO_PACKAGES = [1, 5, 10, 20]  # USDT
 
+# Поповнення на довільну суму + накопичувальний бонус
+TOPUP_MIN = int(os.getenv("TOPUP_MIN", "10"))  # мінімальна сума поповнення, грн
+TOPUP_MAX = int(os.getenv("TOPUP_MAX", "10000"))  # максимальна сума поповнення, грн
+TOPUP_QUICK_AMOUNTS = [50, 100, 250, 500, 1000]  # швидкі кнопки сум
+TOPUP_BONUS_STEP = float(os.getenv("TOPUP_BONUS_STEP", "500"))  # за кожні N грн поповнень...
+TOPUP_BONUS_AMOUNT = float(os.getenv("TOPUP_BONUS_AMOUNT", "50"))  # ...бонус стільки грн
+
 DAY = 86400
 
 # Магазин: ключ -> (назва, ціна, перк, тривалість у секундах; None = назавжди)
@@ -278,6 +285,7 @@ BTN_ROOM_LEAVE = "🚪 Вийти з кімнати"
 BTN_ROOM_REPORT = "🚨 Поскаржитися на учасника"
 BTN_HELP = "🆘 Допомога"
 BTN_FRIENDS = "👫 Друзі"
+BTN_TOPUP = "💳 Поповнити баланс"
 BTN_ADD_FRIEND = "🤝 Додати в друзі"
 
 
@@ -318,12 +326,17 @@ class FriendStates(StatesGroup):
     write = State()
 
 
+class TopupStates(StatesGroup):
+    amount = State()
+
+
 # ---------------------------------------------------------------------------
 # Клавіатури
 # ---------------------------------------------------------------------------
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text=BTN_TOPUP)],
             [KeyboardButton(text=BTN_SEARCH)],
             [KeyboardButton(text=BTN_SHOP), KeyboardButton(text=BTN_WALLET)],
             [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
@@ -443,7 +456,7 @@ def get_shop_keyboard():
 def get_wallet_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Поповнити баланс", callback_data="deposit")],
+            [InlineKeyboardButton(text="💳 Поповнити баланс", callback_data="topup_open")],
             [InlineKeyboardButton(text=f"✏️ Змінити нік ({NICK_PRICE} грн)", callback_data="buy_nick")],
             [InlineKeyboardButton(text="🎒 Інвентар подарунків", callback_data="inv_open")],
         ]
@@ -602,6 +615,7 @@ def init_user(user_id: int) -> dict:
             "filter_country": None,  # бажана країна співрозмовника (None = будь-яка)
             "last_partner_id": None,  # останній співрозмовник (для реконнекту)
             "friends": set(),  # user_id друзів (додані за взаємною згодою)
+            "topup_total": 0.0,  # скільки грн поповнено реальними оплатами (для бонусу)
         }
     return users_db[user_id]
 
@@ -664,6 +678,35 @@ async def safe_send(chat_id: int, text: str, **kwargs) -> bool:
     except TelegramAPIError as e:
         logging.warning("Не вдалося надіслати %s: %s", chat_id, e)
         return False
+
+
+def calc_topup_bonus(total_before: float, amount: float) -> float:
+    """Скільки бонусу дає поповнення: за кожен новий перетнутий рубіж TOPUP_BONUS_STEP."""
+    if TOPUP_BONUS_STEP <= 0 or TOPUP_BONUS_AMOUNT <= 0 or amount <= 0:
+        return 0.0
+    steps = int((total_before + amount) // TOPUP_BONUS_STEP) - int(total_before // TOPUP_BONUS_STEP)
+    return max(steps, 0) * TOPUP_BONUS_AMOUNT
+
+
+def apply_topup_bonus(u: dict, amount: float) -> float:
+    """Враховує реальне поповнення (Stars/крипта) і нараховує бонус. Повертає суму бонусу."""
+    total_before = float(u.get("topup_total") or 0.0)
+    bonus = calc_topup_bonus(total_before, amount)
+    u["topup_total"] = total_before + amount
+    if bonus:
+        u["balance"] += bonus
+    return bonus
+
+
+def topup_progress_text(u: dict) -> str:
+    if TOPUP_BONUS_STEP <= 0 or TOPUP_BONUS_AMOUNT <= 0:
+        return ""
+    done = float(u.get("topup_total") or 0.0) % TOPUP_BONUS_STEP
+    filled = min(int(done / TOPUP_BONUS_STEP * 10), 10)
+    bar = "▓" * filled + "░" * (10 - filled)
+    return (
+        f"🎁 До бонусу +{TOPUP_BONUS_AMOUNT:.0f} грн: {done:.0f}/{TOPUP_BONUS_STEP:.0f} грн\n{bar}"
+    )
 
 
 def end_chat(user_id: int):
@@ -767,7 +810,14 @@ async def check_and_credit_invoice(invoice_id: str) -> bool:
     pending_crypto_invoices.pop(invoice_id, None)
     u = init_user(info["user_id"])
     u["balance"] += info["credit"]
+    bonus = apply_topup_bonus(u, info["credit"])
     request_save()
+    if bonus:
+        await safe_send(
+            info["user_id"],
+            f"🎉 Бонус +{bonus:.0f} грн за кожні {TOPUP_BONUS_STEP:.0f} грн поповнень!\n\n"
+            + topup_progress_text(u),
+        )
     return True
 
 
@@ -1502,7 +1552,8 @@ async def wallet_handler(message: types.Message, state: FSMContext):
     await message.answer(
         "👛 <b>Твій гаманець</b>\n\n"
         f"• <b>Баланс:</b> {u['balance']:.2f} грн\n"
-        f"• <b>Нік:</b> {esc(u['nickname'])}",
+        f"• <b>Нік:</b> {esc(u['nickname'])}"
+        + (f"\n\n{topup_progress_text(u)}" if topup_progress_text(u) else ""),
         reply_markup=get_wallet_keyboard(),
     )
 
@@ -1559,10 +1610,15 @@ async def process_successful_payment(message: types.Message):
     amount = payment.total_amount  # для XTR це кількість зірок напряму
     u = init_user(message.from_user.id)
     u["balance"] += amount
+    bonus = apply_topup_bonus(u, amount)
     request_save()
-    await message.answer(
-        f"✅ Оплату отримано! Баланс поповнено на {amount} грн.", reply_markup=get_main_keyboard()
-    )
+    text = f"✅ Оплату отримано! Баланс поповнено на {amount} грн."
+    if bonus:
+        text += f"\n🎉 Бонус +{bonus:.0f} грн за кожні {TOPUP_BONUS_STEP:.0f} грн поповнень!"
+    progress = topup_progress_text(u)
+    if progress:
+        text += f"\n\n{progress}"
+    await message.answer(text, reply_markup=get_main_keyboard())
 
 
 @dp.callback_query(F.data == "dep_crypto")
