@@ -404,6 +404,29 @@ async def unban_buy(call: types.CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
+# Онлайн: скільки людей зараз у боті
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_ONLINE)
+@dp.message(Command("online"))
+async def online_stats(message: types.Message, state: FSMContext):
+    await state.clear()
+    now = time.time()
+    online = sum(1 for ts in last_seen.values() if now - ts <= ONLINE_WINDOW)
+    online = max(online, 1)  # той, хто натиснув кнопку, точно онлайн
+    in_chats = len(active_chats)
+    searching = len(queue)
+    in_rooms = len(user_room)
+    await message.answer(
+        "👥 <b>Зараз у боті</b>\n\n"
+        f"🟢 Онлайн: <b>{online}</b>\n"
+        f"💬 Спілкуються в чатах: <b>{in_chats}</b>\n"
+        f"🔍 Шукають співрозмовника: <b>{searching}</b>\n"
+        f"🏠 У кімнатах: <b>{in_rooms}</b>\n\n"
+        f"<i>Онлайн — ті, хто був активний за останні {ONLINE_WINDOW // 60} хв.</i>"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Рулетка (лотерея за грн)
 # ---------------------------------------------------------------------------
 def get_lottery_keyboard():
@@ -1617,6 +1640,7 @@ async def setup_bot_commands():
         types.BotCommand(command="rooms", description="👥 Кімнати за інтересами"),
         types.BotCommand(command="help", description="🆘 Допомога / зв'язок з адміном"),
         types.BotCommand(command="friends", description="👫 Друзі"),
+        types.BotCommand(command="online", description="👥 Хто зараз онлайн"),
         types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
