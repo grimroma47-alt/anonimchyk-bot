@@ -141,6 +141,11 @@ REFERRAL_PREMIUM_DAYS = int(os.getenv("REFERRAL_PREMIUM_DAYS", "5"))  # днів
 reconnect_requests: dict[int, int] = {}  # acceptor_id -> requester_id (очікує відповіді)
 
 # ---------------------------------------------------------------------------
+# Друзі (додаються за взаємною згодою з активного чату)
+# ---------------------------------------------------------------------------
+friend_add_requests: dict[int, int] = {}  # acceptor_id -> requester_id (запит у друзі)
+
+# ---------------------------------------------------------------------------
 # Рулетка
 # ---------------------------------------------------------------------------
 LOTTERY_COST = float(os.getenv("LOTTERY_COST", "15"))  # грн за один спін
@@ -264,6 +269,9 @@ BTN_BLACKLIST_ADD = "🚫 Чорний список"
 BTN_ROOMS = "👥 Кімнати за інтересами"
 BTN_ROOM_LEAVE = "🚪 Вийти з кімнати"
 BTN_ROOM_REPORT = "🚨 Поскаржитися на учасника"
+BTN_FRIENDS = "👫 Друзі"
+BTN_ADD_FRIEND = "🤝 Додати в друзі"
+BTN_HELP = "🆘 Допомога"
 
 
 # ---------------------------------------------------------------------------
@@ -288,10 +296,15 @@ class AdminStates(StatesGroup):
     ban_id = State()
     unban_id = State()
     broadcast = State()
+    support_reply = State()
 
 
 class FilterStates(StatesGroup):
     country = State()
+
+
+class SupportStates(StatesGroup):
+    message = State()
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +318,8 @@ def get_main_keyboard():
             [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
             [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_LOTTERY)],
             [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_FILTERS)],
-            [KeyboardButton(text=BTN_ROOMS)],
+            [KeyboardButton(text=BTN_ROOMS), KeyboardButton(text=BTN_FRIENDS)],
+            [KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )
@@ -341,12 +355,29 @@ def get_room_topics_keyboard():
 def get_chat_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_GIFT)],
+            [KeyboardButton(text=BTN_GIFT), KeyboardButton(text=BTN_ADD_FRIEND)],
             [KeyboardButton(text=BTN_STOP), KeyboardButton(text=BTN_REPORT)],
             [KeyboardButton(text=BTN_BLACKLIST_ADD)],
         ],
         resize_keyboard=True,
     )
+
+
+def get_friends_keyboard(u: dict):
+    friends = u.get("friends") or set()
+    if not friends:
+        return None
+    rows = []
+    for fid in sorted(friends):
+        f = users_db.get(fid)
+        name = f["nickname"] if f else str(fid)
+        rows.append(
+            [
+                InlineKeyboardButton(text=f"💬 {name}", callback_data=f"friend_chat_{fid}"),
+                InlineKeyboardButton(text="❌", callback_data=f"friend_remove_{fid}"),
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_gift_menu_keyboard():
@@ -559,6 +590,7 @@ def init_user(user_id: int) -> dict:
             "filter_age_ranges": set(),  # ключі з AGE_RANGES (порожньо = будь-який вік)
             "filter_country": None,  # бажана країна співрозмовника (None = будь-яка)
             "last_partner_id": None,  # останній співрозмовник (для реконнекту)
+            "friends": set(),  # user_id друзів (додані за взаємною згодою)
         }
     return users_db[user_id]
 
@@ -1122,6 +1154,73 @@ async def blacklist_add_in_chat(message: types.Message, state: FSMContext):
         reply_markup=get_main_keyboard(),
     )
     await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+
+
+# ---------------------------------------------------------------------------
+# Допомога / чат з адміністратором
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_HELP)
+@dp.message(Command("help"))
+async def help_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "🆘 <b>Допомога</b>\n\nОбери, що потрібно:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❓ Часті запитання", callback_data="help_faq")],
+                [InlineKeyboardButton(text="💬 Написати адміну", callback_data="support_start")],
+            ]
+        ),
+    )
+
+
+@dp.callback_query(F.data == "help_faq")
+async def help_faq(call: types.CallbackQuery):
+    await call.message.answer(
+        "❓ <b>Часті запитання</b>\n\n"
+        "• <b>Як почати чат?</b> — натисни «🔍 Шукати співрозмовника».\n"
+        "• <b>Як поповнити баланс?</b> — 👛 Гаманець → 💳 Поповнити баланс "
+        "(Telegram Stars або криптою).\n"
+        "• <b>Як поскаржитись на співрозмовника?</b> — кнопка «🚨 Поскаржитися» під час чату.\n"
+        "• <b>Що дає Premium?</b> — фільтри пошуку, пріоритет у черзі, VIP-значок (дивись 🏪 Магазин).\n"
+        "• <b>Як запросити в друзі?</b> — кнопка «🤝 Додати в друзі» під час чату, за взаємною згодою.\n\n"
+        "Не знайшов відповіді? Тисни «💬 Написати адміну»."
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "support_start")
+async def support_start(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("✍️ Напиши своє повідомлення для адміністратора (або /cancel):")
+    await state.set_state(SupportStates.message)
+    await call.answer()
+
+
+@dp.message(SupportStates.message, F.text)
+async def support_finish(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    u = init_user(user_id)
+
+    if not ADMIN_ID:
+        await message.answer("⚠️ Підтримка тимчасово недоступна.", reply_markup=get_main_keyboard())
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✍️ Відповісти", callback_data=f"adm_reply_{user_id}")]]
+    )
+    ok = await safe_send(
+        ADMIN_ID,
+        f"🆘 <b>Повідомлення від {esc(u['nickname'])}</b> (<code>{user_id}</code>):\n\n{esc(message.text)}",
+        reply_markup=kb,
+    )
+    if ok:
+        await message.answer(
+            "✅ Повідомлення надіслано адміну. Відповідь прийде прямо сюди.",
+            reply_markup=get_main_keyboard(),
+        )
+    else:
+        await message.answer("❌ Не вдалося надіслати. Спробуй пізніше.", reply_markup=get_main_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -1821,30 +1920,27 @@ async def rate_down_handler(call: types.CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
-# Реконнект з минулим співрозмовником (за згодою обох сторін)
+# Реконнект з минулим співрозмовником і запрошення друзів у чат (за згодою)
 # ---------------------------------------------------------------------------
-@dp.callback_query(F.data == "reconnect_request")
-async def reconnect_request(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    u = init_user(user_id)
-    target_id = u.get("last_partner_id")
-
+async def try_send_chat_invite(requester_id: int, target_id: int | None) -> str:
+    """Надсилає target_id запит почати чат із requester_id. Повертає текст помилки, або "" при успіху."""
     if not target_id or target_id not in users_db:
-        await call.answer("Немає з ким відновлювати зв'язок.", show_alert=True)
-        return
-    if user_id in banned_users or target_id in banned_users:
-        await call.answer("Недоступно.", show_alert=True)
-        return
-    if user_id in active_chats or target_id in active_chats:
-        await call.answer("Хтось із вас зараз уже в іншому чаті.", show_alert=True)
-        return
+        return "Користувача не знайдено."
+    if requester_id in banned_users or target_id in banned_users:
+        return "Недоступно."
+    if requester_id in active_chats or target_id in active_chats:
+        return "Хтось із вас зараз уже в іншому чаті."
+    if requester_id in queue or target_id in queue:
+        return "Хтось із вас зараз у черзі пошуку."
+    if requester_id in user_room or target_id in user_room:
+        return "Хтось із вас зараз у груповій кімнаті."
 
+    u = init_user(requester_id)
     p = init_user(target_id)
-    if is_blacklisted(u, user_id, p, target_id):
-        await call.answer("Недоступно.", show_alert=True)
-        return
+    if is_blacklisted(u, requester_id, p, target_id):
+        return "Недоступно."
 
-    reconnect_requests[target_id] = user_id
+    reconnect_requests[target_id] = requester_id
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1854,13 +1950,29 @@ async def reconnect_request(call: types.CallbackQuery):
         ]
     )
     ok = await safe_send(
-        target_id, "🔄 Твій минулий співрозмовник хоче поновити чат. Прийняти?", reply_markup=kb
+        target_id, f"🔄 <b>{esc(u['nickname'])}</b> хоче почати з тобою чат. Прийняти?", reply_markup=kb
     )
-    if ok:
-        await call.answer("Запит надіслано! Чекай на відповідь.", show_alert=True)
-    else:
+    if not ok:
         reconnect_requests.pop(target_id, None)
-        await call.answer("Не вдалося надіслати запит — співрозмовник недоступний.", show_alert=True)
+        return "Співрозмовник зараз недоступний."
+    return ""
+
+
+@dp.callback_query(F.data == "reconnect_request")
+async def reconnect_request(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    u = init_user(user_id)
+    target_id = u.get("last_partner_id")
+
+    if not target_id:
+        await call.answer("Немає з ким відновлювати зв'язок.", show_alert=True)
+        return
+
+    error = await try_send_chat_invite(user_id, target_id)
+    if error:
+        await call.answer(error, show_alert=True)
+    else:
+        await call.answer("Запит надіслано! Чекай на відповідь.", show_alert=True)
 
 
 @dp.callback_query(F.data == "reconnect_accept")
@@ -1882,6 +1994,9 @@ async def reconnect_accept(call: types.CallbackQuery):
     if requester_id in banned_users or acceptor_id in banned_users:
         await call.answer("Недоступно.", show_alert=True)
         return
+    if requester_id in user_room or acceptor_id in user_room:
+        await call.answer("Хтось із вас зараз у груповій кімнаті.", show_alert=True)
+        return
 
     if requester_id in queue:
         queue.remove(requester_id)
@@ -1891,9 +2006,9 @@ async def reconnect_accept(call: types.CallbackQuery):
     active_chats[requester_id] = acceptor_id
     active_chats[acceptor_id] = requester_id
 
-    await call.message.answer("✅ Чат відновлено!", reply_markup=get_chat_keyboard())
+    await call.message.answer("✅ Чат розпочато!", reply_markup=get_chat_keyboard())
     await safe_send(
-        requester_id, "✅ Співрозмовник прийняв запит — чат відновлено!", reply_markup=get_chat_keyboard()
+        requester_id, "✅ Співрозмовник прийняв запит — чат розпочато!", reply_markup=get_chat_keyboard()
     )
     await call.answer()
 
@@ -1911,6 +2026,134 @@ async def reconnect_decline(call: types.CallbackQuery):
     if requester_id is not None:
         await safe_send(requester_id, "❌ Співрозмовник відхилив запит на повторний зв'язок.")
     await call.answer("Відхилено.")
+
+
+# ---------------------------------------------------------------------------
+# Друзі
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_ADD_FRIEND)
+async def add_friend_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await message.answer("Додавати в друзі можна лише під час чату.", reply_markup=get_main_keyboard())
+        return
+
+    u = init_user(user_id)
+    if partner_id in (u.get("friends") or set()):
+        await message.answer("Ви вже друзі! 👫")
+        return
+
+    friend_add_requests[partner_id] = user_id
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Прийняти", callback_data="friend_accept"),
+                InlineKeyboardButton(text="❌ Відхилити", callback_data="friend_decline"),
+            ]
+        ]
+    )
+    ok = await safe_send(
+        partner_id, f"🤝 <b>{esc(u['nickname'])}</b> хоче додати тебе в друзі. Прийняти?", reply_markup=kb
+    )
+    if ok:
+        await message.answer("🤝 Запит надіслано!")
+    else:
+        friend_add_requests.pop(partner_id, None)
+        await message.answer("❌ Не вдалося надіслати запит.")
+
+
+@dp.callback_query(F.data == "friend_accept")
+async def friend_accept(call: types.CallbackQuery):
+    acceptor_id = call.from_user.id
+    requester_id = friend_add_requests.pop(acceptor_id, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+
+    if requester_id is None:
+        await call.answer("Запит уже неактуальний.", show_alert=True)
+        return
+
+    u = init_user(acceptor_id)
+    p = init_user(requester_id)
+    u.setdefault("friends", set()).add(requester_id)
+    p.setdefault("friends", set()).add(acceptor_id)
+
+    await call.message.answer(
+        f"🤝 Тепер ви з <b>{esc(p['nickname'])}</b> у друзях! Знайдеш їх у вкладці «{BTN_FRIENDS}»."
+    )
+    await safe_send(requester_id, f"🤝 <b>{esc(u['nickname'])}</b> прийняв твій запит у друзі!")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "friend_decline")
+async def friend_decline(call: types.CallbackQuery):
+    acceptor_id = call.from_user.id
+    requester_id = friend_add_requests.pop(acceptor_id, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+
+    if requester_id is not None:
+        await safe_send(requester_id, "❌ Запит у друзі відхилено.")
+    await call.answer("Відхилено.")
+
+
+@dp.message(F.text == BTN_FRIENDS)
+@dp.message(Command("friends"))
+async def friends_list(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    kb = get_friends_keyboard(u)
+    if kb is None:
+        await message.answer(
+            "👫 У тебе поки немає друзів.\n"
+            "Додай когось під час чату кнопкою «🤝 Додати в друзі» — за взаємною згодою."
+        )
+        return
+    await message.answer(
+        "👫 <b>Твої друзі</b>\n\n"
+        "Натисни «💬», щоб запросити людину в чат (вона має підтвердити), "
+        "або «❌», щоб прибрати з друзів.",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("friend_chat_"))
+async def friend_chat_request(call: types.CallbackQuery):
+    target_id = int(call.data[len("friend_chat_"):])
+    error = await try_send_chat_invite(call.from_user.id, target_id)
+    if error:
+        await call.answer(error, show_alert=True)
+    else:
+        await call.answer("Запит надіслано! Чекай на відповідь.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("friend_remove_"))
+async def friend_remove(call: types.CallbackQuery):
+    target_id = int(call.data[len("friend_remove_"):])
+    u = init_user(call.from_user.id)
+    u.get("friends", set()).discard(target_id)
+    p = users_db.get(target_id)
+    if p:
+        p.get("friends", set()).discard(call.from_user.id)
+
+    kb = get_friends_keyboard(u)
+    if kb is None:
+        try:
+            await call.message.edit_text("👫 У тебе більше немає друзів у списку.")
+        except TelegramAPIError:
+            await call.message.answer("👫 У тебе більше немає друзів у списку.")
+    else:
+        try:
+            await call.message.edit_reply_markup(reply_markup=kb)
+        except TelegramAPIError:
+            pass
+    await call.answer("Прибрано з друзів.")
 
 
 # ---------------------------------------------------------------------------
@@ -2339,6 +2582,35 @@ async def adm_broadcast_finish(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Розіслано: {sent}. Не вдалося: {failed}.")
 
 
+@dp.callback_query(F.data.startswith("adm_reply_"))
+@admin_only
+async def adm_reply_start(call: types.CallbackQuery, state: FSMContext):
+    target_id = int(call.data[len("adm_reply_"):])
+    await state.update_data(support_target=target_id)
+    await state.set_state(AdminStates.support_reply)
+    await call.message.answer(
+        f"✍️ Введіть відповідь для користувача <code>{target_id}</code> (або /cancel):"
+    )
+    await call.answer()
+
+
+@dp.message(AdminStates.support_reply, F.text)
+async def adm_reply_finish(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    target_id = data.get("support_target")
+    await state.clear()
+    if not target_id:
+        await message.answer("Помилка: не знайдено отримувача.")
+        return
+    ok = await safe_send(target_id, f"📩 <b>Відповідь від підтримки:</b>\n{esc(message.text)}")
+    if ok:
+        await message.answer("✅ Відповідь надіслано користувачу.")
+    else:
+        await message.answer("❌ Не вдалося надіслати — користувач недоступний.")
+
+
 # ---------------------------------------------------------------------------
 # Пересилання повідомлень (завжди останнім!)
 # ---------------------------------------------------------------------------
@@ -2409,55 +2681,3 @@ async def start_web_server() -> web.AppRunner:
     await runner.setup()
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info("Веб-сервер запущено на порту %s", port)
-    return runner
-
-
-async def setup_bot_commands():
-    """Перекладає меню команд '/' на українську (замість заглушок command1, command2...)."""
-    default_commands = [
-        types.BotCommand(command="start", description="🚀 Почати / перезапустити бота"),
-        types.BotCommand(command="edit_profile", description="✏️ Редагувати профіль"),
-        types.BotCommand(command="stop", description="❌ Завершити чат"),
-        types.BotCommand(command="cancel", description="⬅️ Скасувати поточну дію"),
-        types.BotCommand(command="top", description="🏆 Топ дарувальників подарунків"),
-        types.BotCommand(command="filters", description="🎯 Фільтри пошуку"),
-        types.BotCommand(command="rooms", description="👥 Кімнати за інтересами"),
-    ]
-    await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
-
-    if ADMIN_ID:
-        admin_commands = default_commands + [
-            types.BotCommand(command="admin", description="🔐 Адмін-панель"),
-            types.BotCommand(command="addbalance", description="💰 Поповнити баланс користувачу"),
-        ]
-        try:
-            await bot.set_my_commands(
-                admin_commands, scope=types.BotCommandScopeChat(chat_id=ADMIN_ID)
-            )
-        except TelegramAPIError as e:
-            # адмін ще жодного разу не писав боту — Telegram не дає встановити команди для нього
-            logging.warning("Не вдалося встановити адмін-команди: %s", e)
-
-
-async def main():
-    global BOT_USERNAME
-    logging.basicConfig(level=logging.INFO)
-    runner = await start_web_server()
-    poll_task = asyncio.create_task(crypto_poll_loop())
-    try:
-        # Скидаємо webhook і старі апдейти, щоб менше конфліктувати при редеплої
-        await bot.delete_webhook(drop_pending_updates=True)
-        await setup_bot_commands()
-        me = await bot.get_me()
-        BOT_USERNAME = me.username or ""
-        await dp.start_polling(bot)
-    finally:
-        poll_task.cancel()
-        await bot.session.close()
-        await runner.cleanup()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
