@@ -118,15 +118,21 @@ NICK_PRICE = SHOP["nick"][1]
 GIFT_CATALOG = {
     "rose": ("🌹 Троянда", 10),
     "heart": ("❤️ Серце", 12),
+    "chocolate": ("🍫 Шоколадка", 15),
     "rabbit": ("🐰 Зайчик", 18),
     "dog": ("🐶 Собачка", 18),
     "cat": ("🐱 Котик", 18),
     "cake": ("🎂 Тортик", 25),
+    "bouquet": ("💐 Букет", 35),
     "teddy": ("🧸 Ведмедик", 40),
-    "ring": ("💍 Каблучка", 75),
-    "diamond": ("💎 Діамант", 150),
     "car": ("🚗 Машинка", 60),
+    "ring": ("💍 Каблучка", 75),
+    "unicorn": ("🦄 Єдиноріг", 100),
+    "diamond": ("💎 Діамант", 150),
+    "console": ("🎮 Приставка", 200),
     "crown": ("👑 Корона", 300),
+    "rocket": ("🚀 Ракета", 500),
+    "castle": ("🏰 Замок", 1000),
 }
 # Частка від ціни подарунка, яка йде отримувачу (решта — дохід адміна)
 GIFT_RECIPIENT_SHARE = float(os.getenv("GIFT_RECIPIENT_SHARE", "0.25"))  # 0.25 = 25%
@@ -338,14 +344,13 @@ class TopupStates(StatesGroup):
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_TOPUP)],
             [KeyboardButton(text=BTN_SEARCH)],
-            [KeyboardButton(text=BTN_SHOP), KeyboardButton(text=BTN_WALLET)],
+            [KeyboardButton(text=BTN_TOPUP), KeyboardButton(text=BTN_WALLET)],
+            [KeyboardButton(text=BTN_SHOP), KeyboardButton(text=BTN_DAILY)],
             [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
-            [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_LOTTERY)],
-            [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_FILTERS)],
             [KeyboardButton(text=BTN_ROOMS), KeyboardButton(text=BTN_FRIENDS)],
-            [KeyboardButton(text=BTN_HELP)],
+            [KeyboardButton(text=BTN_FILTERS), KeyboardButton(text=BTN_LOTTERY)],
+            [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )
@@ -418,10 +423,11 @@ def get_gift_menu_keyboard():
 
 def get_gift_catalog_keyboard():
     """Магазин подарунків: купити подарунок про запас (в інвентар)."""
-    rows = [
-        [InlineKeyboardButton(text=f"{title} — {price} грн", callback_data=f"buygift_{key}")]
+    buttons = [
+        InlineKeyboardButton(text=f"{title} — {price} грн", callback_data=f"buygift_{key}")
         for key, (title, price) in GIFT_CATALOG.items()
     ]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -690,6 +696,30 @@ async def safe_send(chat_id: int, text: str, **kwargs) -> bool:
     except TelegramAPIError as e:
         logging.warning("Не вдалося надіслати %s: %s", chat_id, e)
         return False
+
+
+def admin_label(user_id: int) -> str:
+    """Для адміна: нік і наш ID (ID_1001), а Telegram ID — дрібно, для команд."""
+    u = users_db.get(user_id)
+    if u is None:
+        return f"<code>{user_id}</code>"
+    return f"{esc(u['nickname'])} ({esc(u['custom_id'])}) · <code>{user_id}</code>"
+
+
+def resolve_user_id(text: str) -> int | None:
+    """Приймає і наш ID (ID_1001), і Telegram ID. Повертає Telegram ID або None."""
+    text = (text or "").strip()
+    m = re.fullmatch(r"(?i)id_?(\d+)", text)
+    if m:
+        wanted = f"ID_{int(m.group(1))}"
+        for uid, u in users_db.items():
+            if u.get("custom_id") == wanted:
+                return uid
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
 
 
 def should_protect(u: dict | None) -> bool:
@@ -1300,16 +1330,19 @@ async def add_balance_admin(message: types.Message):
         return
     parts = (message.text or "").split()
     try:
-        target, amount = int(parts[1]), float(parts[2])
+        target, amount = resolve_user_id(parts[1]), float(parts[2].replace(",", "."))
     except (IndexError, ValueError):
-        await message.answer("Формат: /addbalance <user_id> <сума>")
+        await message.answer("Формат: /addbalance ID_1001 80  (або Telegram ID замість ID_1001)")
+        return
+    if target is None:
+        await message.answer("Не знайшов такого користувача. Перевір ID (напр. ID_1001).")
         return
     if target not in users_db:
         await message.answer("Такого користувача немає в базі.")
         return
     users_db[target]["balance"] += amount
     request_save()
-    await message.answer(f"✅ Баланс {target} поповнено на {amount:.2f} грн.")
+    await message.answer(f"✅ Баланс {admin_label(target)} поповнено на {amount:.2f} грн.")
     await safe_send(target, f"💰 Ваш баланс поповнено на {amount:.2f} грн.")
 
 
@@ -1675,7 +1708,7 @@ async def support_finish(message: types.Message, state: FSMContext):
     )
     ok = await safe_send(
         ADMIN_ID,
-        f"🆘 <b>Повідомлення від {esc(u['nickname'])}</b> (<code>{user_id}</code>):\n\n{esc(message.text)}",
+        f"🆘 <b>Повідомлення від</b> {admin_label(user_id)}:\n\n{esc(message.text)}",
         reply_markup=kb,
     )
     if ok:
