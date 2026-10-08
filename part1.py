@@ -767,6 +767,7 @@ async def check_and_credit_invoice(invoice_id: str) -> bool:
     pending_crypto_invoices.pop(invoice_id, None)
     u = init_user(info["user_id"])
     u["balance"] += info["credit"]
+    request_save()
     return True
 
 
@@ -786,6 +787,202 @@ async def crypto_poll_loop():
                     info["user_id"],
                     f"✅ Оплату {info['amount']} USDT отримано! Баланс поповнено на {info['credit']:.2f} грн.",
                 )
+
+
+# ---------------------------------------------------------------------------
+# База даних (Postgres): збереження балансів, профілів, друзів тощо між перезапусками.
+# Весь важливий стан зберігається одним "знімком". Якщо DATABASE_URL не задано —
+# бот працює як раніше, лише в пам'яті.
+# ---------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+SAVE_INTERVAL = int(os.getenv("SAVE_INTERVAL", "60"))  # секунд між автозбереженнями
+
+_db_ready = False  # True лише після успішного завантаження — щоб не затерти базу порожнім станом
+_last_saved_blob: bytes | None = None
+_save_event = asyncio.Event()
+
+
+def request_save():
+    """Попросити зберегти стан якнайшвидше (напр. одразу після оплати)."""
+    _save_event.set()
+
+
+def _db_connect():
+    import ssl
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    import pg8000.native
+
+    url = urlparse(DATABASE_URL)
+    sslmode = (parse_qs(url.query).get("sslmode") or ["require"])[0]
+    if sslmode == "disable":
+        ssl_context = None
+    elif sslmode in ("verify-ca", "verify-full"):
+        ssl_context = ssl.create_default_context()
+    else:
+        # як sslmode=require: з'єднання шифроване, сертифікат не перевіряється
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+    return pg8000.native.Connection(
+        user=unquote(url.username or ""),
+        password=unquote(url.password or ""),
+        host=url.hostname or "localhost",
+        port=url.port or 5432,
+        database=(url.path or "/postgres").lstrip("/") or "postgres",
+        ssl_context=ssl_context,
+        timeout=30,
+    )
+
+
+def _db_load_blob() -> bytes | None:
+    con = _db_connect()
+    try:
+        con.run(
+            "CREATE TABLE IF NOT EXISTS bot_state ("
+            " id INTEGER PRIMARY KEY,"
+            " data BYTEA NOT NULL,"
+            " prev_data BYTEA,"
+            " updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        rows = con.run("SELECT data FROM bot_state WHERE id = 1")
+        return bytes(rows[0][0]) if rows else None
+    finally:
+        con.close()
+
+
+def _db_load_prev_blob() -> bytes | None:
+    con = _db_connect()
+    try:
+        rows = con.run("SELECT prev_data FROM bot_state WHERE id = 1")
+        return bytes(rows[0][0]) if rows and rows[0][0] is not None else None
+    finally:
+        con.close()
+
+
+def _db_save_blob(blob: bytes):
+    con = _db_connect()
+    try:
+        # попередню версію зберігаємо в prev_data — запасна копія
+        con.run(
+            "INSERT INTO bot_state (id, data) VALUES (1, :d) "
+            "ON CONFLICT (id) DO UPDATE SET prev_data = bot_state.data, data = EXCLUDED.data, updated_at = now()",
+            d=blob,
+        )
+    finally:
+        con.close()
+
+
+def _make_snapshot() -> bytes:
+    import pickle
+
+    return pickle.dumps(
+        {
+            "version": 1,
+            "users_db": users_db,
+            "user_counter": user_counter,
+            "banned_users": banned_users,
+            "reports": reports,
+            "report_counter": report_counter,
+            "pending_crypto_invoices": pending_crypto_invoices,
+            "gift_revenue_total": gift_revenue_total,
+            "lottery_revenue_total": lottery_revenue_total,
+        },
+        protocol=4,
+    )
+
+
+def _apply_snapshot(blob: bytes):
+    import copy
+    import pickle
+
+    global user_counter, report_counter, gift_revenue_total, lottery_revenue_total
+    data = pickle.loads(blob)
+
+    users_db.clear()
+    users_db.update(data.get("users_db", {}))
+    banned_users.clear()
+    banned_users.update(data.get("banned_users", set()))
+    reports.clear()
+    reports.extend(data.get("reports", []))
+    pending_crypto_invoices.clear()
+    pending_crypto_invoices.update(data.get("pending_crypto_invoices", {}))
+    user_counter = data.get("user_counter", user_counter)
+    report_counter = data.get("report_counter", report_counter)
+    gift_revenue_total = data.get("gift_revenue_total", gift_revenue_total)
+    lottery_revenue_total = data.get("lottery_revenue_total", lottery_revenue_total)
+
+    # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
+    saved_counter = user_counter
+    template = init_user(-1)
+    users_db.pop(-1, None)
+    user_counter = saved_counter
+    for u in users_db.values():
+        for key, value in template.items():
+            if key not in u:
+                u[key] = copy.deepcopy(value)
+
+
+async def load_state_from_db():
+    """Завантажує стан з бази при старті. Без успішного завантаження збереження вимкнене."""
+    global _db_ready, _last_saved_blob
+    if not DATABASE_URL:
+        logging.warning("DATABASE_URL не задано — дані зберігаються лише в пам'яті і зникнуть після перезапуску.")
+        return
+
+    last_error = None
+    for attempt in range(1, 6):
+        try:
+            blob = await asyncio.to_thread(_db_load_blob)
+            break
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            logging.warning("База даних недоступна (спроба %s/5): %s", attempt, e)
+            await asyncio.sleep(3 * attempt)
+    else:
+        # Краще не запускатись, ніж запуститись з порожніми даними і затерти ними базу.
+        raise SystemExit(f"❌ Не вдалося підключитися до бази даних: {last_error}")
+
+    if blob is None:
+        logging.info("База даних порожня — починаємо з нуля.")
+    else:
+        try:
+            _apply_snapshot(blob)
+        except Exception as e:  # noqa: BLE001
+            logging.error("Основна копія даних пошкоджена (%s) — пробую запасну.", e)
+            prev = await asyncio.to_thread(_db_load_prev_blob)
+            if prev is None:
+                raise SystemExit("❌ Дані в базі пошкоджені, а запасної копії немає.")
+            _apply_snapshot(prev)
+        logging.info("Дані завантажено з бази: %s користувачів.", len(users_db))
+        _last_saved_blob = blob
+
+    _db_ready = True
+
+
+async def save_state_to_db():
+    global _last_saved_blob
+    if not _db_ready:
+        return
+    try:
+        blob = _make_snapshot()  # знімок робимо в основному потоці — дані не змінюються посередині
+        if blob == _last_saved_blob:
+            return  # нічого не змінилось
+        await asyncio.to_thread(_db_save_blob, blob)
+        _last_saved_blob = blob
+    except Exception as e:  # noqa: BLE001
+        logging.error("Не вдалося зберегти дані в базу: %s", e)
+
+
+async def persistence_loop():
+    while True:
+        try:
+            await asyncio.wait_for(_save_event.wait(), timeout=SAVE_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+        _save_event.clear()
+        await save_state_to_db()
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +1053,7 @@ async def add_balance_admin(message: types.Message):
         await message.answer("Такого користувача немає в базі.")
         return
     users_db[target]["balance"] += amount
+    request_save()
     await message.answer(f"✅ Баланс {target} поповнено на {amount:.2f} грн.")
     await safe_send(target, f"💰 Ваш баланс поповнено на {amount:.2f} грн.")
 
@@ -1346,6 +1544,7 @@ async def process_successful_payment(message: types.Message):
     amount = payment.total_amount  # для XTR це кількість зірок напряму
     u = init_user(message.from_user.id)
     u["balance"] += amount
+    request_save()
     await message.answer(
         f"✅ Оплату отримано! Баланс поповнено на {amount} грн.", reply_markup=get_main_keyboard()
     )
@@ -1387,6 +1586,7 @@ async def dep_crypto_create(call: types.CallbackQuery):
         "amount": amount,
         "credit": credit,
     }
+    request_save()
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
