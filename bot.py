@@ -80,6 +80,27 @@ SHOP = {
 }
 NICK_PRICE = SHOP["nick"][1]
 
+# Каталог подарунків: ключ -> (назва, ціна в грн). Купуються "про запас" в інвентар,
+# даруються будь-коли під час чату. Відсоток ціни падає отримувачу на баланс,
+# решта лишається адміну (тобто просто не нараховується нікому).
+GIFT_CATALOG = {
+    "rose": ("🌹 Троянда", 10),
+    "heart": ("❤️ Серце", 12),
+    "rabbit": ("🐰 Зайчик", 18),
+    "dog": ("🐶 Собачка", 18),
+    "cat": ("🐱 Котик", 18),
+    "cake": ("🎂 Тортик", 25),
+    "teddy": ("🧸 Ведмедик", 40),
+    "ring": ("💍 Каблучка", 75),
+    "diamond": ("💎 Діамант", 150),
+    "car": ("🚗 Машинка", 60),
+    "crown": ("👑 Корона", 300),
+}
+# Частка від ціни подарунка, яка йде отримувачу (решта — дохід адміна)
+GIFT_RECIPIENT_SHARE = float(os.getenv("GIFT_RECIPIENT_SHARE", "0.25"))  # 0.25 = 25%
+
+gift_revenue_total = 0.0  # сумарний дохід адміна з подарунків (для статистики)
+
 BTN_SEARCH = "🔍 Шукати співрозмовника"
 BTN_SHOP = "🏪 Магазин"
 BTN_WALLET = "👛 Гаманець"
@@ -87,6 +108,7 @@ BTN_PROFILE = "👤 Мій профіль / Архів"
 BTN_SETTINGS = "⚙️ Налаштування"
 BTN_STOP = "❌ Завершити чат"
 BTN_REPORT = "🚨 Поскаржитися"
+BTN_GIFT = "🎁 Подарувати"
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +122,10 @@ class ProfileStates(StatesGroup):
 
 class WalletStates(StatesGroup):
     change_nick = State()
+
+
+class GiftStates(StatesGroup):
+    amount = State()
 
 
 class AdminStates(StatesGroup):
@@ -125,9 +151,43 @@ def get_main_keyboard():
 
 def get_chat_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_STOP), KeyboardButton(text=BTN_REPORT)]],
+        keyboard=[
+            [KeyboardButton(text=BTN_GIFT)],
+            [KeyboardButton(text=BTN_STOP), KeyboardButton(text=BTN_REPORT)],
+        ],
         resize_keyboard=True,
     )
+
+
+def get_gift_menu_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💰 Гроші з балансу", callback_data="gift_money")],
+            [InlineKeyboardButton(text="🎁 Подарунок з інвентарю", callback_data="gift_inventory")],
+        ]
+    )
+
+
+def get_gift_catalog_keyboard():
+    """Магазин подарунків: купити подарунок про запас (в інвентар)."""
+    rows = [
+        [InlineKeyboardButton(text=f"{title} — {price} грн", callback_data=f"buygift_{key}")]
+        for key, (title, price) in GIFT_CATALOG.items()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_gift_inventory_keyboard(u: dict):
+    """Що з інвентарю можна подарувати зараз (тільки те, що є в наявності)."""
+    rows = []
+    for key, count in u.get("gifts", {}).items():
+        if count <= 0:
+            continue
+        title, price = GIFT_CATALOG[key]
+        rows.append(
+            [InlineKeyboardButton(text=f"{title} ×{count}", callback_data=f"sendgift_{key}")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_gender_keyboard():
@@ -191,6 +251,7 @@ def init_user(user_id: int) -> dict:
             "country": "Не вказано",
             "balance": 0.0,
             "perks": {},  # перк -> час закінчення (float('inf') = назавжди)
+            "gifts": {},  # ключ подарунка -> кількість в інвентарі
             "archive": [],
         }
     return users_db[user_id]
@@ -351,6 +412,13 @@ async def profile_handler(message: types.Message, state: FSMContext):
     await state.clear()
     u = init_user(message.from_user.id)
     archive_text = esc("\n".join(u["archive"][-5:])) if u["archive"] else "Історія порожня"
+
+    gifts = {k: c for k, c in u.get("gifts", {}).items() if c > 0}
+    if gifts:
+        gifts_text = ", ".join(f"{GIFT_CATALOG[k][0]} ×{c}" for k, c in gifts.items())
+    else:
+        gifts_text = "порожньо"
+
     text = (
         "👤 <b>Твій профіль:</b>\n"
         f"• <b>ID / Нік:</b> {esc(u['nickname'])} ({u['custom_id']})\n"
@@ -359,6 +427,7 @@ async def profile_handler(message: types.Message, state: FSMContext):
         f"• <b>Країна:</b> {esc(u['country'])}\n"
         f"• <b>Преміум:</b> {'Так 💎' if is_premium(u) else 'Ні ❌'}\n"
         f"• <b>VIP-значок:</b> {'Так ⭐' if has_perk(u, 'vip_badge') else 'Ні'}\n\n"
+        f"🎒 <b>Інвентар подарунків:</b> {gifts_text}\n\n"
         f"📜 <b>Архів останніх змін профілю:</b>\n{archive_text}\n\n"
         "Хочеш оновити дані? Введи /edit_profile"
     )
@@ -602,6 +671,13 @@ async def shop_handler(message: types.Message, state: FSMContext):
         "🏪 <b>Магазин послуг та товарів</b>\n\nОберіть позицію для купівлі:",
         reply_markup=get_shop_keyboard(),
     )
+    await message.answer(
+        "🎁 <b>Магазин подарунків</b>\n\n"
+        "Купи подарунок про запас — даруватимеш його співрозмовникам у чаті, "
+        f"коли захочеш. Отримувач одразу отримає {GIFT_RECIPIENT_SHARE * 100:.0f}% "
+        "вартості на баланс.",
+        reply_markup=get_gift_catalog_keyboard(),
+    )
 
 
 @dp.callback_query(F.data.startswith("buy_"))
@@ -636,6 +712,36 @@ async def buy_item(call: types.CallbackQuery, state: FSMContext):
         u["perks"][perk] = start + seconds
 
     await call.message.answer(f"🎉 Куплено: <b>{esc(title)}</b>. Списано {price} грн.")
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("buygift_"))
+async def buy_gift_item(call: types.CallbackQuery):
+    """Купівля подарунка про запас (в інвентар), без прив'язки до співрозмовника."""
+    key = call.data[len("buygift_"):]
+    item = GIFT_CATALOG.get(key)
+    if item is None:
+        await call.answer("Невідомий подарунок", show_alert=True)
+        return
+
+    title, price = item
+    u = init_user(call.from_user.id)
+
+    if u["balance"] < price:
+        await call.message.answer(
+            f"❌ Недостатньо коштів. Ціна: {price} грн. Ваш баланс: {u['balance']:.2f} грн."
+        )
+        await call.answer()
+        return
+
+    u["balance"] -= price
+    u.setdefault("gifts", {})
+    u["gifts"][key] = u["gifts"].get(key, 0) + 1
+
+    await call.message.answer(
+        f"🎁 Куплено: <b>{esc(title)}</b>! Тепер у твоєму інвентарі. "
+        "Подарувати його можна будь-якому співрозмовнику під час чату."
+    )
     await call.answer()
 
 
@@ -741,6 +847,118 @@ async def report_handler(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
+# Подарунки співрозмовнику (тільки під час активного чату)
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_GIFT)
+async def gift_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    if user_id not in active_chats:
+        await message.answer("Дарувати можна лише співрозмовнику під час чату.", reply_markup=get_main_keyboard())
+        return
+    await message.answer("🎁 Що подаруєш співрозмовнику?", reply_markup=get_gift_menu_keyboard())
+
+
+@dp.callback_query(F.data == "gift_money")
+async def gift_money_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id not in active_chats:
+        await call.answer("Чат вже завершено", show_alert=True)
+        return
+    await call.message.answer("Введіть суму в грн, яку хочете подарувати (або /cancel):")
+    await state.set_state(GiftStates.amount)
+    await call.answer()
+
+
+@dp.message(GiftStates.amount, F.text)
+async def gift_money_finish(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await message.answer("Чат вже завершено.", reply_markup=get_main_keyboard())
+        return
+
+    try:
+        amount = float(message.text.strip().replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введіть додатне число, наприклад 20 або 15.5.")
+        return
+
+    u = init_user(user_id)
+    if u["balance"] < amount:
+        await message.answer(f"❌ Недостатньо коштів. Ваш баланс: {u['balance']:.2f} грн.")
+        return
+
+    u["balance"] -= amount
+    p = init_user(partner_id)
+    p["balance"] += amount
+
+    await message.answer(
+        f"🎁 Подаровано {amount:.2f} грн співрозмовнику!", reply_markup=get_chat_keyboard()
+    )
+    await safe_send(partner_id, f"🎁 Співрозмовник подарував вам {amount:.2f} грн!")
+
+
+@dp.callback_query(F.data == "gift_inventory")
+async def gift_inventory_menu(call: types.CallbackQuery):
+    if call.from_user.id not in active_chats:
+        await call.answer("Чат вже завершено", show_alert=True)
+        return
+    u = init_user(call.from_user.id)
+    kb = get_gift_inventory_keyboard(u)
+    if not kb.inline_keyboard:
+        await call.message.answer(
+            "У тебе ще немає подарунків в інвентарі. Купи їх у 🏪 Магазині (там же, де перки)."
+        )
+        await call.answer()
+        return
+    await call.message.answer("🎁 Що подаруєш співрозмовнику зі свого інвентарю?", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("sendgift_"))
+async def send_gift_item(call: types.CallbackQuery):
+    global gift_revenue_total
+    user_id = call.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await call.answer("Чат вже завершено", show_alert=True)
+        return
+
+    key = call.data[len("sendgift_"):]
+    item = GIFT_CATALOG.get(key)
+    if item is None:
+        await call.answer("Невідомий подарунок", show_alert=True)
+        return
+
+    u = init_user(user_id)
+    have = u.get("gifts", {}).get(key, 0)
+    if have <= 0:
+        await call.answer("У тебе немає такого подарунка в інвентарі", show_alert=True)
+        return
+
+    title, price = item
+    u["gifts"][key] = have - 1
+
+    recipient_amount = round(price * GIFT_RECIPIENT_SHARE, 2)
+    admin_amount = round(price - recipient_amount, 2)
+    gift_revenue_total += admin_amount
+
+    p = init_user(partner_id)
+    p["balance"] += recipient_amount
+
+    await call.message.answer(f"🎁 Подаровано: <b>{esc(title)}</b>!")
+    await safe_send(
+        partner_id,
+        f"🎁 Співрозмовник подарував вам: <b>{esc(title)}</b>!\n"
+        f"На баланс нараховано {recipient_amount:.2f} грн.",
+    )
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
 # Адмін-панель (прихована, тільки для ADMIN_ID + пароль)
 # ---------------------------------------------------------------------------
 @dp.message(Command("admin"))
@@ -795,6 +1013,7 @@ async def adm_stats(call: types.CallbackQuery):
         f"• Premium: {premium_count}\n"
         f"• Забанено: {len(banned_users)}\n"
         f"• Скарг усього: {len(reports)}\n"
+        f"• Дохід з подарунків: {gift_revenue_total:.2f} грн\n"
     )
     await call.message.answer(text)
     await call.answer()
