@@ -586,7 +586,7 @@ def _onoff(v) -> str:
 
 def get_settings_keyboard(u: dict | None = None):
     u = u or {}
-    media = "без фото/відео 🛡" if u.get("media_mode") == "safe" else "усі"
+    media = "без фото/відео 🛡" if media_is_safe(u) else "усі"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Мій профіль", callback_data="pe_menu")],
@@ -753,6 +753,8 @@ def init_user(user_id: int) -> dict:
             "notify_tasks": True,  # повідомлення про виконані завдання
             "notify_tips": True,  # підказки (напр. про фільтр за статтю)
             "allow_invites": True,  # приймати запрошення в чат від друзів/минулих співрозмовників
+            "media_mode_set": False,  # чи людина сама обирала режим медіа (інакше для неповнолітніх — «без фото/відео»)
+            "safety_memo_shown": False,  # чи показували пам'ятку з безпеки (для неповнолітніх)
             "ref_qualified": False,  # чи вже зарахований своєму запрошувачу в конкурсі (після першого чату)
             "blacklist": set(),  # user_id, яких ця людина заблокувала особисто
             "filter_gender": None,  # бажана стать співрозмовника (None = будь-яка)
@@ -872,6 +874,20 @@ def resolve_user_id(text: str) -> int | None:
         return int(text)
     except ValueError:
         return None
+
+
+def is_minor(u: dict | None) -> bool:
+    age = get_age_int(u) if u else None
+    return age is not None and age < 18
+
+
+def media_is_safe(u: dict | None) -> bool:
+    """Чи НЕ приймає людина фото/відео від співрозмовника. Неповнолітнім — так за замовчуванням."""
+    if not u:
+        return False
+    if u.get("media_mode_set"):
+        return u.get("media_mode") == "safe"
+    return u.get("media_mode") == "safe" or is_minor(u)
 
 
 def should_protect(u: dict | None) -> bool:
