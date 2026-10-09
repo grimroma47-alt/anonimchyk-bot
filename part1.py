@@ -78,6 +78,9 @@ banned_users: set[int] = set()
 stats_days: dict[str, dict] = {}
 # Поточні чати: user_id -> {"start": час, "mode": режим, "msgs": скільки написав} (лише в пам'яті)
 chat_meta: dict[int, dict] = {}
+last_chat_mode: dict[int, str] = {}  # у якому режимі був останній чат (для автопошуку)
+# Банери-картинки для екранів: місце -> file_id фото в Telegram. Ставить адмін з телефона.
+banners: dict[str, str] = {}
 reports: list[dict] = []  # {"id", "from", "on", "time", "status"}
 report_counter = 0
 ads: list[dict] = []  # реклама в черзі пошуку: {"id","text","url","active","shows","created"}
@@ -573,15 +576,27 @@ def get_rating_keyboard(partner_id: int):
     )
 
 
+def _onoff(v) -> str:
+    return "увімк ✅" if v else "вимк"
+
+
 def get_settings_keyboard(u: dict | None = None):
-    protect_on = bool(u and u.get("protect_media"))
+    u = u or {}
+    media = "без фото/відео 🛡" if u.get("media_mode") == "safe" else "усі"
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Мій профіль", callback_data="pe_menu")],
             [InlineKeyboardButton(text=BTN_FILTERS, callback_data="filters_menu")],
+            [InlineKeyboardButton(text=f"📷 Медіа від співрозмовника: {media}", callback_data="set_media")],
+            [InlineKeyboardButton(text=f"🔁 Автопошук після чату: {_onoff(u.get('auto_search'))}", callback_data="set_auto")],
+            [
+                InlineKeyboardButton(text="🙈 Приватність", callback_data="set_privacy"),
+                InlineKeyboardButton(text="🔔 Сповіщення", callback_data="set_notify"),
+            ],
             [InlineKeyboardButton(text="📋 Чорний список", callback_data="bl_view")],
             [
                 InlineKeyboardButton(
-                    text=f"🔒 Захист моїх медіа: {'увімк ✅' if protect_on else 'вимк'} (💎)",
+                    text=f"🔒 Захист моїх медіа: {'увімк ✅' if u.get('protect_media') else 'вимк'} (💎)",
                     callback_data="toggle_protect",
                 )
             ],
@@ -682,6 +697,7 @@ def get_admin_keyboard():
             [InlineKeyboardButton(text="📢 Розсилка всім", callback_data="adm_broadcast")],
             [InlineKeyboardButton(text="📣 Реклама в пошуку", callback_data="adm_ads")],
             [InlineKeyboardButton(text="🏦 Оплати на перевірці", callback_data="adm_payments")],
+            [InlineKeyboardButton(text="🖼 Банери", callback_data="adm_banners")],
         ]
     )
 
@@ -724,6 +740,14 @@ def init_user(user_id: int) -> dict:
             "tasks_progress": {},  # ключ -> скільки вже зроблено
             "tasks_done": set(),  # виконані сьогодні
             "tasks_bonus": False,  # чи отримано бонус за всі завдання сьогодні
+            "media_mode": "all",  # "all" — приймати все, "safe" — без фото/відео/GIF/файлів від співрозмовника
+            "auto_search": False,  # після завершення чату одразу шукати наступного
+            "hide_age": False,  # не показувати співрозмовнику вік
+            "hide_country": False,  # не показувати співрозмовнику країну
+            "hide_interests": False,  # не показувати співрозмовнику інтереси
+            "notify_tasks": True,  # повідомлення про виконані завдання
+            "notify_tips": True,  # підказки (напр. про фільтр за статтю)
+            "allow_invites": True,  # приймати запрошення в чат від друзів/минулих співрозмовників
             "blacklist": set(),  # user_id, яких ця людина заблокувала особисто
             "filter_gender": None,  # бажана стать співрозмовника (None = будь-яка)
             "filter_age_ranges": set(),  # ключі з AGE_RANGES (порожньо = будь-який вік)
@@ -800,12 +824,15 @@ def is_low_rated(u: dict) -> bool:
     return up + down >= LOW_RATING_MIN_VOTES and up * 100 < LOW_RATING_PERCENT * (up + down)
 
 
-def short_info(u: dict) -> str:
+def short_info(u: dict, public: bool = True) -> str:
+    """public=True — як бачить співрозмовник (з урахуванням приватності), False — як бачить сам власник."""
     badge = " 💎" if is_premium(u) else ""
     vip = " ⭐VIP" if has_perk(u, "vip_badge") else ""
     pct = rating_percent(u)
     rating = f" · 👍 {pct}%" if pct is not None and u.get("rating_up", 0) + u.get("rating_down", 0) >= RATING_MIN_VOTES else ""
-    return f"{esc(u['gender'])}, {esc(u['age'])}, {esc(u['country'])}{badge}{vip}{rating}"
+    age = "🙈 вік приховано" if public and u.get("hide_age") else esc(u["age"])
+    country = "🙈 країну приховано" if public and u.get("hide_country") else esc(u["country"])
+    return f"{esc(u['gender'])}, {age}, {country}{badge}{vip}{rating}"
 
 
 async def safe_send(chat_id: int, text: str, **kwargs) -> bool:
@@ -1224,6 +1251,7 @@ def _make_snapshot() -> bytes:
             "ads": ads,
             "ad_counter": ad_counter,
             "stats_days": stats_days,
+            "banners": banners,
         },
         protocol=4,
     )
@@ -1257,6 +1285,8 @@ def _apply_snapshot(blob: bytes):
     ad_counter = data.get("ad_counter", ad_counter)
     stats_days.clear()
     stats_days.update(data.get("stats_days", {}))
+    banners.clear()
+    banners.update(data.get("banners", {}))
 
     # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
     saved_counter = user_counter
