@@ -326,6 +326,75 @@ async def mono_status(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
+# Пошук за інтересами 1-на-1: з'єднуємо лише людей з однаковою темою
+# ---------------------------------------------------------------------------
+def interests_keyboard(tab: str = "main"):
+    waiting = {}
+    for uid in queue:
+        mode = search_mode.get(uid, "")
+        if mode.startswith("int:"):
+            waiting[mode[4:]] = waiting.get(mode[4:], 0) + 1
+    topics = HOBBY_TOPICS if tab == "hobby" else ROOM_TOPICS
+    buttons = []
+    for key, label in topics.items():
+        n = waiting.get(key, 0)
+        buttons.append(
+            InlineKeyboardButton(text=f"{label} · чекає {n}" if n else label, callback_data=f"intr_{key}")
+        )
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    hobby_wait = sum(waiting.get(k, 0) for k in HOBBY_TOPICS)
+    main_wait = sum(waiting.get(k, 0) for k in ROOM_TOPICS)
+    tabs = [
+        InlineKeyboardButton(
+            text=("• " if tab != "hobby" else "") + "🧩 Інтереси" + (f" ({main_wait})" if main_wait else ""),
+            callback_data="intrtab_main",
+        ),
+        InlineKeyboardButton(
+            text=("• " if tab == "hobby" else "") + "🎯 Захоплення" + (f" ({hobby_wait})" if hobby_wait else ""),
+            callback_data="intrtab_hobby",
+        ),
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[tabs] + rows)
+
+
+@dp.callback_query(F.data.startswith("intrtab_"))
+async def interests_tab(call: types.CallbackQuery):
+    tab = "hobby" if call.data == "intrtab_hobby" else "main"
+    try:
+        await call.message.edit_reply_markup(reply_markup=interests_keyboard(tab))
+    except TelegramAPIError:
+        pass
+    await call.answer("🎯 Захоплення" if tab == "hobby" else "🧩 Інтереси")
+
+
+@dp.message(F.text == BTN_INTERESTS)
+@dp.message(Command("interests"))
+async def interests_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "🧩 <b>Пошук за інтересами</b>\n\n"
+        "Обери тему — і ми знайдемо співрозмовника, якому цікаве те саме. "
+        "Поруч із темою видно, скільки людей уже чекає.\n\n"
+        "Перемикай вкладки вгорі: 🧩 Інтереси / 🎯 Захоплення.",
+        reply_markup=interests_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("intr_"))
+async def interests_pick(call: types.CallbackQuery, state: FSMContext):
+    key = call.data[len("intr_"):]
+    if key not in INTEREST_LABELS:
+        await call.answer("Невідома тема", show_alert=True)
+        return
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer(INTEREST_LABELS[key])
+    await run_search(call.message, state, f"int:{key}", user_id=call.from_user.id)
+
+
+# ---------------------------------------------------------------------------
 # Онбординг новачків: стать → вік → країна за кілька натискань
 # (обробники стоять після кнопок меню — натискання меню має пріоритет)
 # ---------------------------------------------------------------------------
@@ -561,6 +630,7 @@ async def setup_bot_commands():
         types.BotCommand(command="online", description="👥 Хто зараз онлайн"),
         types.BotCommand(command="premium", description="💎 Premium"),
         types.BotCommand(command="flirt", description="❤️ Флірт-пошук (18+)"),
+        types.BotCommand(command="interests", description="🧩 Пошук за інтересами"),
         types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
@@ -634,6 +704,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 # === КІНЕЦЬ part3.py ===
