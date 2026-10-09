@@ -81,6 +81,22 @@ authorized_admins: set[int] = set()  # хто вже ввів пароль у ц
 # Крипто-рахунки, очікують оплати: invoice_id -> {"user_id", "amount" (USDT), "credit" (грн)}
 pending_crypto_invoices: dict[str, dict] = {}
 
+# Оплата за реквізитами (переказ на картку / IBAN) з ручним підтвердженням адміном.
+# Реквізити — ТІЛЬКИ в змінних середовища Render (не в коді на GitHub).
+PAY_CARD = os.getenv("PAY_CARD", "").strip()  # номер картки
+PAY_IBAN = os.getenv("PAY_IBAN", "").strip()  # IBAN (для ФОП)
+PAY_RECIPIENT = os.getenv("PAY_RECIPIENT", "").strip()  # отримувач (ПІБ або ФОП ...)
+PAY_TAX_ID = os.getenv("PAY_TAX_ID", "").strip()  # ЄДРПОУ / ІПН (якщо потрібно для IBAN)
+# код -> {"user_id", "amount", "created", "status": "pending"/"confirmed"/"rejected", "receipt": bool}
+manual_payments: dict[str, dict] = {}
+
+# Автопідтвердження через Банку monobank (особистий API, лише читання).
+MONO_TOKEN = os.getenv("MONO_TOKEN", "").strip()  # токен з api.monobank.ua
+MONO_JAR_ID = os.getenv("MONO_JAR_ID", "").strip()  # id Банки (необов'язково — бот знайде сам)
+MONO_JAR_TITLE = os.getenv("MONO_JAR_TITLE", "").strip()  # частина назви Банки, якщо їх кілька
+PAY_JAR_LINK = os.getenv("PAY_JAR_LINK", "").strip()  # посилання на Банку (необов'язково)
+mono_seen_ids: list[str] = []  # id операцій з виписки, які вже оброблено (щоб не зарахувати двічі)
+
 # ---------------------------------------------------------------------------
 # Групові кімнати за інтересами (фіксовані теми, невеликі групи, лише текст)
 # ---------------------------------------------------------------------------
@@ -358,6 +374,7 @@ class FriendStates(StatesGroup):
 
 class TopupStates(StatesGroup):
     amount = State()
+    receipt = State()
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +630,7 @@ def get_admin_keyboard():
             [InlineKeyboardButton(text="📋 Список забанених", callback_data="adm_banlist")],
             [InlineKeyboardButton(text="📢 Розсилка всім", callback_data="adm_broadcast")],
             [InlineKeyboardButton(text="📣 Реклама в пошуку", callback_data="adm_ads")],
+            [InlineKeyboardButton(text="🏦 Оплати на перевірці", callback_data="adm_payments")],
         ]
     )
 
@@ -1119,6 +1137,8 @@ def _make_snapshot() -> bytes:
             "reports": reports,
             "report_counter": report_counter,
             "pending_crypto_invoices": pending_crypto_invoices,
+            "manual_payments": manual_payments,
+            "mono_seen_ids": mono_seen_ids,
             "gift_revenue_total": gift_revenue_total,
             "lottery_revenue_total": lottery_revenue_total,
             "ads": ads,
@@ -1143,6 +1163,10 @@ def _apply_snapshot(blob: bytes):
     reports.extend(data.get("reports", []))
     pending_crypto_invoices.clear()
     pending_crypto_invoices.update(data.get("pending_crypto_invoices", {}))
+    manual_payments.clear()
+    manual_payments.update(data.get("manual_payments", {}))
+    mono_seen_ids.clear()
+    mono_seen_ids.extend(data.get("mono_seen_ids", []))
     user_counter = data.get("user_counter", user_counter)
     report_counter = data.get("report_counter", report_counter)
     gift_revenue_total = data.get("gift_revenue_total", gift_revenue_total)
