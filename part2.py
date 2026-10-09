@@ -201,6 +201,14 @@ async def topup_show_methods(message: types.Message, user_id: int, amount: int):
         buttons.append(
             [InlineKeyboardButton(text=f"💎 Крипта (~{usdt} USDT)", callback_data=f"topup_crypto_{amount}")]
         )
+    if mono_jar_link():
+        buttons.append(
+            [InlineKeyboardButton(text="🫙 Оплатити через Банку monobank", callback_data=f"topup_jar_{amount}")]
+        )
+    if PAY_CARD or PAY_IBAN:
+        buttons.append(
+            [InlineKeyboardButton(text="🏦 Переказ на картку / за реквізитами", callback_data=f"topup_bank_{amount}")]
+        )
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
@@ -1713,6 +1721,210 @@ async def adm_ad_delete(call: types.CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
+# Оплата за реквізитами: код у призначенні + квитанція → адмін підтверджує кнопкою
+# ---------------------------------------------------------------------------
+def new_payment_code() -> str:
+    while True:
+        code = f"P{random.randint(100000, 999999)}"
+        if code not in manual_payments:
+            return code
+
+
+def bank_details_text(code: str, amount: int) -> str:
+    lines = ["🏦 <b>Оплата за реквізитами</b>\n", f"💵 До сплати: <b>{amount} грн</b>\n"]
+    lines.append("Переказ через банківський застосунок (дані копіюються натисканням):")
+    if PAY_RECIPIENT:
+        lines.append(f"▶️ Отримувач: <code>{esc(PAY_RECIPIENT)}</code>")
+    if PAY_CARD:
+        lines.append(f"▶️ Картка: <code>{esc(PAY_CARD)}</code>")
+    if PAY_IBAN:
+        lines.append(f"▶️ IBAN: <code>{esc(PAY_IBAN)}</code>")
+    if PAY_TAX_ID:
+        lines.append(f"▶️ ЄДРПОУ / ІПН: <code>{esc(PAY_TAX_ID)}</code>")
+    lines.append(f"▶️ Призначення / коментар: <code>Поповнення {code}</code>")
+    lines.append(f"▶️ Сума: <code>{amount}</code> грн\n")
+    lines.append(
+        f"⚠️ <b>Обов'язково</b> вкажи код <b>{code}</b> у призначенні або коментарі до переказу "
+        "і переказуй рівно цю суму — інакше ми не зможемо знайти твій платіж."
+    )
+    lines.append("📸 Після оплати натисни кнопку нижче і надішли скріншот квитанції — так зарахуємо швидше.")
+    lines.append("⏳ Платежі перевіряються вручну, зазвичай — протягом кількох годин.")
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data.startswith("topup_bank_"))
+async def topup_pay_bank(call: types.CallbackQuery):
+    if not (PAY_CARD or PAY_IBAN):
+        await call.answer("Цей спосіб оплати зараз недоступний", show_alert=True)
+        return
+    amount = _parse_topup_amount(call.data[len("topup_bank_"):])
+    if amount is None:
+        await call.answer("Недоступна сума.", show_alert=True)
+        return
+    code = new_payment_code()
+    manual_payments[code] = {
+        "user_id": call.from_user.id,
+        "amount": amount,
+        "created": time.strftime("%d.%m.%Y %H:%M"),
+        "ts": time.time(),
+        "status": "pending",
+        "receipt": False,
+    }
+    request_save()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✅ Я оплатив — надіслати квитанцію", callback_data=f"bank_paid_{code}")]]
+    )
+    await call.message.answer(bank_details_text(code, amount), reply_markup=kb)
+    await call.answer()
+
+
+def _payment_admin_kb(code: str):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Підтвердити", callback_data=f"pay_ok_{code}"),
+                InlineKeyboardButton(text="❌ Відхилити", callback_data=f"pay_no_{code}"),
+            ]
+        ]
+    )
+
+
+def _payment_caption(code: str, p: dict) -> str:
+    return (
+        f"🏦 <b>Оплата за реквізитами {code}</b>\n"
+        f"Від: {admin_label(p['user_id'])}\n"
+        f"Сума: <b>{p['amount']} грн</b>\nСтворено: {p['created']}\n\n"
+        f"Перевір у банку надходження з призначенням «Поповнення {code}»."
+    )
+
+
+@dp.callback_query(F.data.startswith("bank_paid_"))
+async def bank_paid(call: types.CallbackQuery, state: FSMContext):
+    code = call.data[len("bank_paid_"):]
+    p = manual_payments.get(code)
+    if p is None or p["user_id"] != call.from_user.id:
+        await call.answer("Платіж не знайдено.", show_alert=True)
+        return
+    if p["status"] != "pending":
+        await call.answer("Цей платіж уже оброблено.", show_alert=True)
+        return
+    await state.set_state(TopupStates.receipt)
+    await state.update_data(payment_code=code)
+    await call.message.answer("📸 Надішли скріншот або файл квитанції про оплату (або /cancel).")
+    await call.answer()
+
+
+@dp.message(TopupStates.receipt)
+async def bank_receipt(message: types.Message, state: FSMContext):
+    if not (message.photo or message.document):
+        await message.answer("Потрібен скріншот або файл квитанції 📸 (або /cancel).")
+        return
+    data = await state.get_data()
+    await state.clear()
+    code = data.get("payment_code")
+    p = manual_payments.get(code or "")
+    if p is None or p["status"] != "pending":
+        await message.answer("Цей платіж уже оброблено або не знайдено.")
+        return
+    p["receipt"] = True
+    request_save()
+    if ADMIN_ID:
+        try:
+            await message.copy_to(
+                chat_id=ADMIN_ID, caption=_payment_caption(code, p), reply_markup=_payment_admin_kb(code)
+            )
+        except TelegramAPIError as e:
+            logging.warning("Не вдалося надіслати квитанцію адміну: %s", e)
+            await safe_send(ADMIN_ID, _payment_caption(code, p), reply_markup=_payment_admin_kb(code))
+    await message.answer(
+        f"✅ Квитанцію отримано! Як тільки адміністратор підтвердить платіж {code}, "
+        "баланс поповниться і тобі прийде повідомлення."
+    )
+
+
+async def _resolve_payment(code: str, approve: bool) -> str:
+    """Підтвердити/відхилити платіж. Повертає текст для адміна."""
+    p = manual_payments.get(code)
+    if p is None:
+        return f"Платіж {code} не знайдено."
+    if p["status"] != "pending":
+        return f"Платіж {code} уже оброблено ({'підтверджено' if p['status'] == 'confirmed' else 'відхилено'})."
+    if approve:
+        p["status"] = "confirmed"
+        u = init_user(p["user_id"])
+        u["balance"] += p["amount"]
+        bonus = apply_topup_bonus(u, p["amount"])
+        request_save()
+        text = f"✅ Оплату {code} підтверджено! Баланс поповнено на {p['amount']} грн."
+        if bonus:
+            text += f"\n🎉 Бонус +{bonus:.0f} грн за кожні {TOPUP_BONUS_STEP:.0f} грн поповнень!"
+        progress = topup_progress_text(u)
+        if progress:
+            text += f"\n\n{progress}"
+        await safe_send(p["user_id"], text)
+        return f"✅ {code}: зараховано {p['amount']} грн користувачу {admin_label(p['user_id'])}."
+    p["status"] = "rejected"
+    request_save()
+    await safe_send(
+        p["user_id"],
+        f"❌ Платіж {code} не знайдено в банку. Якщо ти точно оплатив — напиши в «{BTN_HELP}» "
+        "і додай квитанцію.",
+    )
+    return f"❌ {code}: відхилено."
+
+
+def _is_admin(user_id: int) -> bool:
+    return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
+@dp.callback_query(F.data.startswith("pay_ok_") | F.data.startswith("pay_no_"))
+async def pay_resolve_button(call: types.CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await call.answer("Доступ заборонено", show_alert=True)
+        return
+    approve = call.data.startswith("pay_ok_")
+    code = call.data[len("pay_ok_"):]
+    result = await _resolve_payment(code, approve)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.message.answer(result)
+    await call.answer()
+
+
+@dp.message(Command("confirm"))
+@dp.message(Command("reject"))
+async def pay_resolve_command(message: types.Message):
+    """Адмін: /confirm P123456 або /reject P123456 — якщо платіж прийшов без квитанції."""
+    if not _is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Формат: /confirm P123456 або /reject P123456")
+        return
+    approve = parts[0].lower().startswith("/confirm")
+    await message.answer(await _resolve_payment(parts[1].strip().upper(), approve))
+
+
+@dp.callback_query(F.data == "adm_payments")
+async def adm_payments(call: types.CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await call.answer("Доступ заборонено", show_alert=True)
+        return
+    pending = [(c, p) for c, p in manual_payments.items() if p["status"] == "pending"]
+    if not pending:
+        await call.message.answer("🏦 Немає оплат, що очікують перевірки.")
+        await call.answer()
+        return
+    await call.message.answer(f"🏦 <b>Оплати на перевірці: {len(pending)}</b> (показую останні 10)")
+    for code, p in pending[-10:]:
+        mark = "📸 є квитанція" if p.get("receipt") else "без квитанції"
+        await call.message.answer(f"{_payment_caption(code, p)}\n({mark})", reply_markup=_payment_admin_kb(code))
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
 # Переписка з друзями (окремо від анонімного чату)
 # ---------------------------------------------------------------------------
 @dp.message(FriendStates.write)
@@ -1745,165 +1957,6 @@ async def friend_reply(message: types.Message):
         await message.answer(f"❌ {err}")
     else:
         await message.answer("✅ Надіслано другу.")
-
-
-# ---------------------------------------------------------------------------
-# Пересилання повідомлень (завжди останнім!)
-# ---------------------------------------------------------------------------
-@dp.message()
-async def relay_messages(message: types.Message):
-    user_id = message.from_user.id
-
-    room_id = user_room.get(user_id)
-    if room_id is not None:
-        room = rooms.get(room_id)
-        if room is None:
-            user_room.pop(user_id, None)
-        else:
-            if not message.text:
-                await message.answer(
-                    "📷 У кімнатах поки підтримується лише текст — це для безпеки спілкування в групі."
-                )
-                return
-            if LINK_REGEX.search(message.text):
-                await message.answer(
-                    "🚫 Повідомлення з посиланнями або контактами заборонено."
-                )
-                return
-            u = init_user(user_id)
-            broadcast_text = f"<b>{esc(u['nickname'])}:</b> {esc(message.text)}"
-            for member_id in list(room["members"]):
-                if member_id == user_id:
-                    continue
-                ok = await safe_send(member_id, broadcast_text)
-                if not ok:
-                    room["members"].discard(member_id)
-                    user_room.pop(member_id, None)
-            return
-
-    partner_id = active_chats.get(user_id)
-    if partner_id is None:
-        await message.answer("Скористайтеся меню нижче:", reply_markup=get_main_keyboard())
-        return
-
-    text_to_check = message.text or message.caption
-    if text_to_check and LINK_REGEX.search(text_to_check):
-        await message.answer(
-            "🚫 Повідомлення з посиланнями або контактами заборонено — спілкуйтесь анонімно в боті."
-        )
-        return
-
-    try:
-        await message.copy_to(chat_id=partner_id, protect_content=should_protect(users_db.get(user_id)))
-    except TelegramAPIError:
-        end_chat(user_id)
-        await message.answer(
-            "Не вдалося доставити повідомлення, чат завершено.", reply_markup=get_main_keyboard()
-        )
-
-
-# ---------------------------------------------------------------------------
-# Веб-сервер для Render (інакше "No open ports detected")
-# ---------------------------------------------------------------------------
-async def handle_ping(request: web.Request):
-    return web.Response(text="Bot is running!")
-
-
-async def start_web_server() -> web.AppRunner:
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/health", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info("Веб-сервер запущено на порту %s", port)
-    return runner
-
-
-async def setup_bot_commands():
-    """Перекладає меню команд '/' на українську (замість заглушок command1, command2...)."""
-    default_commands = [
-        types.BotCommand(command="start", description="🚀 Почати / перезапустити бота"),
-        types.BotCommand(command="edit_profile", description="✏️ Редагувати профіль"),
-        types.BotCommand(command="stop", description="❌ Завершити чат"),
-        types.BotCommand(command="cancel", description="⬅️ Скасувати поточну дію"),
-        types.BotCommand(command="top", description="🏆 Топ дарувальників подарунків"),
-        types.BotCommand(command="filters", description="🎯 Фільтри пошуку"),
-        types.BotCommand(command="rooms", description="👥 Кімнати за інтересами"),
-        types.BotCommand(command="help", description="🆘 Допомога / зв'язок з адміном"),
-        types.BotCommand(command="friends", description="👫 Друзі"),
-        types.BotCommand(command="online", description="👥 Хто зараз онлайн"),
-        types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
-    ]
-    await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
-
-    if ADMIN_ID:
-        admin_commands = default_commands + [
-            types.BotCommand(command="admin", description="🔐 Адмін-панель"),
-            types.BotCommand(command="addbalance", description="💰 Поповнити баланс користувачу"),
-        ]
-        try:
-            await bot.set_my_commands(
-                admin_commands, scope=types.BotCommandScopeChat(chat_id=ADMIN_ID)
-            )
-        except TelegramAPIError as e:
-            # адмін ще жодного разу не писав боту — Telegram не дає встановити команди для нього
-            logging.warning("Не вдалося встановити адмін-команди: %s", e)
-
-
-async def main():
-    global BOT_USERNAME
-    logging.basicConfig(level=logging.INFO)
-    runner = await start_web_server()
-    # Дані з бази завантажуємо ДО того, як бот почне приймати повідомлення.
-    await load_state_from_db()
-    poll_task = asyncio.create_task(crypto_poll_loop())
-    save_task = asyncio.create_task(persistence_loop())
-    lease_task = asyncio.create_task(lease_heartbeat_loop())
-    try:
-        # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
-        # Telegram API не вбивала весь процес (і "Application exited early" на Render).
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Не вдалося скинути webhook: %s", e)
-
-        try:
-            await setup_bot_commands()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Не вдалося встановити команди бота: %s", e)
-
-        try:
-            me = await bot.get_me()
-            BOT_USERNAME = me.username or ""
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Не вдалося отримати інформацію про бота (get_me): %s", e)
-
-        # Якщо polling впаде (напр. TelegramConflictError через старий інстанс),
-        # логуємо чітку причину і пробуємо знову, а не завершуємо процес.
-        while True:
-            try:
-                await dp.start_polling(bot)
-                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001
-                logging.error("Помилка під час polling, перезапуск через 5с: %s", e)
-                await asyncio.sleep(5)
-    finally:
-        poll_task.cancel()
-        save_task.cancel()
-        lease_task.cancel()
-        await save_state_to_db()  # фінальне збереження при зупинці (деплой/перезапуск)
-        await release_lease()  # тепер нова копія може забрати свіжі дані
-        await bot.session.close()
-        await runner.cleanup()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 
 # === КІНЕЦЬ part2.py ===
