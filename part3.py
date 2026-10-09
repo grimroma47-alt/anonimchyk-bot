@@ -1,913 +1,1380 @@
 # ---------------------------------------------------------------------------
-# Оплата через Банку monobank з автоматичним підтвердженням
-# (бот раз на хвилину читає виписку Банки і шукає код платежу в коментарі)
+# Рулетка (лотерея за грн)
 # ---------------------------------------------------------------------------
-MONO_API = "https://api.monobank.ua"
-MONO_POLL_SECONDS = 65  # API дозволяє виписку не частіше ніж раз на 60 с
-MONO_SEEN_LIMIT = 2000
-MONO_CODE_REGEX = re.compile(r"[PР]\s?(\d{6})", re.IGNORECASE)  # латинська P або кирилична Р
-mono_state = {"jar": None, "last_poll": None, "last_error": None, "jars": []}
+def get_lottery_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🎲 Крутити", callback_data="lottery_spin")]]
+    )
 
 
-def mono_jar_link() -> str:
-    if PAY_JAR_LINK:
-        return PAY_JAR_LINK
-    jar = mono_state.get("jar")
-    if jar and jar.get("sendId"):
-        send_id = jar["sendId"]
-        return send_id if send_id.startswith("http") else f"https://send.monobank.ua/{send_id}"
-    return ""
+@dp.message(F.text == BTN_LOTTERY)
+async def lottery_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    await message.answer(
+        "🎰 <b>Рулетка</b>\n\n"
+        f"Один спін коштує {LOTTERY_COST:.0f} грн.\n"
+        "Можливі призи: трохи грошей, великий виграш грошей або випадковий подарунок!\n"
+        f"Твій баланс: {u['balance']:.2f} грн.",
+        reply_markup=get_lottery_keyboard(),
+    )
 
 
-async def _mono_get(path: str):
-    """GET до API monobank. Повертає (статус, json або None)."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            f"{MONO_API}{path}", headers={"X-Token": MONO_TOKEN}, timeout=aiohttp.ClientTimeout(total=20)
-        ) as resp:
-            try:
-                data = await resp.json(content_type=None)
-            except Exception:  # noqa: BLE001
-                data = None
-            return resp.status, data
+@dp.callback_query(F.data == "lottery_spin")
+async def lottery_spin_handler(call: types.CallbackQuery):
+    global lottery_revenue_total
+    u = init_user(call.from_user.id)
 
-
-def _choose_jar(jars: list[dict]) -> dict | None:
-    if MONO_JAR_ID:
-        return next((j for j in jars if j.get("id") == MONO_JAR_ID), None)
-    if MONO_JAR_TITLE:
-        wanted = MONO_JAR_TITLE.lower()
-        matches = [j for j in jars if wanted in (j.get("title") or "").lower()]
-        return matches[0] if len(matches) == 1 else None
-    uah = [j for j in jars if j.get("currencyCode") in (980, None)]
-    return uah[0] if len(uah) == 1 else None
-
-
-async def mono_detect_jar() -> bool:
-    status, data = await _mono_get("/personal/client-info")
-    if status != 200 or not isinstance(data, dict):
-        desc = (data or {}).get("errorDescription") if isinstance(data, dict) else None
-        mono_state["last_error"] = f"client-info: HTTP {status} {desc or ''}".strip()
-        return False
-    jars = data.get("jars") or []
-    mono_state["jars"] = jars
-    jar = _choose_jar(jars)
-    if jar is None:
-        mono_state["last_error"] = (
-            f"Не вдалося вибрати Банку (знайдено: {len(jars)}). "
-            "Задай MONO_JAR_TITLE (частину назви) або MONO_JAR_ID — список: /mono"
-        )
-        return False
-    mono_state["jar"] = jar
-    mono_state["last_error"] = None
-    logging.info("Monobank: використовую Банку «%s».", jar.get("title"))
-    return True
-
-
-def find_payment_code(comment: str) -> str | None:
-    m = MONO_CODE_REGEX.search(comment or "")
-    return f"P{m.group(1)}" if m else None
-
-
-MONO_MATCH_WINDOW = 30 * 60  # оплата без коду: шукаємо заявку з тією ж сумою за останні 30 хв
-# Надходження без коду, які чекають вибору адміна (лише в пам'яті): ключ -> {"paid", "comment"}
-mono_unmatched: dict[str, dict] = {}
-_mono_unmatched_seq = [0]
-
-
-def _amount_candidates(paid, item_time: float) -> list[str]:
-    """Неоплачені заявки з точно такою ж сумою, створені незадовго до оплати."""
-    found = []
-    for code, p in manual_payments.items():
-        if p.get("status") != "pending" or not p.get("ts"):
-            continue
-        if abs(float(p["amount"]) - float(paid)) >= 0.01:
-            continue
-        if p["ts"] - 120 <= item_time <= p["ts"] + MONO_MATCH_WINDOW:
-            found.append(code)
-    return found
-
-
-def _recent_pending(item_time: float, limit: int = 5) -> list[str]:
-    recent = [
-        (p["ts"], code)
-        for code, p in manual_payments.items()
-        if p.get("status") == "pending" and p.get("ts") and 0 <= item_time - p["ts"] + 120 <= 86400
-    ]
-    return [code for _ts, code in sorted(recent, reverse=True)[:limit]]
-
-
-async def _credit_jar_payment(code: str, paid, how: str) -> str:
-    p = manual_payments[code]
-    expected = p["amount"]
-    if abs(float(paid) - float(expected)) >= 0.01:
-        p["expected_amount"] = expected
-        p["amount"] = paid  # зараховуємо фактично отриману суму
-    p["method"] = "jar"
-    result = await _resolve_payment(code, True)
-    if ADMIN_ID:
-        note = "" if abs(float(paid) - float(expected)) < 0.01 else f" (очікувалось {expected} грн)"
-        await safe_send(ADMIN_ID, f"🤖 {how}{note}:\n{result}")
-    return result
-
-
-async def process_jar_statement(items: list[dict]) -> int:
-    """Обробляє операції з виписки Банки. Повертає, скільки платежів зараховано."""
-    credited = 0
-    changed = False
-    seen = set(mono_seen_ids)
-    for item in sorted(items, key=lambda i: i.get("time", 0)):
-        item_id = str(item.get("id") or "")
-        amount_kop = item.get("amount") or 0
-        if not item_id or item_id in seen or amount_kop <= 0:
-            continue
-        seen.add(item_id)
-        mono_seen_ids.append(item_id)
-        changed = True
-        paid = round(amount_kop / 100, 2)
-        if float(paid).is_integer():
-            paid = int(paid)
-        item_time = float(item.get("time") or time.time())
-        comment = item.get("comment") or ""
-
-        # 1) код у коментарі
-        code = find_payment_code(comment)
-        p = manual_payments.get(code) if code else None
-        if p is not None and p.get("status") == "pending":
-            await _credit_jar_payment(code, paid, "Автоматично через Банку")
-            credited += 1
-            continue
-
-        # 2) коду немає — шукаємо заявку з тією ж сумою
-        candidates = _amount_candidates(paid, item_time)
-        if len(candidates) == 1:
-            await _credit_jar_payment(candidates[0], paid, "Зараховано за сумою (у коментарі не було коду)")
-            credited += 1
-            continue
-
-        # 3) кілька або жодної — питаємо адміна кнопками
-        if not ADMIN_ID:
-            continue
-        options = candidates or _recent_pending(item_time)
-        text = (
-            f"🫙 Надходження в Банку без коду: <b>{paid:g} грн</b>\n"
-            f"Коментар: «{esc(comment) or '—'}»\n"
-        )
-        kb = None
-        if options:
-            _mono_unmatched_seq[0] += 1
-            key = str(_mono_unmatched_seq[0])
-            mono_unmatched[key] = {"paid": paid, "comment": comment}
-            text += (
-                "Кілька заявок з такою сумою — обери, кому зарахувати:"
-                if candidates
-                else "Заявки з такою сумою немає. Ось останні неоплачені — обери, кому зарахувати:"
-            )
-            rows = []
-            for c in options:
-                cp = manual_payments[c]
-                cu = users_db.get(cp["user_id"]) or {}
-                label = f"✅ {c}: {cu.get('nickname', cp['user_id'])} ({cu.get('custom_id', '?')}), заявка {cp['amount']} грн"
-                rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"jp_{key}_{c}")])
-            kb = InlineKeyboardMarkup(inline_keyboard=rows)
-        else:
-            text += "Неоплачених заявок немає. Якщо це оплата від користувача — зарахуй вручну (/addbalance)."
-        await safe_send(ADMIN_ID, text, reply_markup=kb)
-    if len(mono_seen_ids) > MONO_SEEN_LIMIT:
-        del mono_seen_ids[: len(mono_seen_ids) - MONO_SEEN_LIMIT]
-    if changed:
-        request_save()
-    return credited
-
-
-@dp.callback_query(F.data.startswith("jp_"))
-async def jar_pick(call: types.CallbackQuery):
-    """Адмін вибрав, кому зарахувати надходження без коду."""
-    if not _is_admin(call.from_user.id):
-        await call.answer("Доступ заборонено", show_alert=True)
-        return
-    try:
-        _prefix, key, code = call.data.split("_", 2)
-    except ValueError:
-        await call.answer()
-        return
-    entry = mono_unmatched.get(key)
-    if entry is None:
+    if u["balance"] < LOTTERY_COST:
         await call.answer(
-            "Це надходження вже оброблено або бот перезапускався. Зарахуй вручну: /addbalance", show_alert=True
+            f"❌ Недостатньо коштів. Ціна спіну: {LOTTERY_COST:.0f} грн.", show_alert=True
         )
         return
-    p = manual_payments.get(code)
-    if p is None or p.get("status") != "pending":
-        await call.answer("Ця заявка вже оброблена. Обери іншу.", show_alert=True)
+
+    u["balance"] -= LOTTERY_COST
+    lottery_revenue_total += LOTTERY_COST
+
+    kind, mult = spin_lottery()
+    if kind == "nothing":
+        text = "😔 На цей раз нічого не випало. Спробуй ще раз!"
+    elif kind == "money":
+        win = round(LOTTERY_COST * mult, 2)
+        u["balance"] += win
+        lottery_revenue_total -= win
+        text = f"🎉 Виграш: <b>{win:.2f} грн</b>! Зараховано на баланс."
+    else:  # gift
+        key = random.choice(list(GIFT_CATALOG.keys()))
+        title, gift_price = GIFT_CATALOG[key]
+        u.setdefault("gifts", {})
+        u["gifts"][key] = u["gifts"].get(key, 0) + 1
+        lottery_revenue_total -= gift_price
+        text = f"🎁 Виграш: подарунок <b>{esc(title)}</b>! Додано в інвентар."
+
+    text += f"\n\n💰 Баланс: {u['balance']:.2f} грн."
+    await call.message.answer(text, reply_markup=get_lottery_keyboard())
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Групові кімнати за інтересами
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_ROOMS)
+@dp.message(Command("rooms"))
+async def rooms_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+
+    if user_id in banned_users:
+        ban_text, ban_kb = banned_notice(user_id)
+        await message.answer(ban_text, reply_markup=ban_kb)
         return
-    mono_unmatched.pop(key, None)
+    if user_id in user_room:
+        await message.answer("Ти вже в кімнаті. Спочатку вийди з неї.", reply_markup=get_room_keyboard())
+        return
+    if user_id in active_chats:
+        await message.answer("Спочатку заверши приватний чат.", reply_markup=get_chat_keyboard())
+        return
+
+    await message.answer(
+        "👥 <b>Кімнати за інтересами</b>\n\n"
+        f"Обери тему — потрапиш у групу до {ROOM_CAPACITY} людей, які говорять про те саме. "
+        "У кімнатах поки підтримується лише текст — це для безпеки спілкування в групі.",
+        reply_markup=get_room_topics_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("room_join_"))
+async def room_join(call: types.CallbackQuery):
+    user_id = call.from_user.id
+
+    if user_id in banned_users:
+        await call.answer("⛔ Вас заблоковано в цьому боті.", show_alert=True)
+        return
+    if user_id in user_room:
+        await call.answer("Ти вже в кімнаті. Спочатку вийди з неї.", show_alert=True)
+        return
+    if user_id in active_chats or user_id in queue:
+        await call.answer("Спочатку заверши приватний чат або пошук.", show_alert=True)
+        return
+
+    topic_key = call.data[len("room_join_"):]
+    if topic_key not in ROOM_TOPICS:
+        await call.answer("Невідома тема", show_alert=True)
+        return
+
+    global room_counter
+    target_room_id = None
+    for rid, r in rooms.items():
+        if r["topic"] == topic_key and len(r["members"]) < ROOM_CAPACITY:
+            target_room_id = rid
+            break
+    if target_room_id is None:
+        room_counter += 1
+        target_room_id = f"room_{room_counter}"
+        rooms[target_room_id] = {"topic": topic_key, "members": set()}
+
+    room = rooms[target_room_id]
+    u = init_user(user_id)
+
+    for member_id in room["members"]:
+        await safe_send(member_id, f"🆕 <b>{esc(u['nickname'])}</b> приєднався до кімнати!")
+
+    room["members"].add(user_id)
+    user_room[user_id] = target_room_id
+
+    await call.message.answer(
+        f"✅ Ти приєднався до кімнати: <b>{esc(ROOM_TOPICS[topic_key])}</b> "
+        f"({len(room['members'])}/{ROOM_CAPACITY} 👥)\n\n"
+        "Просто пиши текстом — повідомлення побачать усі учасники кімнати.",
+        reply_markup=get_room_keyboard(),
+    )
+    await call.answer()
+
+
+@dp.message(F.text == BTN_ROOM_LEAVE)
+async def room_leave(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    room_id = user_room.get(user_id)
+    if room_id is None:
+        await message.answer("Ти зараз не в кімнаті.", reply_markup=get_main_keyboard())
+        return
+
+    room = rooms.get(room_id)
+    u = init_user(user_id)
+    remove_from_room(user_id)
+
+    if room:
+        for member_id in room["members"]:
+            await safe_send(member_id, f"🚪 <b>{esc(u['nickname'])}</b> покинув кімнату.")
+
+    await message.answer("Ти вийшов з кімнати.", reply_markup=get_main_keyboard())
+
+
+@dp.message(F.text == BTN_ROOM_REPORT)
+async def room_report_start(message: types.Message):
+    user_id = message.from_user.id
+    room_id = user_room.get(user_id)
+    if room_id is None:
+        await message.answer("Ти зараз не в кімнаті.", reply_markup=get_main_keyboard())
+        return
+    room = rooms.get(room_id)
+    others = [uid for uid in room["members"] if uid != user_id] if room else []
+    if not others:
+        await message.answer("У кімнаті, крім тебе, нікого немає.")
+        return
+
+    rows = [
+        [InlineKeyboardButton(text=users_db[uid]["nickname"], callback_data=f"roomrep_{uid}")]
+        for uid in others
+    ]
+    await message.answer(
+        "🚨 На кого з учасників кімнати поскаржитись?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("roomrep_"))
+async def room_report_submit(call: types.CallbackQuery):
+    global report_counter
+    target_id = int(call.data[len("roomrep_"):])
+    user_id = call.from_user.id
+
+    report_counter += 1
+    reports.append(
+        {
+            "id": report_counter,
+            "from": user_id,
+            "on": target_id,
+            "time": time.strftime("%d.%m.%Y %H:%M"),
+            "status": "нова",
+        }
+    )
+
+    p = init_user(target_id)
+    p["reports_received"] = p.get("reports_received", 0) + 1
+    auto_banned = False
+    if p["reports_received"] >= AUTO_BAN_REPORTS and target_id not in banned_users:
+        banned_users.add(target_id)
+        register_auto_ban(p)
+        request_save()
+        auto_banned = True
+        if target_id in queue:
+            queue.remove(target_id)
+        remove_from_room(target_id)
+        end_chat(target_id)
+        ban_text, ban_kb = banned_notice(target_id)
+        await safe_send(target_id, ban_text, reply_markup=ban_kb)
+
+    if ADMIN_ID:
+        extra = (
+            f"\n\n⛔ Автобан: досягнуто {AUTO_BAN_REPORTS} скарг, користувача заблоковано автоматично."
+            if auto_banned
+            else ""
+        )
+        await safe_send(
+            ADMIN_ID,
+            f"🚨 Скарга з кімнати #{report_counter}\nВід: {admin_label(user_id)}\nНа: {admin_label(target_id)}{extra}",
+        )
+
+    await call.message.answer("🚨 Скаргу надіслано, дякуємо!")
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Пошук та чат
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_SEARCH)
+async def search_partner(message: types.Message, state: FSMContext):
+    await run_search(message, state, "normal")
+
+
+FLIRT_MIN_AGE = 18
+FLIRT_RULES = (
+    "❤️ <b>Флірт-чат</b>\n"
+    "• Повага і згода — понад усе. «Ні» означає «ні».\n"
+    "• Жодних інтимних фото без явної згоди співрозмовника.\n"
+    "• Не тиснемо і не просимо грошей чи контактів.\n"
+    f"• Порушують — тисни «{BTN_REPORT}»."
+)
+
+
+def min_age_ever(u: dict) -> int | None:
+    """Найменший вік, який будь-коли був у профілі (поточний, архів, онбординг)."""
+    ages = []
+    cur = get_age_int(u)
+    if cur is not None:
+        ages.append(cur)
+    if u.get("min_age_seen") is not None:
+        ages.append(int(u["min_age_seen"]))
+    for line in u.get("archive") or []:
+        m = re.search(r"Вік:\s*(\d+)", line)
+        if m:
+            ages.append(int(m.group(1)))
+    return min(ages) if ages else None
+
+
+def flirt_block_reason(u: dict) -> str | None:
+    """Чому людині не можна у флірт-пошук (або None — можна)."""
+    age = get_age_int(u)
+    if age is None or u.get("gender") not in ("Хлопець", "Дівчина"):
+        return "❤️ Щоб увімкнути флірт-пошук, вкажи у профілі стать і вік: /edit_profile"
+    if age < FLIRT_MIN_AGE:
+        return f"❤️ Флірт-пошук доступний лише з {FLIRT_MIN_AGE} років."
+    # Перевірку історії віку (min_age_ever) вимкнено за рішенням власника.
+    # Щоб увімкнути: якщо min_age_ever(u) < FLIRT_MIN_AGE — повертати відмову.
+    return None
+
+
+@dp.message(F.text == BTN_FLIRT)
+@dp.message(Command("flirt"))
+async def flirt_search(message: types.Message, state: FSMContext):
+    u = init_user(message.from_user.id)
+    reason = flirt_block_reason(u)
+    if reason and message.from_user.id not in banned_users:
+        await state.clear()
+        await message.answer(reason)
+        return
+    await run_search(message, state, "flirt")
+
+
+async def run_search(message: types.Message, state: FSMContext, mode: str = "normal", user_id: int | None = None):
+    await state.clear()
+    user_id = user_id or message.from_user.id
+
+    if user_id in banned_users:
+        ban_text, ban_kb = banned_notice(user_id)
+        await message.answer(ban_text, reply_markup=ban_kb)
+        return
+
+    u = init_user(user_id)
+
+    if user_id in active_chats:
+        await message.answer("Ти вже перебуваєш у чаті!", reply_markup=get_chat_keyboard())
+        return
+    if user_id in queue:
+        await message.answer("Ти вже в черзі пошуку. Зачекай трохи... ⏳")
+        return
+    if user_id in user_room:
+        await message.answer("Спочатку вийди з групової кімнати.", reply_markup=get_room_keyboard())
+        return
+
+    best = None  # (бали, позиція в черзі)
+    for i, candidate_id in enumerate(queue):
+        if search_mode.get(candidate_id, "normal") != mode:
+            continue  # флірт шукає лише флірт, звичайний — лише звичайний
+        p_candidate = init_user(candidate_id)
+        if is_blacklisted(u, user_id, p_candidate, candidate_id):
+            continue
+        if mode == "flirt" and p_candidate.get("gender") == u.get("gender"):
+            continue  # у флірті з'єднуємо лише хлопця з дівчиною
+        if not passes_filters(u, p_candidate) or not passes_filters(p_candidate, u):
+            continue
+        score = match_score(u, p_candidate, mode)
+        if best is None or score > best[0]:
+            best = (score, i)
+            if score >= MATCH_SCORE_MAX:
+                break
+    match_index = best[1] if best else None
+
+    if match_index is not None:
+        partner_id = queue.pop(match_index)
+        active_chats[user_id] = partner_id
+        active_chats[partner_id] = user_id
+        p = init_user(partner_id)
+
+        ok_partner = await safe_send(
+            partner_id, f"Партнера знайдено! 🤫\nІнфо: {short_info(u)}", reply_markup=get_chat_keyboard()
+        )
+        if not ok_partner:
+            # співрозмовник заблокував бота — відкочуємо і ставимо користувача в чергу
+            end_chat(user_id)
+            queue.append(user_id)
+            search_mode[user_id] = mode
+            await message.answer("Співрозмовник виявився недоступним. Шукаємо далі... ⏳")
+            return
+
+        u["total_chats"] = u.get("total_chats", 0) + 1
+        p["total_chats"] = p.get("total_chats", 0) + 1
+
+        await message.answer(
+            f"Партнера знайдено! 🤫\nІнфо: {short_info(p)}", reply_markup=get_chat_keyboard()
+        )
+        if mode == "flirt":
+            await message.answer(FLIRT_RULES)
+            await safe_send(partner_id, FLIRT_RULES)
+        elif mode.startswith("int:"):
+            topic_note = f"🧩 Ваша спільна тема: <b>{INTEREST_LABELS.get(mode[4:], mode[4:])}</b> — є з чого почати 😉"
+            await message.answer(topic_note)
+            await safe_send(partner_id, topic_note)
+        if not mode.startswith("int:"):
+            await send_interest_notes(user_id, u, partner_id, p)
+    else:
+        if has_perk(u, "priority") or is_premium(u):
+            queue.insert(0, user_id)
+        else:
+            queue.append(user_id)
+        search_mode[user_id] = mode
+        if mode == "flirt":
+            looking_for = "дівчину" if u.get("gender") == "Хлопець" else "хлопця"
+            wait_text = f"❤️ Шукаємо {looking_for} для флірту... Зачекай ⏳"
+        elif mode.startswith("int:"):
+            wait_text = (
+                f"🧩 Шукаємо співрозмовника за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}... Зачекай ⏳\n"
+                f"Якщо довго нікого немає — натисни «{BTN_STOP}» і спробуй звичайний пошук."
+            )
+        else:
+            wait_text = "Шукаємо співрозмовника... Зачекай ⏳"
+            schedule_filter_nudge(user_id)
+        await message.answer(wait_text)
+        await maybe_show_ad(user_id)
+
+
+@dp.message(F.text == BTN_STOP)
+@dp.message(Command("stop"))
+async def stop_chat(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+
+    if user_id in queue:
+        queue.remove(user_id)
+        await message.answer("Пошук зупинено.", reply_markup=get_main_keyboard())
+        return
+
+    partner_id = end_chat(user_id)
+    if partner_id is None:
+        await message.answer("Ти зараз не в чаті.", reply_markup=get_main_keyboard())
+        return
+
+    await message.answer("Чат завершено.", reply_markup=get_main_keyboard())
+    await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+    await send_post_chat_menu(user_id, partner_id)
+    await send_post_chat_menu(partner_id, user_id)
+
+
+@dp.callback_query(F.data.startswith("rate_up_"))
+async def rate_up_handler(call: types.CallbackQuery):
+    target_id = int(call.data[len("rate_up_"):])
+    if pending_rating.get(call.from_user.id) != target_id:
+        await call.answer("Оцінку вже враховано 🙂")
+        return
+    pending_rating.pop(call.from_user.id, None)
+    u = init_user(target_id)
+    u["rating_up"] = u.get("rating_up", 0) + 1
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except TelegramAPIError:
         pass
-    await _credit_jar_payment(code, entry["paid"], "Зараховано вручну з Банки")
-    await call.answer("Зараховано ✅")
+    await call.answer("Дякуємо за оцінку! 👍")
 
 
-async def mono_poll_once():
-    now = int(time.time())
-    # стежимо лише за свіжими заявками (до 3 діб); старші можна підтвердити вручну
-    pending = [
-        p
-        for p in manual_payments.values()
-        if p.get("status") == "pending" and p.get("ts") and now - p["ts"] < 3 * 86400
-    ]
-    if not pending:
+@dp.callback_query(F.data.startswith("rate_down_"))
+async def rate_down_handler(call: types.CallbackQuery):
+    target_id = int(call.data[len("rate_down_"):])
+    if pending_rating.get(call.from_user.id) != target_id:
+        await call.answer("Оцінку вже враховано 🙂")
         return
-    oldest = min(int(p["ts"]) for p in pending) - 300
-    frm = max(oldest, now - 2682000 + 60)  # не більше 31 доби + 1 год
-    status, data = await _mono_get(f"/personal/statement/{mono_state['jar']['id']}/{frm}/{now}")
-    mono_state["last_poll"] = time.strftime("%d.%m.%Y %H:%M:%S")
-    if status != 200 or not isinstance(data, list):
-        desc = data.get("errorDescription") if isinstance(data, dict) else ""
-        mono_state["last_error"] = f"statement: HTTP {status} {desc or ''}".strip()
-        logging.warning("Monobank: %s", mono_state["last_error"])
-        return
-    mono_state["last_error"] = None
-    await process_jar_statement(data)
+    pending_rating.pop(call.from_user.id, None)
+    u = init_user(target_id)
+    u["rating_down"] = u.get("rating_down", 0) + 1
+    await maybe_warn_low_rating(target_id, u)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer("Дякуємо за оцінку! 👎")
 
 
-async def mono_poll_loop():
-    if not MONO_TOKEN:
-        return
-    await asyncio.sleep(10)
-    while True:
-        try:
-            if mono_state.get("jar") is None:
-                if not await mono_detect_jar():
-                    logging.warning("Monobank: %s", mono_state["last_error"])
-                    await asyncio.sleep(300)
-                    continue
-                await asyncio.sleep(MONO_POLL_SECONDS)  # окремий ліміт для client-info / statement
-            await mono_poll_once()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            mono_state["last_error"] = str(e)
-            logging.warning("Monobank: помилка перевірки Банки: %s", e)
-        await asyncio.sleep(MONO_POLL_SECONDS)
+# ---------------------------------------------------------------------------
+# Реконнект з минулим співрозмовником і запрошення друзів у чат (за згодою)
+# ---------------------------------------------------------------------------
+async def try_send_chat_invite(requester_id: int, target_id: int | None) -> str:
+    """Надсилає target_id запит почати чат із requester_id. Повертає текст помилки, або "" при успіху."""
+    if not target_id or target_id not in users_db:
+        return "Користувача не знайдено."
+    if requester_id in banned_users or target_id in banned_users:
+        return "Недоступно."
+    if requester_id in active_chats or target_id in active_chats:
+        return "Хтось із вас зараз уже в іншому чаті."
+    if requester_id in queue or target_id in queue:
+        return "Хтось із вас зараз у черзі пошуку."
+    if requester_id in user_room or target_id in user_room:
+        return "Хтось із вас зараз у груповій кімнаті."
 
+    u = init_user(requester_id)
+    p = init_user(target_id)
+    if is_blacklisted(u, requester_id, p, target_id):
+        return "Недоступно."
 
-@dp.callback_query(F.data.startswith("topup_jar_"))
-async def topup_pay_jar(call: types.CallbackQuery):
-    link = mono_jar_link()
-    if not link:
-        await call.answer("Цей спосіб оплати зараз недоступний", show_alert=True)
-        return
-    amount = _parse_topup_amount(call.data[len("topup_jar_"):])
-    if amount is None:
-        await call.answer("Недоступна сума.", show_alert=True)
-        return
-    code = new_payment_code()
-    manual_payments[code] = {
-        "user_id": call.from_user.id,
-        "amount": amount,
-        "created": time.strftime("%d.%m.%Y %H:%M"),
-        "ts": time.time(),
-        "status": "pending",
-        "receipt": False,
-        "method": "jar",
-    }
-    request_save()
+    reconnect_requests[target_id] = requester_id
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🫙 Відкрити Банку і оплатити", url=link)],
-            [InlineKeyboardButton(text="📸 Не зарахувалось? Надіслати квитанцію", callback_data=f"bank_paid_{code}")],
+            [
+                InlineKeyboardButton(text="✅ Прийняти", callback_data="reconnect_accept"),
+                InlineKeyboardButton(text="❌ Відхилити", callback_data="reconnect_decline"),
+            ]
         ]
     )
-    auto = bool(MONO_TOKEN and mono_state.get("jar"))
-    await call.message.answer(
-        "🫙 <b>Оплата через Банку monobank</b>\n\n"
-        f"1️⃣ Натисни «Відкрити Банку» і введи суму <b>{amount} грн</b>.\n"
-        f"2️⃣ У полі <b>коментар</b> обов'язково напиши код: <code>{code}</code>\n"
-        "3️⃣ Оплати будь-якою карткою.\n\n"
-        + (
-            "🤖 Баланс поповниться <b>автоматично</b> за 1–2 хвилини після оплати."
-            if auto
-            else "⏳ Платіж перевіряється вручну, зазвичай протягом кількох годин."
-        )
-        + f"\n\n⚠️ Без коду {code} у коментарі ми не зможемо знайти твій платіж.",
-        reply_markup=kb,
+    ok = await safe_send(
+        target_id, f"🔄 <b>{esc(u['nickname'])}</b> хоче почати з тобою чат. Прийняти?", reply_markup=kb
+    )
+    if not ok:
+        reconnect_requests.pop(target_id, None)
+        return "Співрозмовник зараз недоступний."
+    return ""
+
+
+@dp.callback_query(F.data == "reconnect_request")
+async def reconnect_request(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    u = init_user(user_id)
+    target_id = u.get("last_partner_id")
+
+    if not target_id:
+        await call.answer("Немає з ким відновлювати зв'язок.", show_alert=True)
+        return
+
+    error = await try_send_chat_invite(user_id, target_id)
+    if error:
+        await call.answer(error, show_alert=True)
+    else:
+        await call.answer("Запит надіслано! Чекай на відповідь.", show_alert=True)
+
+
+@dp.callback_query(F.data == "reconnect_accept")
+async def reconnect_accept(call: types.CallbackQuery):
+    acceptor_id = call.from_user.id
+    requester_id = reconnect_requests.pop(acceptor_id, None)
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+
+    if requester_id is None:
+        await call.answer("Запит уже неактуальний.", show_alert=True)
+        return
+    if requester_id in active_chats or acceptor_id in active_chats:
+        await call.answer("Хтось із вас вже в іншому чаті.", show_alert=True)
+        return
+    if requester_id in banned_users or acceptor_id in banned_users:
+        await call.answer("Недоступно.", show_alert=True)
+        return
+    if requester_id in user_room or acceptor_id in user_room:
+        await call.answer("Хтось із вас зараз у груповій кімнаті.", show_alert=True)
+        return
+
+    if requester_id in queue:
+        queue.remove(requester_id)
+    if acceptor_id in queue:
+        queue.remove(acceptor_id)
+
+    active_chats[requester_id] = acceptor_id
+    active_chats[acceptor_id] = requester_id
+
+    await call.message.answer("✅ Чат розпочато!", reply_markup=get_chat_keyboard())
+    await safe_send(
+        requester_id, "✅ Співрозмовник прийняв запит — чат розпочато!", reply_markup=get_chat_keyboard()
     )
     await call.answer()
 
 
-@dp.message(Command("mono"))
-async def mono_status(message: types.Message):
-    """Адмін: стан підключення до Банки monobank."""
-    if not _is_admin(message.from_user.id):
+@dp.callback_query(F.data == "reconnect_decline")
+async def reconnect_decline(call: types.CallbackQuery):
+    acceptor_id = call.from_user.id
+    requester_id = reconnect_requests.pop(acceptor_id, None)
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+
+    if requester_id is not None:
+        await safe_send(requester_id, "❌ Співрозмовник відхилив запит на повторний зв'язок.")
+    await call.answer("Відхилено.")
+
+
+# ---------------------------------------------------------------------------
+# Друзі (повністю окремий механізм від реконнекту — нижче)
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_ADD_FRIEND)
+async def add_friend_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await message.answer("Додавати в друзі можна лише під час чату.", reply_markup=get_main_keyboard())
         return
-    if not MONO_TOKEN:
-        await message.answer("🫙 MONO_TOKEN не задано в Render — автопідтвердження вимкнене.")
+
+    u = init_user(user_id)
+    if partner_id in (u.get("friends") or set()):
+        await message.answer("Ви вже друзі! 👫")
         return
-    jar = mono_state.get("jar")
-    pending = sum(1 for p in manual_payments.values() if p.get("status") == "pending" and p.get("method") == "jar")
-    lines = ["🫙 <b>Банка monobank</b>"]
-    if jar:
-        lines.append(f"Банка: «{esc(jar.get('title'))}», баланс {jar.get('balance', 0) / 100:g} грн")
-        lines.append(f"Посилання: {esc(mono_jar_link())}")
+
+    friend_add_requests[partner_id] = user_id
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Прийняти", callback_data="friend_accept"),
+                InlineKeyboardButton(text="❌ Відхилити", callback_data="friend_decline"),
+            ]
+        ]
+    )
+    ok = await safe_send(
+        partner_id, f"🤝 <b>{esc(u['nickname'])}</b> хоче додати тебе в друзі. Прийняти?", reply_markup=kb
+    )
+    if ok:
+        await message.answer("🤝 Запит надіслано!")
     else:
-        lines.append("Банку ще не вибрано.")
-    lines.append(f"Оплат через Банку на перевірці: {pending}")
-    lines.append(f"Остання перевірка виписки: {mono_state.get('last_poll') or '—'}")
-    if mono_state.get("last_error"):
-        lines.append(f"⚠️ Помилка: {esc(mono_state['last_error'])}")
-    if mono_state.get("jars"):
-        lines.append("\nУсі твої Банки (для MONO_JAR_TITLE / MONO_JAR_ID):")
-        for j in mono_state["jars"]:
-            lines.append(f"• «{esc(j.get('title'))}» — <code>{esc(j.get('id'))}</code>")
+        friend_add_requests.pop(partner_id, None)
+        await message.answer("❌ Не вдалося надіслати запит.")
+
+
+@dp.callback_query(F.data == "friend_accept")
+async def friend_accept(call: types.CallbackQuery):
+    acceptor_id = call.from_user.id
+    requester_id = friend_add_requests.pop(acceptor_id, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+
+    if requester_id is None:
+        await call.answer("Запит уже неактуальний.", show_alert=True)
+        return
+
+    u = init_user(acceptor_id)
+    p = init_user(requester_id)
+    u.setdefault("friends", set()).add(requester_id)
+    p.setdefault("friends", set()).add(acceptor_id)
+
+    await call.message.answer(
+        f"🤝 Тепер ви з <b>{esc(p['nickname'])}</b> у друзях! Знайдеш їх у вкладці «{BTN_FRIENDS}»."
+    )
+    await safe_send(requester_id, f"🤝 <b>{esc(u['nickname'])}</b> прийняв твій запит у друзі!")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "friend_decline")
+async def friend_decline(call: types.CallbackQuery):
+    acceptor_id = call.from_user.id
+    requester_id = friend_add_requests.pop(acceptor_id, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+
+    if requester_id is not None:
+        await safe_send(requester_id, "❌ Запит у друзі відхилено.")
+    await call.answer("Відхилено.")
+
+
+@dp.message(F.text == BTN_FRIENDS)
+@dp.message(Command("friends"))
+async def friends_list(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    kb = get_friends_keyboard(u)
+    if kb is None:
+        await message.answer(
+            "👫 У тебе поки немає друзів.\n"
+            "Додай когось під час чату кнопкою «🤝 Додати в друзі» — за взаємною згодою."
+        )
+        return
+    await message.answer(
+        "👫 <b>Твої друзі</b>\n\n"
+        "Натисни «✍️» біля імені, щоб написати другу, або «❌», щоб прибрати з друзів.\n\n"
+        "💡 Переписка з друзями працює завжди — навіть коли ти в анонімному чаті чи шукаєш нового "
+        "співрозмовника. Щоб відповісти другу, просто зроби свайп (Reply) на його повідомлення.",
+        reply_markup=kb,
+    )
+
+
+def _remember_friend_msg(recipient_id: int, message_id: int, sender_id: int):
+    if len(friend_msg_map) >= FRIEND_MSG_MAP_LIMIT:
+        # прибираємо найстаріший запис (dict зберігає порядок додавання)
+        friend_msg_map.pop(next(iter(friend_msg_map)), None)
+    friend_msg_map[(recipient_id, message_id)] = sender_id
+
+
+async def deliver_friend_message(sender_id: int, target_id: int, message: types.Message) -> str | None:
+    """Надсилає повідомлення другу. Повертає текст помилки або None, якщо все ок."""
+    u = init_user(sender_id)
+    p = users_db.get(target_id)
+    if (
+        p is None
+        or target_id not in (u.get("friends") or set())
+        or sender_id not in (p.get("friends") or set())
+    ):
+        return "Ця людина більше не у твоїх друзях."
+    if sender_id in banned_users or target_id in banned_users:
+        return "Недоступно."
+    if is_blacklisted(u, sender_id, p, target_id):
+        return "Недоступно."
+
+    text_to_check = message.text or message.caption
+    if text_to_check and LINK_REGEX.search(text_to_check):
+        return "🚫 Посилання та контакти заборонені — спілкуйтесь у боті."
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="↩️ Відповісти", callback_data=f"fmsg_{sender_id}")]]
+    )
+    header = f"💌 <b>{esc(u['nickname'])}</b> (друг):"
+    protect = should_protect(u)
+    try:
+        if message.text:
+            sent = await bot.send_message(
+                target_id, f"{header}\n{esc(message.text)}", reply_markup=kb, protect_content=protect
+            )
+            _remember_friend_msg(target_id, sent.message_id, sender_id)
+        else:
+            head = await bot.send_message(target_id, header)
+            _remember_friend_msg(target_id, head.message_id, sender_id)
+            copied = await message.copy_to(chat_id=target_id, reply_markup=kb, protect_content=protect)
+            _remember_friend_msg(target_id, copied.message_id, sender_id)
+    except TelegramAPIError:
+        return "Не вдалося доставити — друг зараз недоступний."
+    return None
+
+
+@dp.callback_query(F.data.startswith("fmsg_"))
+async def friend_write_start(call: types.CallbackQuery, state: FSMContext):
+    try:
+        target_id = int(call.data[len("fmsg_"):])
+    except ValueError:
+        await call.answer()
+        return
+
+    u = init_user(call.from_user.id)
+    if target_id not in (u.get("friends") or set()):
+        await call.answer("Ця людина більше не у твоїх друзях.", show_alert=True)
+        return
+
+    f = users_db.get(target_id)
+    name = f["nickname"] if f else str(target_id)
+    await state.set_state(FriendStates.write)
+    await state.update_data(friend_target=target_id)
+    await call.message.answer(
+        f"✍️ Напиши повідомлення для <b>{esc(name)}</b> (або /cancel).\n"
+        "Анонімний чат при цьому не переривається."
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("friend_remove_"))
+async def friend_remove(call: types.CallbackQuery):
+    target_id = int(call.data[len("friend_remove_"):])
+    u = init_user(call.from_user.id)
+    u.get("friends", set()).discard(target_id)
+    p = users_db.get(target_id)
+    if p:
+        p.get("friends", set()).discard(call.from_user.id)
+
+    kb = get_friends_keyboard(u)
+    if kb is None:
+        try:
+            await call.message.edit_text("👫 У тебе більше немає друзів у списку.")
+        except TelegramAPIError:
+            await call.message.answer("👫 У тебе більше немає друзів у списку.")
+    else:
+        try:
+            await call.message.edit_reply_markup(reply_markup=kb)
+        except TelegramAPIError:
+            pass
+    await call.answer("Прибрано з друзів.")
+
+
+# ---------------------------------------------------------------------------
+# Лідерборд найщедріших дарувальників
+# ---------------------------------------------------------------------------
+async def show_top_gifters(message: types.Message):
+    top = sorted(
+        users_db.items(), key=lambda kv: kv[1].get("gifts_sent_count", 0), reverse=True
+    )[:10]
+    top = [(uid, u) for uid, u in top if u.get("gifts_sent_count", 0) > 0]
+
+    if not top:
+        await message.answer("Поки що ніхто не дарував подарунків. Будь першим! 🎁")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 <b>Топ дарувальників подарунків</b>\n"]
+    for i, (uid, u) in enumerate(top, start=1):
+        rank = medals[i - 1] if i <= 3 else f"{i}."
+        lines.append(f"{rank} {esc(u['nickname'])} — {u.get('gifts_sent_count', 0)} 🎁")
     await message.answer("\n".join(lines))
 
 
-# ---------------------------------------------------------------------------
-# Рейтинг і інтереси профілю: кого кому підбирати першим
-# ---------------------------------------------------------------------------
-MAX_PROFILE_INTERESTS = 3
-MATCH_SCORE_MAX = 3  # 2 — однаковий «рівень» рейтингу, +1 — є спільний інтерес
-
-
-def match_score(u: dict, p: dict, mode: str) -> int:
-    """Чим більше балів, тим краща пара. Люди з низьким рейтингом спершу потрапляють одне до одного."""
-    score = 2 if is_low_rated(u) == is_low_rated(p) else 0
-    if not mode.startswith("int:") and (u.get("interests") or set()) & (p.get("interests") or set()):
-        score += 1
-    return score
-
-
-def rating_line(u: dict) -> str:
-    up, down = u.get("rating_up", 0), u.get("rating_down", 0)
-    if not up + down:
-        return "ще немає оцінок"
-    return f"👍 {up} · 👎 {down} ({rating_percent(u)}%)"
-
-
-def interests_line(u: dict) -> str:
-    keys = [k for k in INTEREST_LABELS if k in (u.get("interests") or set())]
-    return ", ".join(INTEREST_LABELS[k] for k in keys) if keys else "не обрано"
-
-
-async def send_interest_notes(user_id: int, u: dict, partner_id: int, p: dict):
-    common = [k for k in INTEREST_LABELS if k in (u.get("interests") or set()) & (p.get("interests") or set())]
-    if common:
-        note = "🧩 Спільні інтереси: <b>" + ", ".join(INTEREST_LABELS[k] for k in common) + "</b> — є з чого почати 😉"
-        await safe_send(user_id, note)
-        await safe_send(partner_id, note)
-        return
-    for me, other in ((user_id, p), (partner_id, u)):
-        if other.get("interests"):
-            await safe_send(me, f"🧩 Інтереси співрозмовника: {interests_line(other)}")
-
-
-async def maybe_warn_low_rating(user_id: int, u: dict):
-    if is_low_rated(u) and not u.get("low_warned"):
-        u["low_warned"] = True
-        await safe_send(
-            user_id,
-            "⚠️ Співрозмовники часто ставлять тобі 👎.\n"
-            "Через це бот рідше підбирає тебе іншим. Будь привітнішим — "
-            "і рейтинг підросте, а з ним і кількість цікавих чатів 🙂",
-        )
-    elif not is_low_rated(u) and u.get("low_warned"):
-        u["low_warned"] = False
-
-
-def profile_interests_keyboard(u: dict, tab: str = "main"):
-    chosen = u.get("interests") or set()
-    topics = HOBBY_TOPICS if tab == "hobby" else ROOM_TOPICS
-    buttons = [
-        InlineKeyboardButton(text=("✅ " if k in chosen else "") + label, callback_data=f"pi_t_{tab}_{k}")
-        for k, label in topics.items()
-    ]
-    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-    tabs = [
-        InlineKeyboardButton(text=("• " if tab != "hobby" else "") + "🧩 Інтереси", callback_data="pi_tab_main"),
-        InlineKeyboardButton(text=("• " if tab == "hobby" else "") + "🎯 Захоплення", callback_data="pi_tab_hobby"),
-    ]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[tabs] + rows + [[InlineKeyboardButton(text="✅ Готово", callback_data="pi_done")]]
-    )
-
-
-def profile_interests_text(u: dict) -> str:
-    return (
-        f"🧩 <b>Мої інтереси</b> (до {MAX_PROFILE_INTERESTS})\n\n"
-        f"Обрано: {interests_line(u)}\n\n"
-        "Бот спершу шукатиме співрозмовників зі спільними інтересами, "
-        "а після з'єднання покаже, про що вам цікаво поговорити."
-    )
-
-
-@dp.message(Command("myinterests"))
-async def my_interests_cmd(message: types.Message, state: FSMContext):
+@dp.message(F.text == BTN_TOP)
+@dp.message(Command("top"))
+async def top_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    u = init_user(message.from_user.id)
-    await message.answer(profile_interests_text(u), reply_markup=profile_interests_keyboard(u))
+    await show_top_gifters(message)
 
 
-@dp.callback_query(F.data == "pi_open")
-async def my_interests_open(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    await call.message.answer(profile_interests_text(u), reply_markup=profile_interests_keyboard(u))
-    await call.answer()
-
-
-@dp.callback_query(F.data.startswith("pi_tab_"))
-async def my_interests_tab(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    tab = "hobby" if call.data == "pi_tab_hobby" else "main"
-    try:
-        await call.message.edit_reply_markup(reply_markup=profile_interests_keyboard(u, tab))
-    except TelegramAPIError:
-        pass
-    await call.answer()
-
-
-@dp.callback_query(F.data.startswith("pi_t_"))
-async def my_interests_toggle(call: types.CallbackQuery):
-    tab, _, key = call.data[len("pi_t_"):].partition("_")
-    if key not in INTEREST_LABELS:
-        await call.answer("Невідома тема", show_alert=True)
+@dp.message(F.text == BTN_REPORT)
+async def report_handler(message: types.Message):
+    # Раніше ця кнопка не мала обробника, і текст "🚨 Поскаржитися" пересилався співрозмовнику.
+    global report_counter
+    user_id = message.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await message.answer("Скарга можлива лише під час чату.", reply_markup=get_main_keyboard())
         return
-    u = init_user(call.from_user.id)
-    chosen = u.setdefault("interests", set())
-    if key in chosen:
-        chosen.discard(key)
-    elif len(chosen) >= MAX_PROFILE_INTERESTS:
-        await call.answer(f"Можна обрати до {MAX_PROFILE_INTERESTS}. Спершу зніми якийсь ✅", show_alert=True)
-        return
-    else:
-        chosen.add(key)
-    request_save()
-    try:
-        await call.message.edit_text(profile_interests_text(u), reply_markup=profile_interests_keyboard(u, tab))
-    except TelegramAPIError:
-        pass
-    await call.answer()
 
+    report_counter += 1
+    reports.append(
+        {
+            "id": report_counter,
+            "from": user_id,
+            "on": partner_id,
+            "time": time.strftime("%d.%m.%Y %H:%M"),
+            "status": "нова",
+        }
+    )
 
-@dp.callback_query(F.data == "pi_done")
-async def my_interests_done(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    try:
-        await call.message.edit_text(f"✅ Твої інтереси: {interests_line(u)}\n\nЗмінити: /myinterests")
-    except TelegramAPIError:
-        pass
-    await call.answer("Збережено")
+    p = init_user(partner_id)
+    p["reports_received"] = p.get("reports_received", 0) + 1
+    auto_banned = False
+    if p["reports_received"] >= AUTO_BAN_REPORTS and partner_id not in banned_users:
+        banned_users.add(partner_id)
+        register_auto_ban(p)
+        request_save()
+        auto_banned = True
+        if partner_id in queue:
+            queue.remove(partner_id)
+        remove_from_room(partner_id)
+        ban_text, ban_kb = banned_notice(partner_id)
+        await safe_send(partner_id, ban_text, reply_markup=ban_kb)
 
-
-# ---------------------------------------------------------------------------
-# Підказка про фільтр за статтю: якщо безкоштовний юзер довго чекає у звичайному пошуку
-# ---------------------------------------------------------------------------
-FILTER_NUDGE_DELAY = int(os.getenv("FILTER_NUDGE_DELAY", "40"))  # секунд очікування
-FILTER_NUDGE_COOLDOWN = 24 * 3600  # не частіше разу на добу
-filter_nudge_last: dict[int, float] = {}
-
-
-def schedule_filter_nudge(user_id: int):
-    u = init_user(user_id)
-    if filter_active(u, "gender_filter"):
-        return
-    if time.time() - filter_nudge_last.get(user_id, 0) < FILTER_NUDGE_COOLDOWN:
-        return
-    asyncio.create_task(filter_nudge_after_wait(user_id))
-
-
-async def filter_nudge_after_wait(user_id: int):
-    try:
-        await asyncio.sleep(FILTER_NUDGE_DELAY)
-        u = init_user(user_id)
-        if user_id not in queue or search_mode.get(user_id, "normal") != "normal":
-            return  # уже знайшов співрозмовника або вийшов з пошуку
-        if filter_active(u, "gender_filter"):
-            return
-        if time.time() - filter_nudge_last.get(user_id, 0) < FILTER_NUDGE_COOLDOWN:
-            return
-        filter_nudge_last[user_id] = time.time()
-        if u.get("gender") == "Хлопець":
-            ask = "Хочеш спілкуватися лише з дівчатами? 👧"
-        elif u.get("gender") == "Дівчина":
-            ask = "Хочеш спілкуватися лише з хлопцями? 👦"
-        else:
-            ask = "Хочеш обирати стать співрозмовника? 👫"
-        price = SHOP["gender_filter"][1]
-        await safe_send(
-            user_id,
-            f"{ask}\n\n🎯 <b>Фільтр за статтю</b> — і бот з'єднуватиме лише з тими, кого ти обереш.\n"
-            f"Він входить у 💎 Premium або купується окремо — {price} грн на тиждень.\n\n"
-            "<i>Пошук триває, можеш просто чекати далі ⏳</i>",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="💎 Premium", callback_data="prem_open")],
-                    [InlineKeyboardButton(text=f"🎯 Фільтр на тиждень — {price} грн", callback_data="buy_gender_filter")],
-                ]
-            ),
+    if ADMIN_ID:
+        extra = (
+            f"\n\n⛔ Автобан: досягнуто {AUTO_BAN_REPORTS} скарг, користувача заблоковано автоматично."
+            if auto_banned
+            else ""
         )
-    except Exception as e:  # noqa: BLE001 — підказка ніколи не має ламати пошук
-        logging.warning("Підказка про фільтр не надіслана: %s", e)
+        await safe_send(
+            ADMIN_ID,
+            f"🚨 Нова скарга #{report_counter}\nВід: {admin_label(user_id)}\nНа: {admin_label(partner_id)}{extra}\n\n"
+            "Переглянути список: /admin",
+        )
+    end_chat(user_id)
+    await message.answer(
+        "🚨 Скаргу надіслано, чат завершено. Дякуємо!", reply_markup=get_main_keyboard()
+    )
+    await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
 
 
-@dp.callback_query(F.data == "prem_open")
-async def prem_open(call: types.CallbackQuery):
+# ---------------------------------------------------------------------------
+# Подарунки співрозмовнику (тільки під час активного чату)
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_GIFT)
+async def gift_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    if user_id not in active_chats:
+        await message.answer("Дарувати можна лише співрозмовнику під час чату.", reply_markup=get_main_keyboard())
+        return
+    await message.answer("🎁 Що подаруєш співрозмовнику?", reply_markup=get_gift_menu_keyboard())
+
+
+@dp.callback_query(F.data == "gift_money")
+async def gift_money_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id not in active_chats:
+        await call.answer("Чат вже завершено", show_alert=True)
+        return
+    await call.message.answer("Введіть суму в грн, яку хочете подарувати (або /cancel):")
+    await state.set_state(GiftStates.amount)
+    await call.answer()
+
+
+@dp.message(GiftStates.amount, F.text)
+async def gift_money_finish(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await message.answer("Чат вже завершено.", reply_markup=get_main_keyboard())
+        return
+
+    try:
+        amount = float(message.text.strip().replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введіть додатне число, наприклад 20 або 15.5.")
+        return
+
+    u = init_user(user_id)
+    if u["balance"] < amount:
+        await message.answer(f"❌ Недостатньо коштів. Ваш баланс: {u['balance']:.2f} грн.")
+        return
+
+    u["balance"] -= amount
+    p = init_user(partner_id)
+    p["balance"] += amount
+
+    await message.answer(
+        f"🎁 Подаровано {amount:.2f} грн співрозмовнику!", reply_markup=get_chat_keyboard()
+    )
+    await safe_send(partner_id, f"🎁 Співрозмовник подарував вам {amount:.2f} грн!")
+
+
+@dp.callback_query(F.data == "gift_catalog")
+async def gift_catalog_in_chat(call: types.CallbackQuery):
+    if call.from_user.id not in active_chats:
+        await call.answer("Чат вже завершено", show_alert=True)
+        return
+    await call.message.answer(
+        "🛒 <b>Магазин подарунків</b>\n\nКупи подарунок — одразу запропоную подарувати його співрозмовнику:",
+        reply_markup=get_gift_catalog_keyboard(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "gift_inventory")
+async def gift_inventory_menu(call: types.CallbackQuery):
+    if call.from_user.id not in active_chats:
+        await call.answer("Чат вже завершено", show_alert=True)
+        return
     u = init_user(call.from_user.id)
-    text, kb = premium_page()
-    text += f"{premium_status_text(u)}\n💰 Баланс: {u['balance']:.2f} грн\n\nОбери тариф:"
+    kb = get_gift_inventory_keyboard(u)
+    if not kb.inline_keyboard:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🛒 Відкрити магазин подарунків", callback_data="gift_catalog")]
+            ]
+        )
+        await call.message.answer(
+            "У тебе ще немає подарунків в інвентарі.", reply_markup=kb
+        )
+        await call.answer()
+        return
+    await call.message.answer("🎁 Що подаруєш співрозмовнику зі свого інвентарю?", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("sendgift_"))
+async def send_gift_item(call: types.CallbackQuery):
+    global gift_revenue_total
+    user_id = call.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await call.answer("Чат вже завершено", show_alert=True)
+        return
+
+    key = call.data[len("sendgift_"):]
+    item = GIFT_CATALOG.get(key)
+    if item is None:
+        await call.answer("Невідомий подарунок", show_alert=True)
+        return
+
+    u = init_user(user_id)
+    have = u.get("gifts", {}).get(key, 0)
+    if have <= 0:
+        await call.answer("У тебе немає такого подарунка в інвентарі", show_alert=True)
+        return
+
+    title, price = item
+    u["gifts"][key] = have - 1
+    u["gifts_sent_count"] = u.get("gifts_sent_count", 0) + 1
+
+    recipient_amount = round(price * GIFT_RECIPIENT_SHARE, 2)
+    admin_amount = round(price - recipient_amount, 2)
+    gift_revenue_total += admin_amount
+
+    p = init_user(partner_id)
+    p["balance"] += recipient_amount
+
+    await call.message.answer(f"🎁 Подаровано: <b>{esc(title)}</b>!")
+    await safe_send(
+        partner_id,
+        f"🎁 Співрозмовник подарував вам: <b>{esc(title)}</b>!\n"
+        f"На баланс нараховано {recipient_amount:.2f} грн.",
+    )
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Адмін-панель (прихована, тільки для ADMIN_ID + пароль)
+# ---------------------------------------------------------------------------
+@dp.message(Command("admin"))
+async def admin_entry(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if not ADMIN_ID or user_id != ADMIN_ID:
+        return  # для всіх інших ця команда ніби не існує
+
+    if not ADMIN_PASSWORD:
+        await message.answer("⚠️ Не задано ADMIN_PASSWORD у змінних середовища.")
+        return
+
+    if user_id in authorized_admins:
+        await message.answer("🔐 <b>Адмін-панель</b>", reply_markup=get_admin_keyboard())
+        return
+
+    await message.answer("🔐 Введіть пароль для доступу до адмін-панелі:")
+    await state.set_state(AdminStates.password)
+
+
+@dp.message(AdminStates.password, F.text)
+async def admin_password(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await state.clear()
+    if message.text.strip() != ADMIN_PASSWORD:
+        await message.answer("❌ Невірний пароль.")
+        return
+    authorized_admins.add(user_id)
+    await message.answer("✅ Доступ надано.\n\n🔐 <b>Адмін-панель</b>", reply_markup=get_admin_keyboard())
+
+
+def admin_only(func):
+    # functools.wraps — щоб aiogram бачив справжні параметри функції (call, state тощо)
+    # і не передавав у неї зайвих аргументів.
+    @functools.wraps(func)
+    async def wrapper(call: types.CallbackQuery, *args, **kwargs):
+        if call.from_user.id != ADMIN_ID or call.from_user.id not in authorized_admins:
+            await call.answer("Доступ заборонено", show_alert=True)
+            return
+        return await func(call, *args, **kwargs)
+
+    return wrapper
+
+
+@dp.callback_query(F.data == "adm_stats")
+@admin_only
+async def adm_stats(call: types.CallbackQuery):
+    total_users = len(users_db)
+    premium_count = sum(1 for u in users_db.values() if is_premium(u))
+    total_referrals = sum(u.get("referral_count", 0) for u in users_db.values())
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+        f"• Користувачів: {total_users}\n"
+        f"• У черзі пошуку: {len(queue)}\n"
+        f"• Активних чатів: {len(active_chats) // 2}\n"
+        f"• Premium: {premium_count}\n"
+        f"• Забанено: {len(banned_users)}\n"
+        f"• Скарг усього: {len(reports)}\n"
+        f"• Дохід з подарунків: {gift_revenue_total:.2f} грн\n"
+        f"• Дохід з рулетки: {lottery_revenue_total:.2f} грн\n"
+        f"• Запрошень за реферальною програмою: {total_referrals}\n"
+        f"• Автобан після {AUTO_BAN_REPORTS} скарг (users у режимі спостереження: "
+        f"{sum(1 for u in users_db.values() if 0 < u.get('reports_received', 0) < AUTO_BAN_REPORTS)})\n"
+        f"• Активних кімнат: {len(rooms)} (учасників: {sum(len(r['members']) for r in rooms.values())})\n"
+    )
+    await call.message.answer(text)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_reports_"))
+@admin_only
+async def adm_reports(call: types.CallbackQuery):
+    page = int(call.data.split("_")[-1])
+    per_page = 5
+    pending = [r for r in reports if r["status"] == "нова"]
+
+    if not pending:
+        await call.message.answer("🚨 Нових скарг немає.")
+        await call.answer()
+        return
+
+    chunk = pending[page * per_page : (page + 1) * per_page]
+    if not chunk:
+        await call.answer("Більше немає скарг", show_alert=True)
+        return
+
+    lines = ["🚨 <b>Скарги (нові):</b>\n"]
+    buttons = []
+    for r in chunk:
+        lines.append(f"#{r['id']} — {r['time']}\nВід {admin_label(r['from'])}\nНа {admin_label(r['on'])}\n")
+        buttons.append(
+            [
+                InlineKeyboardButton(text=f"⛔ Бан #{r['id']} (на кого скарга)", callback_data=f"adm_banrep_{r['id']}"),
+                InlineKeyboardButton(text=f"✅ Закрити #{r['id']}", callback_data=f"adm_closerep_{r['id']}"),
+            ]
+        )
+    if len(pending) > (page + 1) * per_page:
+        buttons.append([InlineKeyboardButton(text="➡️ Далі", callback_data=f"adm_reports_{page + 1}")])
+
+    await call.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_banrep_"))
+@admin_only
+async def adm_ban_from_report(call: types.CallbackQuery):
+    report_id = int(call.data.split("_")[-1])
+    rep = next((r for r in reports if r["id"] == report_id), None)
+    if rep is None:
+        await call.answer("Скаргу не знайдено", show_alert=True)
+        return
+    banned_users.add(rep["on"])
+    init_user(rep["on"])["ban_type"] = "admin"
+    rep["status"] = "оброблена"
+    end_chat(rep["on"])
+    remove_from_room(rep["on"])
+    if rep["on"] in queue:
+        queue.remove(rep["on"])
+    await safe_send(rep["on"], "⛔ Вас заблоковано адміністратором за скаргою.")
+    await call.message.answer(f"⛔ Користувача {admin_label(rep['on'])} забанено.")
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_closerep_"))
+@admin_only
+async def adm_close_report(call: types.CallbackQuery):
+    report_id = int(call.data.split("_")[-1])
+    rep = next((r for r in reports if r["id"] == report_id), None)
+    if rep is None:
+        await call.answer("Скаргу не знайдено", show_alert=True)
+        return
+    rep["status"] = "закрита"
+    await call.message.answer(f"✅ Скаргу #{report_id} закрито без дій.")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_ban")
+@admin_only
+async def adm_ban_start(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Введіть ID користувача, якого треба забанити (наш ID_1001 або Telegram ID):")
+    await state.set_state(AdminStates.ban_id)
+    await call.answer()
+
+
+@dp.message(AdminStates.ban_id, F.text)
+async def adm_ban_finish(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    target = resolve_user_id(message.text)
+    if target is None:
+        await message.answer("Не знайшов такого користувача. Надішли Telegram ID або наш ID (напр. ID_1001).")
+        return
+    banned_users.add(target)
+    init_user(target)["ban_type"] = "admin"
+    end_chat(target)
+    remove_from_room(target)
+    if target in queue:
+        queue.remove(target)
+    await message.answer(f"⛔ Користувача {admin_label(target)} забанено.")
+    await safe_send(target, "⛔ Вас заблоковано адміністратором.")
+
+
+@dp.callback_query(F.data == "adm_unban")
+@admin_only
+async def adm_unban_start(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Введіть ID користувача, якого треба розбанити (наш ID_1001 або Telegram ID):")
+    await state.set_state(AdminStates.unban_id)
+    await call.answer()
+
+
+@dp.message(AdminStates.unban_id, F.text)
+async def adm_unban_finish(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    target = resolve_user_id(message.text)
+    if target is None:
+        await message.answer("Не знайшов такого користувача. Надішли Telegram ID або наш ID (напр. ID_1001).")
+        return
+    banned_users.discard(target)
+    if target in users_db:
+        users_db[target]["ban_type"] = None
+        users_db[target]["reports_received"] = 0
+    await message.answer(f"✅ Користувача {admin_label(target)} розбанено.")
+    await safe_send(target, "✅ Вас розблоковано адміністратором.")
+
+
+@dp.callback_query(F.data == "adm_banlist")
+@admin_only
+async def adm_banlist(call: types.CallbackQuery):
+    if not banned_users:
+        await call.message.answer("Список забанених порожній.")
+    else:
+        ids = "\n".join(f"• <code>{uid}</code>" for uid in sorted(banned_users))
+        await call.message.answer(f"⛔ <b>Забанені користувачі:</b>\n{ids}")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_broadcast")
+@admin_only
+async def adm_broadcast_start(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Введіть текст розсилки для ВСІХ користувачів (або /cancel):")
+    await state.set_state(AdminStates.broadcast)
+    await call.answer()
+
+
+@dp.message(AdminStates.broadcast, F.text)
+async def adm_broadcast_finish(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    text = message.text
+    sent, failed = 0, 0
+    for uid in list(users_db.keys()):
+        ok = await safe_send(uid, f"📢 {esc(text)}")
+        sent += ok
+        failed += not ok
+    await message.answer(f"✅ Розіслано: {sent}. Не вдалося: {failed}.")
+
+
+@dp.callback_query(F.data.startswith("adm_reply_"))
+@admin_only
+async def adm_reply_start(call: types.CallbackQuery, state: FSMContext):
+    target_id = int(call.data[len("adm_reply_"):])
+    await state.update_data(support_target=target_id)
+    await state.set_state(AdminStates.support_reply)
+    await call.message.answer(
+        f"✍️ Введіть відповідь для користувача <code>{target_id}</code> (або /cancel):"
+    )
+    await call.answer()
+
+
+@dp.message(AdminStates.support_reply, F.text)
+async def adm_reply_finish(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    target_id = data.get("support_target")
+    await state.clear()
+    if not target_id:
+        await message.answer("Помилка: не знайдено отримувача.")
+        return
+    ok = await safe_send(target_id, f"📩 <b>Відповідь від підтримки:</b>\n{esc(message.text)}")
+    if ok:
+        await message.answer("✅ Відповідь надіслано користувачу.")
+    else:
+        await message.answer("❌ Не вдалося надіслати — користувач недоступний.")
+
+
+# ---------------------------------------------------------------------------
+# Реклама в черзі пошуку (керується з адмінки; Premium — без реклами)
+# ---------------------------------------------------------------------------
+ADS_COOLDOWN = int(os.getenv("ADS_COOLDOWN", "300"))  # не частіше ніж раз на N секунд для людини
+AD_MAX_LEN = 300
+ad_last_shown: dict[int, float] = {}
+
+
+def pick_ad_for(user_id: int, now: float | None = None) -> dict | None:
+    """Яку рекламу показати людині (або None): без Premium, з паузою між показами."""
+    now = time.time() if now is None else now
+    u = init_user(user_id)
+    if is_premium(u):
+        return None
+    active = [a for a in ads if a.get("active")]
+    if not active:
+        return None
+    if now - ad_last_shown.get(user_id, 0) < ADS_COOLDOWN:
+        return None
+    return random.choice(active)
+
+
+def _ad_keyboard(ad: dict):
+    if not ad.get("url"):
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👉 Перейти", url=ad["url"])]])
+
+
+def _ad_text(ad: dict) -> str:
+    return f"📣 <i>Реклама</i>\n\n{esc(ad['text'])}"
+
+
+async def maybe_show_ad(user_id: int):
+    try:
+        ad = pick_ad_for(user_id)
+        if ad is None:
+            return
+        if await safe_send(user_id, _ad_text(ad), reply_markup=_ad_keyboard(ad)):
+            ad["shows"] = ad.get("shows", 0) + 1
+            ad_last_shown[user_id] = time.time()
+    except Exception as e:  # noqa: BLE001 — реклама ніколи не має ламати пошук
+        logging.warning("Не вдалося показати рекламу: %s", e)
+
+
+def normalize_ad_url(raw: str) -> str | None:
+    raw = (raw or "").strip()
+    if raw.startswith("@") and len(raw) > 1:
+        return f"https://t.me/{raw[1:]}"
+    if raw.startswith("t.me/"):
+        return f"https://{raw}"
+    if raw.startswith(("https://", "http://")) and " " not in raw:
+        return raw
+    return None
+
+
+def ads_admin_view():
+    lines = ["📣 <b>Реклама в черзі пошуку</b>", "Показується тим, хто чекає співрозмовника (крім Premium)."]
+    rows = []
+    if not ads:
+        lines.append("\nПоки немає жодного оголошення.")
+    for ad in ads:
+        status = "✅ активна" if ad.get("active") else "⏸ на паузі"
+        link = f"\n🔗 {esc(ad['url'])}" if ad.get("url") else ""
+        lines.append(
+            f"\n<b>#{ad['id']}</b> — {status}, показів: {ad.get('shows', 0)}\n{esc(ad['text'][:150])}{link}"
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{'⏸ Пауза' if ad.get('active') else '▶️ Увімкнути'} #{ad['id']}",
+                    callback_data=f"adm_adtoggle_{ad['id']}",
+                ),
+                InlineKeyboardButton(text=f"🗑 Видалити #{ad['id']}", callback_data=f"adm_addel_{ad['id']}"),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="➕ Додати оголошення", callback_data="adm_adnew")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "adm_ads")
+@admin_only
+async def adm_ads(call: types.CallbackQuery):
+    text, kb = ads_admin_view()
     await call.message.answer(text, reply_markup=kb)
     await call.answer()
 
 
-# ---------------------------------------------------------------------------
-# Пошук за інтересами 1-на-1: з'єднуємо лише людей з однаковою темою
-# ---------------------------------------------------------------------------
-def interests_keyboard(tab: str = "main"):
-    waiting = {}
-    for uid in queue:
-        mode = search_mode.get(uid, "")
-        if mode.startswith("int:"):
-            waiting[mode[4:]] = waiting.get(mode[4:], 0) + 1
-    topics = HOBBY_TOPICS if tab == "hobby" else ROOM_TOPICS
-    buttons = []
-    for key, label in topics.items():
-        n = waiting.get(key, 0)
-        buttons.append(
-            InlineKeyboardButton(text=f"{label} · чекає {n}" if n else label, callback_data=f"intr_{key}")
-        )
-    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-    hobby_wait = sum(waiting.get(k, 0) for k in HOBBY_TOPICS)
-    main_wait = sum(waiting.get(k, 0) for k in ROOM_TOPICS)
-    tabs = [
-        InlineKeyboardButton(
-            text=("• " if tab != "hobby" else "") + "🧩 Інтереси" + (f" ({main_wait})" if main_wait else ""),
-            callback_data="intrtab_main",
-        ),
-        InlineKeyboardButton(
-            text=("• " if tab == "hobby" else "") + "🎯 Захоплення" + (f" ({hobby_wait})" if hobby_wait else ""),
-            callback_data="intrtab_hobby",
-        ),
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=[tabs] + rows)
-
-
-@dp.callback_query(F.data.startswith("intrtab_"))
-async def interests_tab(call: types.CallbackQuery):
-    tab = "hobby" if call.data == "intrtab_hobby" else "main"
-    try:
-        await call.message.edit_reply_markup(reply_markup=interests_keyboard(tab))
-    except TelegramAPIError:
-        pass
-    await call.answer("🎯 Захоплення" if tab == "hobby" else "🧩 Інтереси")
-
-
-@dp.message(F.text == BTN_INTERESTS)
-@dp.message(Command("interests"))
-async def interests_menu(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "🧩 <b>Пошук за інтересами</b>\n\n"
-        "Обери тему — і ми знайдемо співрозмовника, якому цікаве те саме. "
-        "Поруч із темою видно, скільки людей уже чекає.\n\n"
-        "Перемикай вкладки вгорі: 🧩 Інтереси / 🎯 Захоплення.",
-        reply_markup=interests_keyboard(),
-    )
-
-
-@dp.callback_query(F.data.startswith("intr_"))
-async def interests_pick(call: types.CallbackQuery, state: FSMContext):
-    key = call.data[len("intr_"):]
-    if key not in INTEREST_LABELS:
-        await call.answer("Невідома тема", show_alert=True)
-        return
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await call.answer(INTEREST_LABELS[key])
-    await run_search(call.message, state, f"int:{key}", user_id=call.from_user.id)
-
-
-# ---------------------------------------------------------------------------
-# Онбординг новачків: стать → вік → країна за кілька натискань
-# (обробники стоять після кнопок меню — натискання меню має пріоритет)
-# ---------------------------------------------------------------------------
-class OnboardStates(StatesGroup):
-    age = State()
-    country = State()
-
-
-ONBOARD_COUNTRIES = [
-    ("ua", "🇺🇦 Україна", "Україна"),
-    ("pl", "🇵🇱 Польща", "Польща"),
-    ("de", "🇩🇪 Німеччина", "Німеччина"),
-    ("cz", "🇨🇿 Чехія", "Чехія"),
-]
-ONBOARD_AGE_REGEX = re.compile(r"^\s*(\d{1,3})\s*$")
-
-
-def profile_complete(u: dict) -> bool:
-    return all(u.get(k) not in (None, "", "Не вказано") for k in ("gender", "age", "country"))
-
-
-def _skip_row():
-    return [InlineKeyboardButton(text="⏭ Пропустити", callback_data="ob_skip")]
-
-
-async def start_onboarding(chat_id: int, state: FSMContext):
-    await state.clear()
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="👨 Хлопець", callback_data="ob_g_m"),
-                InlineKeyboardButton(text="👩 Дівчина", callback_data="ob_g_f"),
-            ],
-            _skip_row(),
-        ]
-    )
-    await safe_send(
-        chat_id,
-        "👋 Налаштуймо профіль — це 3 кроки, ~10 секунд. Так ти знаходитимеш кращих співрозмовників.\n\n"
-        "<b>Крок 1/3.</b> Хто ти?",
-        reply_markup=kb,
-    )
-
-
-@dp.callback_query(F.data.in_({"ob_g_m", "ob_g_f"}))
-async def onboard_gender(call: types.CallbackQuery, state: FSMContext):
-    u = init_user(call.from_user.id)
-    u["gender"] = "Хлопець" if call.data == "ob_g_m" else "Дівчина"
-    request_save()
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await state.set_state(OnboardStates.age)
+@dp.callback_query(F.data == "adm_adnew")
+@admin_only
+async def adm_ad_new(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.ad_text)
     await call.message.answer(
-        f"✅ {u['gender']}\n\n<b>Крок 2/3.</b> Скільки тобі років? Напиши числом, наприклад <code>19</code>.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_skip_row()]),
+        f"✍️ Надішли текст реклами: 2–3 рядки, до {AD_MAX_LEN} символів (або /cancel)."
     )
     await call.answer()
 
 
-def _is_onboard_age_text(message: types.Message) -> bool:
-    return bool(message.text and ONBOARD_AGE_REGEX.match(message.text))
-
-
-@dp.message(OnboardStates.age, _is_onboard_age_text)
-async def onboard_age(message: types.Message, state: FSMContext):
-    age = int(ONBOARD_AGE_REGEX.match(message.text).group(1))
-    if not (10 <= age <= 99):
-        await message.answer("Вкажи вік числом від 10 до 99 (або натисни «Пропустити»).")
+@dp.message(AdminStates.ad_text, F.text)
+async def adm_ad_text(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
         return
-    u = init_user(message.from_user.id)
-    u["age"] = str(age)
-    prev_min = u.get("min_age_seen")
-    u["min_age_seen"] = age if prev_min is None else min(int(prev_min), age)
-    request_save()
-    await state.set_state(OnboardStates.country)
-    rows = [
-        [InlineKeyboardButton(text=ONBOARD_COUNTRIES[i][1], callback_data=f"ob_c_{ONBOARD_COUNTRIES[i][0]}"),
-         InlineKeyboardButton(text=ONBOARD_COUNTRIES[i + 1][1], callback_data=f"ob_c_{ONBOARD_COUNTRIES[i + 1][0]}")]
-        for i in range(0, len(ONBOARD_COUNTRIES) - 1, 2)
-    ]
-    rows.append([InlineKeyboardButton(text="🌍 Інша — напишу сам(а)", callback_data="ob_c_other")])
-    rows.append(_skip_row())
-    await message.answer(
-        f"✅ {age}\n\n<b>Крок 3/3.</b> Звідки ти?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-    )
-
-
-async def _finish_onboarding(chat_id: int, user_id: int, state: FSMContext):
-    await state.clear()
-    u = init_user(user_id)
-    request_save()
-    await safe_send(
-        chat_id,
-        f"🎉 Готово! Твій профіль: {short_info(u)}\n\n"
-        f"Тепер тисни «{BTN_SEARCH}» внизу — і знайомся! 🤫\n"
-        "Змінити дані можна будь-коли: /edit_profile",
-        reply_markup=get_main_keyboard(),
-    )
-    await safe_send(
-        chat_id,
-        "🧩 Хочеш, щоб бот підбирав співрозмовників зі спільними інтересами? Обери до 3 тем:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🧩 Обрати інтереси", callback_data="pi_open")]]
-        ),
-    )
-
-
-@dp.callback_query(F.data.startswith("ob_c_"))
-async def onboard_country(call: types.CallbackQuery, state: FSMContext):
-    key = call.data[len("ob_c_"):]
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    if key == "other":
-        await state.set_state(OnboardStates.country)
-        await call.message.answer(
-            "Напиши свою країну або місто:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[_skip_row()])
-        )
-        await call.answer()
-        return
-    country = next((name for k, _label, name in ONBOARD_COUNTRIES if k == key), None)
-    if country:
-        init_user(call.from_user.id)["country"] = country
-    await _finish_onboarding(call.message.chat.id, call.from_user.id, state)
-    await call.answer()
-
-
-@dp.message(OnboardStates.country, F.text)
-async def onboard_country_text(message: types.Message, state: FSMContext):
     text = message.text.strip()
-    if text.startswith("/"):
+    if len(text) > AD_MAX_LEN:
+        await message.answer(f"Задовго: {len(text)} символів, максимум {AD_MAX_LEN}. Скороти і надішли ще раз.")
         return
-    init_user(message.from_user.id)["country"] = text[:50]
-    await _finish_onboarding(message.chat.id, message.from_user.id, state)
-
-
-@dp.callback_query(F.data == "ob_skip")
-async def onboard_skip(call: types.CallbackQuery, state: FSMContext):
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await state.clear()
-    await call.message.answer(
-        "Добре! Заповнити профіль можна будь-коли: /edit_profile", reply_markup=get_main_keyboard()
+    await state.update_data(ad_text=text)
+    await state.set_state(AdminStates.ad_url)
+    await message.answer(
+        "🔗 Тепер надішли посилання для кнопки «👉 Перейти»:\n"
+        "• https://... або @username каналу/бота\n"
+        "• або <code>-</code>, якщо реклама без посилання."
     )
-    await call.answer()
 
 
-# ---------------------------------------------------------------------------
-# Пересилання повідомлень (завжди останнім!)
-# ---------------------------------------------------------------------------
-@dp.message()
-async def relay_messages(message: types.Message):
-    user_id = message.from_user.id
-
-    room_id = user_room.get(user_id)
-    if room_id is not None:
-        room = rooms.get(room_id)
-        if room is None:
-            user_room.pop(user_id, None)
-        else:
-            if not message.text:
-                await message.answer(
-                    "📷 У кімнатах поки підтримується лише текст — це для безпеки спілкування в групі."
-                )
-                return
-            if LINK_REGEX.search(message.text):
-                await message.answer(
-                    "🚫 Повідомлення з посиланнями або контактами заборонено."
-                )
-                return
-            u = init_user(user_id)
-            broadcast_text = f"<b>{esc(u['nickname'])}:</b> {esc(message.text)}"
-            for member_id in list(room["members"]):
-                if member_id == user_id:
-                    continue
-                ok = await safe_send(member_id, broadcast_text)
-                if not ok:
-                    room["members"].discard(member_id)
-                    user_room.pop(member_id, None)
+@dp.message(AdminStates.ad_url, F.text)
+async def adm_ad_url(message: types.Message, state: FSMContext):
+    global ad_counter
+    if message.from_user.id != ADMIN_ID:
+        return
+    raw = message.text.strip()
+    url = None
+    if raw != "-":
+        url = normalize_ad_url(raw)
+        if url is None:
+            await message.answer("Не схоже на посилання. Надішли https://..., @username або «-».")
             return
+    data = await state.get_data()
+    await state.clear()
+    ad_counter += 1
+    ad = {
+        "id": ad_counter,
+        "text": data.get("ad_text", ""),
+        "url": url,
+        "active": True,
+        "shows": 0,
+        "created": time.strftime("%d.%m.%Y"),
+    }
+    ads.append(ad)
+    request_save()
+    await message.answer("✅ Оголошення додано. Ось як його бачитимуть користувачі:")
+    ok = await safe_send(message.chat.id, _ad_text(ad), reply_markup=_ad_keyboard(ad))
+    if not ok:
+        ad["active"] = False
+        await message.answer("⚠️ Telegram не прийняв це оголошення (ймовірно, погане посилання) — поставив на паузу.")
+    text, kb = ads_admin_view()
+    await message.answer(text, reply_markup=kb)
 
-    partner_id = active_chats.get(user_id)
-    if partner_id is None:
-        await message.answer("Скористайтеся меню нижче:", reply_markup=get_main_keyboard())
-        return
 
-    text_to_check = message.text or message.caption
-    if text_to_check and LINK_REGEX.search(text_to_check):
-        await message.answer(
-            "🚫 Повідомлення з посиланнями або контактами заборонено — спілкуйтесь анонімно в боті."
-        )
-        return
-
+def _find_ad(call_data: str, prefix: str) -> dict | None:
     try:
-        await message.copy_to(chat_id=partner_id, protect_content=should_protect(users_db.get(user_id)))
+        ad_id = int(call_data[len(prefix):])
+    except ValueError:
+        return None
+    return next((a for a in ads if a["id"] == ad_id), None)
+
+
+@dp.callback_query(F.data.startswith("adm_adtoggle_"))
+@admin_only
+async def adm_ad_toggle(call: types.CallbackQuery):
+    ad = _find_ad(call.data, "adm_adtoggle_")
+    if ad is None:
+        await call.answer("Оголошення не знайдено", show_alert=True)
+        return
+    ad["active"] = not ad.get("active")
+    request_save()
+    text, kb = ads_admin_view()
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
     except TelegramAPIError:
-        end_chat(user_id)
-        await message.answer(
-            "Не вдалося доставити повідомлення, чат завершено.", reply_markup=get_main_keyboard()
-        )
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer("Увімкнено" if ad["active"] else "На паузі")
 
 
-# ---------------------------------------------------------------------------
-# Веб-сервер для Render (інакше "No open ports detected")
-# ---------------------------------------------------------------------------
-async def handle_ping(request: web.Request):
-    return web.Response(text="Bot is running!")
-
-
-async def start_web_server() -> web.AppRunner:
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/health", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info("Веб-сервер запущено на порту %s", port)
-    return runner
-
-
-async def setup_bot_commands():
-    """Перекладає меню команд '/' на українську (замість заглушок command1, command2...)."""
-    default_commands = [
-        types.BotCommand(command="start", description="🚀 Почати / перезапустити бота"),
-        types.BotCommand(command="edit_profile", description="✏️ Редагувати профіль"),
-        types.BotCommand(command="stop", description="❌ Завершити чат"),
-        types.BotCommand(command="cancel", description="⬅️ Скасувати поточну дію"),
-        types.BotCommand(command="top", description="🏆 Топ дарувальників подарунків"),
-        types.BotCommand(command="filters", description="🎯 Фільтри пошуку"),
-        types.BotCommand(command="rooms", description="👥 Кімнати за інтересами"),
-        types.BotCommand(command="help", description="🆘 Допомога / зв'язок з адміном"),
-        types.BotCommand(command="friends", description="👫 Друзі"),
-        types.BotCommand(command="online", description="👥 Хто зараз онлайн"),
-        types.BotCommand(command="premium", description="💎 Premium"),
-        types.BotCommand(command="flirt", description="❤️ Флірт-пошук (18+)"),
-        types.BotCommand(command="interests", description="🧩 Пошук за інтересами"),
-        types.BotCommand(command="myinterests", description="🧩 Мої інтереси в профілі"),
-        types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
-    ]
-    await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
-
-    if ADMIN_ID:
-        admin_commands = default_commands + [
-            types.BotCommand(command="admin", description="🔐 Адмін-панель"),
-            types.BotCommand(command="addbalance", description="💰 Поповнити баланс користувачу"),
-            types.BotCommand(command="confirm", description="🏦 Підтвердити оплату за кодом"),
-            types.BotCommand(command="mono", description="🫙 Стан Банки monobank"),
-        ]
-        try:
-            await bot.set_my_commands(
-                admin_commands, scope=types.BotCommandScopeChat(chat_id=ADMIN_ID)
-            )
-        except TelegramAPIError as e:
-            # адмін ще жодного разу не писав боту — Telegram не дає встановити команди для нього
-            logging.warning("Не вдалося встановити адмін-команди: %s", e)
-
-
-async def main():
-    global BOT_USERNAME
-    logging.basicConfig(level=logging.INFO)
-    runner = await start_web_server()
-    # Дані з бази завантажуємо ДО того, як бот почне приймати повідомлення.
-    await load_state_from_db()
-    poll_task = asyncio.create_task(crypto_poll_loop())
-    save_task = asyncio.create_task(persistence_loop())
-    lease_task = asyncio.create_task(lease_heartbeat_loop())
-    mono_task = asyncio.create_task(mono_poll_loop())
+@dp.callback_query(F.data.startswith("adm_addel_"))
+@admin_only
+async def adm_ad_delete(call: types.CallbackQuery):
+    ad = _find_ad(call.data, "adm_addel_")
+    if ad is None:
+        await call.answer("Оголошення не знайдено", show_alert=True)
+        return
+    ads.remove(ad)
+    request_save()
+    text, kb = ads_admin_view()
     try:
-        # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
-        # Telegram API не вбивала весь процес (і "Application exited early" на Render).
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Не вдалося скинути webhook: %s", e)
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramAPIError:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer("Видалено")
 
-        try:
-            await setup_bot_commands()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Не вдалося встановити команди бота: %s", e)
-
-        try:
-            me = await bot.get_me()
-            BOT_USERNAME = me.username or ""
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Не вдалося отримати інформацію про бота (get_me): %s", e)
-
-        # Якщо polling впаде (напр. TelegramConflictError через старий інстанс),
-        # логуємо чітку причину і пробуємо знову, а не завершуємо процес.
-        while True:
-            try:
-                await dp.start_polling(bot)
-                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001
-                logging.error("Помилка під час polling, перезапуск через 5с: %s", e)
-                await asyncio.sleep(5)
-    finally:
-        poll_task.cancel()
-        save_task.cancel()
-        lease_task.cancel()
-        mono_task.cancel()
-        await save_state_to_db()  # фінальне збереження при зупинці (деплой/перезапуск)
-        await release_lease()  # тепер нова копія може забрати свіжі дані
-        await bot.session.close()
-        await runner.cleanup()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 
 
