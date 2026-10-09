@@ -131,6 +131,7 @@ async def _resolve_payment(code: str, approve: bool) -> str:
         p["status"] = "confirmed"
         u = init_user(p["user_id"])
         u["balance"] += p["amount"]
+        record_topup("jar" if p.get("method") == "jar" else "card", p["amount"])
         bonus = apply_topup_bonus(u, p["amount"])
         request_save()
         text = f"✅ Оплату {code} підтверджено! Баланс поповнено на {p['amount']} грн."
@@ -562,6 +563,232 @@ async def mono_status(message: types.Message):
         for j in mono_state["jars"]:
             lines.append(f"• «{esc(j.get('title'))}» — <code>{esc(j.get('id'))}</code>")
     await message.answer("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Статистика: щоденні лічильники для адміна
+# ---------------------------------------------------------------------------
+STATS_KEEP_DAYS = 62  # скільки днів історії тримаємо в базі
+
+
+def _new_stats_day() -> dict:
+    return {
+        "new": 0,  # нових користувачів
+        "active": set(),  # хто щось робив у боті (унікальні)
+        "chats": 0,  # з'єднань усього
+        "real_chats": 0,  # чатів від 1 хв, де обидва писали
+        "flirt": 0,
+        "interest": 0,
+        "friends": 0,
+        "msgs": 0,  # повідомлень у чатах 1-на-1
+        "topup": {},  # джерело -> грн
+        "topup_n": 0,  # кількість оплат
+        "spent": {},  # на що витрачали баланс -> грн
+        "daily_paid": 0.0,  # роздано щоденними бонусами
+        "tasks_paid": 0.0,  # роздано за завдання
+        "tasks_done": 0,
+    }
+
+
+def stats_day(day: str | None = None) -> dict:
+    day = day or today_str()
+    d = stats_days.get(day)
+    if d is None:
+        d = stats_days[day] = _new_stats_day()
+        cutoff = (kyiv_today() - timedelta(days=STATS_KEEP_DAYS)).isoformat()
+        for old in [k for k in stats_days if k < cutoff]:
+            stats_days.pop(old, None)
+    return d
+
+
+def stat_add(key: str, n: float = 1, sub: str | None = None):
+    try:
+        d = stats_day()
+        if sub is None:
+            d[key] = d.get(key, 0) + n
+        else:
+            bucket = d.setdefault(key, {})
+            bucket[sub] = bucket.get(sub, 0) + n
+    except Exception as e:  # noqa: BLE001 — статистика ніколи не має ламати бота
+        logging.warning("Статистика: %s", e)
+
+
+def record_topup(source: str, amount: float):
+    stat_add("topup", float(amount), sub=source)
+    stat_add("topup_n")
+
+
+def record_spend(category: str, amount: float):
+    stat_add("spent", float(amount), sub=category)
+
+
+# ---------------------------------------------------------------------------
+# Щоденні завдання: 3 на день, нагорода на баланс, з Premium ×2
+# ---------------------------------------------------------------------------
+REAL_CHAT_SECONDS = 60  # чат зараховується, якщо тривав від 1 хв і обидва написали
+LONG_CHAT_SECONDS = 300
+TASKS_PER_DAY = 3
+TASKS_ALL_BONUS = float(os.getenv("TASKS_ALL_BONUS", "2"))  # грн за виконання всіх завдань дня
+TASKS_PREMIUM_MULT = 2
+
+# ключ -> (назва, подія, скільки треба, нагорода грн)
+TASK_POOL = {
+    "daily": ("🎁 Забери щоденний бонус", "daily", 1, 1),
+    "chats3": ("💬 Поспілкуйся в 3 чатах", "chat", 3, 1),
+    "rate2": ("👍 Оціни 2 співрозмовників", "rate", 2, 1),
+    "msgs20": ("✉️ Надішли 20 повідомлень у чатах", "msg", 20, 1),
+    "longchat": ("⏱ Поспілкуйся з кимось 5 хвилин", "long_chat", 1, 2),
+    "flirt1": ("❤️ Поспілкуйся у флірт-чаті", "flirt_chat", 1, 1),
+    "interest1": ("🧩 Поспілкуйся за інтересами", "interest_chat", 1, 1),
+    "gift1": ("🎁 Подаруй подарунок співрозмовнику", "gift", 1, 2),
+    "room1": ("👥 Напиши в кімнаті за інтересами", "room_msg", 1, 1),
+}
+
+
+def ensure_tasks(user_id: int, u: dict) -> list[str]:
+    """Видає завдання на сьогодні (однакові протягом дня, у кожного свій набір)."""
+    today = today_str()
+    if u.get("tasks_day") != today or not u.get("tasks_list"):
+        pool = [k for k in TASK_POOL if k != "daily"]
+        if flirt_block_reason(u) is not None:
+            pool.remove("flirt1")  # флірт лише з 18 і з заповненим профілем
+        rng = random.Random(f"{today}:{user_id}")
+        u["tasks_day"] = today
+        u["tasks_list"] = ["daily"] + rng.sample(pool, TASKS_PER_DAY - 1)
+        u["tasks_progress"] = {}
+        u["tasks_done"] = set()
+        u["tasks_bonus"] = False
+    return [k for k in u["tasks_list"] if k in TASK_POOL]
+
+
+def _task_mult(u: dict) -> int:
+    return TASKS_PREMIUM_MULT if is_premium(u) else 1
+
+
+def _notify_later(user_id: int, text: str):
+    try:
+        asyncio.get_running_loop().create_task(safe_send(user_id, text))
+    except RuntimeError:
+        pass
+
+
+def task_event(user_id: int, event: str, n: int = 1):
+    """Зараховує дію в щоденні завдання; за виконане — нагорода і повідомлення."""
+    try:
+        u = users_db.get(user_id)
+        if u is None or user_id in banned_users:
+            return
+        keys = ensure_tasks(user_id, u)
+        mult = _task_mult(u)
+        notes = []
+        for k in keys:
+            title, ev, goal, reward = TASK_POOL[k]
+            if ev != event or k in u["tasks_done"]:
+                continue
+            done_now = u["tasks_progress"].get(k, 0) + n
+            u["tasks_progress"][k] = min(done_now, goal)
+            if done_now >= goal:
+                u["tasks_done"].add(k)
+                pay = reward * mult
+                u["balance"] += pay
+                stat_add("tasks_paid", pay)
+                stat_add("tasks_done")
+                notes.append(f"✅ Завдання виконано: {title} — <b>+{pay:g} грн</b>")
+        if not notes:
+            return
+        done_cnt = len([k for k in keys if k in u["tasks_done"]])
+        if done_cnt >= len(keys) and not u.get("tasks_bonus"):
+            u["tasks_bonus"] = True
+            bonus = TASKS_ALL_BONUS * mult
+            if bonus:
+                u["balance"] += bonus
+                stat_add("tasks_paid", bonus)
+                notes.append(f"🏆 Усі завдання на сьогодні виконано! Бонус <b>+{bonus:g} грн</b>")
+        else:
+            notes.append(f"📋 Виконано {done_cnt}/{len(keys)} — решта в «{BTN_TASKS}»")
+        request_save()
+        _notify_later(user_id, "\n".join(notes))
+    except Exception as e:  # noqa: BLE001 — завдання ніколи не мають ламати бота
+        logging.warning("Завдання: %s", e)
+
+
+def on_chat_started(a: int, b: int, mode: str):
+    now = time.time()
+    for x in (a, b):
+        chat_meta[x] = {"start": now, "mode": mode, "msgs": 0}
+    stat_add("chats")
+    if mode == "flirt":
+        stat_add("flirt")
+    elif mode.startswith("int:"):
+        stat_add("interest")
+    elif mode == "friend":
+        stat_add("friends")
+
+
+def on_chat_message(user_id: int):
+    m = chat_meta.get(user_id)
+    if m is not None:
+        m["msgs"] += 1
+    stat_add("msgs")
+    task_event(user_id, "msg")
+
+
+def on_chat_ended(a: int, b: int):
+    try:
+        ma, mb = chat_meta.pop(a, None), chat_meta.pop(b, None)
+        if ma is None or mb is None:
+            return
+        duration = time.time() - min(ma["start"], mb["start"])
+        if duration < REAL_CHAT_SECONDS or ma["msgs"] < 1 or mb["msgs"] < 1:
+            return  # «натиснув і втік» не рахується — щоб завдання не накручували
+        stat_add("real_chats")
+        long_chat = duration >= LONG_CHAT_SECONDS and ma["msgs"] >= 3 and mb["msgs"] >= 3
+        mode = ma["mode"]
+        for x in (a, b):
+            task_event(x, "chat")
+            if mode == "flirt":
+                task_event(x, "flirt_chat")
+            elif mode.startswith("int:"):
+                task_event(x, "interest_chat")
+            if long_chat:
+                task_event(x, "long_chat")
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Кінець чату (статистика): %s", e)
+
+
+def tasks_text(user_id: int, u: dict) -> str:
+    keys = ensure_tasks(user_id, u)
+    mult = _task_mult(u)
+    lines = ["📋 <b>Завдання на сьогодні</b>\n"]
+    for k in keys:
+        title, _ev, goal, reward = TASK_POOL[k]
+        pay = reward * mult
+        if k in u["tasks_done"]:
+            lines.append(f"✅ <s>{title}</s> — +{pay:g} грн")
+        else:
+            prog = u["tasks_progress"].get(k, 0)
+            counter = f" ({prog}/{goal})" if goal > 1 else ""
+            lines.append(f"⬜ {title}{counter} — +{pay:g} грн")
+    lines.append("")
+    if u.get("tasks_bonus"):
+        lines.append("🏆 Бонус за всі завдання отримано — ти молодець!")
+    elif TASKS_ALL_BONUS:
+        lines.append(f"🏆 Виконай усі — і отримай ще <b>+{TASKS_ALL_BONUS * mult:g} грн</b>")
+    lines.append("💎 У тебе Premium — нагороди ×2" if mult > 1 else "💎 З Premium усі нагороди ×2")
+    lines.append("")
+    lines.append(
+        "<i>Чат зараховується, якщо триває від 1 хв і ви обоє щось написали. "
+        "Нові завдання — щодня опівночі за Києвом.</i>"
+    )
+    return "\n".join(lines)
+
+
+@dp.message(F.text == BTN_TASKS)
+@dp.message(Command("tasks"))
+async def tasks_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    await message.answer(tasks_text(message.from_user.id, u))
 
 
 # ---------------------------------------------------------------------------
@@ -1006,6 +1233,7 @@ async def relay_messages(message: types.Message):
                 )
                 return
             u = init_user(user_id)
+            task_event(user_id, "room_msg")
             broadcast_text = f"<b>{esc(u['nickname'])}:</b> {esc(message.text)}"
             for member_id in list(room["members"]):
                 if member_id == user_id:
@@ -1030,6 +1258,7 @@ async def relay_messages(message: types.Message):
 
     try:
         await message.copy_to(chat_id=partner_id, protect_content=should_protect(users_db.get(user_id)))
+        on_chat_message(user_id)
     except TelegramAPIError:
         end_chat(user_id)
         await message.answer(
@@ -1074,6 +1303,7 @@ async def setup_bot_commands():
         types.BotCommand(command="flirt", description="❤️ Флірт-пошук (18+)"),
         types.BotCommand(command="interests", description="🧩 Пошук за інтересами"),
         types.BotCommand(command="myinterests", description="🧩 Мої інтереси в профілі"),
+        types.BotCommand(command="tasks", description="📋 Щоденні завдання"),
         types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
