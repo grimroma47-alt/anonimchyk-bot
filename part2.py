@@ -482,6 +482,7 @@ async def daily_checkin(message: types.Message, state: FSMContext):
 
     u["last_checkin_date"] = today
     streak = u["checkin_streak"]
+    task_event(message.from_user.id, "daily")
 
     if streak % DAILY_GIFT_EVERY == 0:
         cheap_keys = [k for k, (_, p) in GIFT_CATALOG.items() if p <= DAILY_GIFT_MAX_PRICE]
@@ -495,6 +496,7 @@ async def daily_checkin(message: types.Message, state: FSMContext):
         )
     else:
         u["balance"] += DAILY_BONUS_AMOUNT
+        stat_add("daily_paid", DAILY_BONUS_AMOUNT)
         left = DAILY_GIFT_EVERY - (streak % DAILY_GIFT_EVERY)
         await message.answer(
             f"✅ Щоденний бонус: +{DAILY_BONUS_AMOUNT:.0f} грн.\n"
@@ -570,6 +572,7 @@ async def process_successful_payment(message: types.Message):
     amount = payment.total_amount  # для XTR це кількість зірок напряму
     u = init_user(message.from_user.id)
     u["balance"] += amount
+    record_topup("stars", amount)
     bonus = apply_topup_bonus(u, amount)
     request_save()
     text = f"✅ Оплату отримано! Баланс поповнено на {amount} грн."
@@ -671,6 +674,7 @@ async def change_nick_finish(message: types.Message, state: FSMContext):
         await message.answer("❌ Недостатньо коштів.")
         return
     u["balance"] -= NICK_PRICE
+    record_spend("shop", NICK_PRICE)
     u["nickname"] = nick
     await state.clear()
     await message.answer(f"🎉 Нікнейм змінено на <b>{esc(nick)}</b> (списано {NICK_PRICE} грн).")
@@ -722,6 +726,7 @@ async def buy_item(call: types.CallbackQuery, state: FSMContext):
         return
 
     u["balance"] -= price
+    record_spend("premium" if perk == "premium" else "shop", price)
     request_save()
     now = time.time()
     if seconds is None:
@@ -758,6 +763,7 @@ async def buy_gift_item(call: types.CallbackQuery):
         return
 
     u["balance"] -= price
+    record_spend("gifts", price)
     u.setdefault("gifts", {})
     u["gifts"][key] = u["gifts"].get(key, 0) + 1
 
@@ -1074,6 +1080,7 @@ async def unban_buy(call: types.CallbackQuery):
         return
 
     u["balance"] -= price
+    record_spend("unban", price)
     banned_users.discard(user_id)
     u["ban_type"] = None
     u["reports_received"] = 0
@@ -1171,6 +1178,7 @@ def premium_page():
         f"🚫 <b>Більший чорний список</b> — до {BLACKLIST_LIMIT_PLUS} замість {BLACKLIST_LIMIT_FREE}",
         "🔒 <b>Захист медіа</b> — твої фото й повідомлення не можна переслати чи зберегти (/silent)",
         "📣 <b>Без реклами</b> під час пошуку",
+        "📋 <b>Нагороди за завдання ×2</b>",
         "💎 <b>Значок</b> у профілі й досягнення",
         "",
     ]
