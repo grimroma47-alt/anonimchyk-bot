@@ -836,7 +836,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
         await message.answer("Спочатку вийди з групової кімнати.", reply_markup=get_room_keyboard())
         return
 
-    match_index = None
+    best = None  # (бали, позиція в черзі)
     for i, candidate_id in enumerate(queue):
         if search_mode.get(candidate_id, "normal") != mode:
             continue  # флірт шукає лише флірт, звичайний — лише звичайний
@@ -847,8 +847,12 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             continue  # у флірті з'єднуємо лише хлопця з дівчиною
         if not passes_filters(u, p_candidate) or not passes_filters(p_candidate, u):
             continue
-        match_index = i
-        break
+        score = match_score(u, p_candidate, mode)
+        if best is None or score > best[0]:
+            best = (score, i)
+            if score >= MATCH_SCORE_MAX:
+                break
+    match_index = best[1] if best else None
 
     if match_index is not None:
         partner_id = queue.pop(match_index)
@@ -880,6 +884,8 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             topic_note = f"🧩 Ваша спільна тема: <b>{INTEREST_LABELS.get(mode[4:], mode[4:])}</b> — є з чого почати 😉"
             await message.answer(topic_note)
             await safe_send(partner_id, topic_note)
+        if not mode.startswith("int:"):
+            await send_interest_notes(user_id, u, partner_id, p)
     else:
         if has_perk(u, "priority") or is_premium(u):
             queue.insert(0, user_id)
@@ -926,6 +932,10 @@ async def stop_chat(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("rate_up_"))
 async def rate_up_handler(call: types.CallbackQuery):
     target_id = int(call.data[len("rate_up_"):])
+    if pending_rating.get(call.from_user.id) != target_id:
+        await call.answer("Оцінку вже враховано 🙂")
+        return
+    pending_rating.pop(call.from_user.id, None)
     u = init_user(target_id)
     u["rating_up"] = u.get("rating_up", 0) + 1
     try:
@@ -938,8 +948,13 @@ async def rate_up_handler(call: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("rate_down_"))
 async def rate_down_handler(call: types.CallbackQuery):
     target_id = int(call.data[len("rate_down_"):])
+    if pending_rating.get(call.from_user.id) != target_id:
+        await call.answer("Оцінку вже враховано 🙂")
+        return
+    pending_rating.pop(call.from_user.id, None)
     u = init_user(target_id)
     u["rating_down"] = u.get("rating_down", 0) + 1
+    await maybe_warn_low_rating(target_id, u)
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except TelegramAPIError:
