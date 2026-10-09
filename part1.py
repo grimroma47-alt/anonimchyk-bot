@@ -8,7 +8,7 @@ import functools
 import random
 import re
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, types
@@ -58,6 +58,7 @@ async def track_last_seen(handler, event, data):
         user = data.get("event_from_user")
         if user is not None:
             last_seen[user.id] = time.time()
+            stats_day()["active"].add(user.id)
     except Exception:  # noqa: BLE001 — облік онлайну ніколи не має ламати обробку повідомлень
         pass
     return await handler(event, data)
@@ -73,6 +74,10 @@ active_chats: dict[int, int] = {}
 user_counter = 1000
 
 banned_users: set[int] = set()
+# Статистика для адміна: дата (YYYY-MM-DD, Київ) -> лічильники за день. Зберігається в базі.
+stats_days: dict[str, dict] = {}
+# Поточні чати: user_id -> {"start": час, "mode": режим, "msgs": скільки написав} (лише в пам'яті)
+chat_meta: dict[int, dict] = {}
 reports: list[dict] = []  # {"id", "from", "on", "time", "status"}
 report_counter = 0
 ads: list[dict] = []  # реклама в черзі пошуку: {"id","text","url","active","shows","created"}
@@ -320,12 +325,34 @@ def get_earned_achievements(u: dict) -> list[str]:
     return [title for title, check in ACHIEVEMENTS.values() if check(u)]
 
 
+def _kyiv_tz():
+    try:
+        from zoneinfo import ZoneInfo
+
+        for name in ("Europe/Kyiv", "Europe/Kiev"):
+            try:
+                return ZoneInfo(name)
+            except Exception:  # noqa: BLE001
+                pass
+    except ImportError:
+        pass
+    return timezone(timedelta(hours=3))  # запасний варіант, якщо на сервері немає бази часових поясів
+
+
+KYIV_TZ = _kyiv_tz()
+
+
+def kyiv_today() -> date:
+    """Сьогоднішня дата за Києвом (сервер Render живе за UTC)."""
+    return datetime.now(KYIV_TZ).date()
+
+
 def today_str() -> str:
-    return date.today().isoformat()
+    return kyiv_today().isoformat()
 
 
 def yesterday_str() -> str:
-    return (date.today() - timedelta(days=1)).isoformat()
+    return (kyiv_today() - timedelta(days=1)).isoformat()
 
 
 BTN_SEARCH = "🔍 Шукати співрозмовника"
@@ -337,6 +364,7 @@ BTN_STOP = "❌ Завершити чат"
 BTN_REPORT = "🚨 Поскаржитися"
 BTN_GIFT = "🎁 Подарувати"
 BTN_DAILY = "🎁 Щоденний бонус"
+BTN_TASKS = "📋 Завдання"
 BTN_LOTTERY = "🎰 Рулетка"
 BTN_TOP = "🏆 Топ дарувальників"
 BTN_FILTERS = "🎯 Фільтри пошуку"
@@ -408,11 +436,12 @@ def get_main_keyboard():
             [KeyboardButton(text=BTN_FLIRT), KeyboardButton(text=BTN_INTERESTS)],
             [KeyboardButton(text=BTN_TOPUP), KeyboardButton(text=BTN_WALLET)],
             [KeyboardButton(text=BTN_PREMIUM), KeyboardButton(text=BTN_SHOP)],
-            [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_PROFILE)],
-            [KeyboardButton(text=BTN_SETTINGS), KeyboardButton(text=BTN_FRIENDS)],
-            [KeyboardButton(text=BTN_ROOMS), KeyboardButton(text=BTN_FILTERS)],
-            [KeyboardButton(text=BTN_ONLINE), KeyboardButton(text=BTN_LOTTERY)],
-            [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_HELP)],
+            [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_TASKS)],
+            [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
+            [KeyboardButton(text=BTN_FRIENDS), KeyboardButton(text=BTN_ROOMS)],
+            [KeyboardButton(text=BTN_FILTERS), KeyboardButton(text=BTN_ONLINE)],
+            [KeyboardButton(text=BTN_LOTTERY), KeyboardButton(text=BTN_TOP)],
+            [KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )
@@ -690,6 +719,11 @@ def init_user(user_id: int) -> dict:
             "rating_down": 0,  # 👎 після чатів
             "low_warned": False,  # чи попереджали про низький рейтинг
             "interests": set(),  # ключі з INTEREST_LABELS (до 3), для підбору співрозмовника
+            "tasks_day": None,  # на яку дату (Київ) видано щоденні завдання
+            "tasks_list": [],  # ключі з TASK_POOL на сьогодні
+            "tasks_progress": {},  # ключ -> скільки вже зроблено
+            "tasks_done": set(),  # виконані сьогодні
+            "tasks_bonus": False,  # чи отримано бонус за всі завдання сьогодні
             "blacklist": set(),  # user_id, яких ця людина заблокувала особисто
             "filter_gender": None,  # бажана стать співрозмовника (None = будь-яка)
             "filter_age_ranges": set(),  # ключі з AGE_RANGES (порожньо = будь-який вік)
@@ -701,6 +735,8 @@ def init_user(user_id: int) -> dict:
             "ban_type": None,  # "auto" — автобан за скарги (можна викупити), "admin" — бан адміном
             "ban_count": 0,  # скільки разів отримував автобан (від цього росте ціна розблокування)
         }
+        if user_id > 0:
+            stat_add("new")
     return users_db[user_id]
 
 
@@ -875,6 +911,7 @@ def end_chat(user_id: int):
     partner_id = active_chats.pop(user_id, None)
     if partner_id is not None:
         active_chats.pop(partner_id, None)
+        on_chat_ended(user_id, partner_id)
         if user_id in users_db:
             users_db[user_id]["last_partner_id"] = partner_id
         if partner_id in users_db:
@@ -972,6 +1009,7 @@ async def check_and_credit_invoice(invoice_id: str) -> bool:
     pending_crypto_invoices.pop(invoice_id, None)
     u = init_user(info["user_id"])
     u["balance"] += info["credit"]
+    record_topup("crypto", info["credit"])
     bonus = apply_topup_bonus(u, info["credit"])
     request_save()
     if bonus:
@@ -1185,6 +1223,7 @@ def _make_snapshot() -> bytes:
             "lottery_revenue_total": lottery_revenue_total,
             "ads": ads,
             "ad_counter": ad_counter,
+            "stats_days": stats_days,
         },
         protocol=4,
     )
@@ -1216,6 +1255,8 @@ def _apply_snapshot(blob: bytes):
     ads.clear()
     ads.extend(data.get("ads", []))
     ad_counter = data.get("ad_counter", ad_counter)
+    stats_days.clear()
+    stats_days.update(data.get("stats_days", {}))
 
     # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
     saved_counter = user_counter
