@@ -1365,9 +1365,11 @@ async def start_handler(message: types.Message, state: FSMContext):
     await message.answer(
         f"Привіт, {esc(message.from_user.first_name)}! Вітаємо в анонімному чаті! 🤫\n\n"
         f"Твій унікальний номер: <b>{u['custom_id']}</b>\n"
-        "Заповни профіль командою /edit_profile, щоб отримувати кращі рекомендації.",
+        "Змінити профіль можна будь-коли командою /edit_profile.",
         reply_markup=get_main_keyboard(),
     )
+    if not profile_complete(u):
+        await start_onboarding(message.chat.id, state)
 
 
 @dp.message(Command("cancel"))
