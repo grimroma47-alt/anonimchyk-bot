@@ -33,6 +33,7 @@ async def lottery_spin_handler(call: types.CallbackQuery):
 
     u["balance"] -= LOTTERY_COST
     lottery_revenue_total += LOTTERY_COST
+    record_spend("lottery", LOTTERY_COST)
 
     kind, mult = spin_lottery()
     if kind == "nothing":
@@ -336,6 +337,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
 
         u["total_chats"] = u.get("total_chats", 0) + 1
         p["total_chats"] = p.get("total_chats", 0) + 1
+        on_chat_started(user_id, partner_id, mode)
 
         await message.answer(
             f"Партнера знайдено! 🤫\nІнфо: {short_info(p)}", reply_markup=get_chat_keyboard()
@@ -401,6 +403,7 @@ async def rate_up_handler(call: types.CallbackQuery):
     pending_rating.pop(call.from_user.id, None)
     u = init_user(target_id)
     u["rating_up"] = u.get("rating_up", 0) + 1
+    task_event(call.from_user.id, "rate")
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except TelegramAPIError:
@@ -417,6 +420,7 @@ async def rate_down_handler(call: types.CallbackQuery):
     pending_rating.pop(call.from_user.id, None)
     u = init_user(target_id)
     u["rating_down"] = u.get("rating_down", 0) + 1
+    task_event(call.from_user.id, "rate")
     await maybe_warn_low_rating(target_id, u)
     try:
         await call.message.edit_reply_markup(reply_markup=None)
@@ -511,6 +515,7 @@ async def reconnect_accept(call: types.CallbackQuery):
 
     active_chats[requester_id] = acceptor_id
     active_chats[acceptor_id] = requester_id
+    on_chat_started(requester_id, acceptor_id, "friend")
 
     await call.message.answer("✅ Чат розпочато!", reply_markup=get_chat_keyboard())
     await safe_send(
@@ -918,6 +923,7 @@ async def send_gift_item(call: types.CallbackQuery):
     title, price = item
     u["gifts"][key] = have - 1
     u["gifts_sent_count"] = u.get("gifts_sent_count", 0) + 1
+    task_event(user_id, "gift")
 
     recipient_amount = round(price * GIFT_RECIPIENT_SHARE, 2)
     admin_amount = round(price - recipient_amount, 2)
@@ -980,29 +986,161 @@ def admin_only(func):
     return wrapper
 
 
+STATS_PERIODS = {
+    "today": ("Сьогодні", 1, 0),
+    "yday": ("Вчора", 1, 1),
+    "7": ("7 днів", 7, 0),
+    "30": ("30 днів", 30, 0),
+}
+TOPUP_SOURCES = {"stars": "⭐ Stars", "card": "💳 Реквізити", "jar": "🏦 Банка", "crypto": "🪙 Крипта"}
+SPEND_CATEGORIES = {
+    "premium": "💎 Premium",
+    "shop": "🏪 Магазин",
+    "gifts": "🎁 Подарунки",
+    "lottery": "🎰 Рулетка",
+    "unban": "🔓 Розбан",
+}
+
+
+def _days_back(count: int, skip: int = 0) -> list[str]:
+    today = kyiv_today()
+    return [(today - timedelta(days=skip + i)).isoformat() for i in range(count)]
+
+
+def _sum_stats(days: list[str]) -> dict:
+    total = _new_stats_day()
+    for day in days:
+        d = stats_days.get(day)
+        if not d:
+            continue
+        for key, val in d.items():
+            if key == "active":
+                total["active"] |= val
+            elif isinstance(val, dict):
+                for sub, amount in val.items():
+                    total[key][sub] = total[key].get(sub, 0) + amount
+            else:
+                total[key] = total.get(key, 0) + val
+    return total
+
+
+def _spark(values: list[float]) -> str:
+    bars = "▁▂▃▄▅▆▇█"
+    top = max(values) if values else 0
+    if not top:
+        return "▁" * len(values)
+    return "".join(bars[min(int(v / top * (len(bars) - 1) + 0.5), len(bars) - 1)] for v in values)
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def _money(x: float) -> str:
+    return f"{x:,.0f}".replace(",", " ")
+
+
+def admin_stats_text(period: str) -> str:
+    title, count, skip = STATS_PERIODS.get(period, STATS_PERIODS["today"])
+    days = _days_back(count, skip)
+    t = _sum_stats(days)
+    now = time.time()
+    online = sum(1 for ts in last_seen.values() if now - ts <= ONLINE_WINDOW)
+    premium_count = sum(1 for u in users_db.values() if is_premium(u))
+
+    if count == 1:
+        when = datetime.fromisoformat(days[0]).strftime("%d.%m")
+        head = f"📅 <b>{title}</b> ({when})"
+    else:
+        head = f"📅 <b>За {title}</b>"
+
+    topup_total = sum(t["topup"].values())
+    topup_parts = " · ".join(f"{lbl} {_money(t['topup'][k])}" for k, lbl in TOPUP_SOURCES.items() if t["topup"].get(k))
+    spent_total = sum(t["spent"].values())
+    spent_parts = " · ".join(
+        f"{lbl} {_money(t['spent'][k])}" for k, lbl in SPEND_CATEGORIES.items() if t["spent"].get(k)
+    )
+    lines = [
+        "📊 <b>Статистика</b>",
+        "",
+        f"👥 Усього користувачів: <b>{len(users_db)}</b> · 💎 Premium: {premium_count} · ⛔ бан: {len(banned_users)}",
+        f"🟢 Зараз: онлайн {online} · у чатах {len(active_chats) // 2} · шукають {len(queue)} · у кімнатах {len(user_room)}",
+        "",
+        head,
+        f"🆕 Нових: <b>{t['new']}</b>",
+        f"🙋 Активних: <b>{len(t['active'])}</b>",
+        f"💬 Чатів: <b>{t['chats']}</b> (справжніх від 1 хв: {t['real_chats']})",
+        f"     ❤️ флірт {t['flirt']} · 🧩 інтереси {t['interest']} · 👫 друзі {t['friends']}",
+        f"✉️ Повідомлень: {t['msgs']}",
+        "",
+        f"💰 Поповнення: <b>{_money(topup_total)} грн</b> ({t['topup_n']} {_plural(t['topup_n'], 'оплата', 'оплати', 'оплат')})",
+    ]
+    if topup_parts:
+        lines.append(f"     {topup_parts}")
+    lines.append(f"🛒 Витратили з балансу: <b>{_money(spent_total)} грн</b>")
+    if spent_parts:
+        lines.append(f"     {spent_parts}")
+    lines.append(
+        f"🎁 Роздано безкоштовно: щоденні {_money(t['daily_paid'])} грн · "
+        f"завдання {_money(t['tasks_paid'])} грн ({t['tasks_done']} виконано)"
+    )
+    if count > 1:
+        week = list(reversed(_days_back(count)))
+        new_series = [stats_days.get(d, {}).get("new", 0) for d in week]
+        money_series = [sum(stats_days.get(d, {}).get("topup", {}).values()) for d in week]
+        active_series = [len(stats_days.get(d, {}).get("active", ())) for d in week]
+        lines += [
+            "",
+            "📈 По днях (зліва старіші):",
+            f"🆕 <code>{_spark(new_series)}</code> макс {max(new_series)}",
+            f"🙋 <code>{_spark(active_series)}</code> макс {max(active_series)}",
+            f"💰 <code>{_spark(money_series)}</code> макс {_money(max(money_series))} грн",
+        ]
+    lines += [
+        "",
+        "📦 <b>За весь час</b>",
+        f"• Дохід з подарунків: {gift_revenue_total:.0f} грн · з рулетки: {lottery_revenue_total:.0f} грн",
+        f"• Запрошено друзями: {sum(u.get('referral_count', 0) for u in users_db.values())}",
+        f"• Скарг: {len(reports)} · кімнат зараз: {len(rooms)}",
+    ]
+    if t["topup"].get("stars"):
+        lines.append("\n<i>⭐ Stars показані як зараховані грн — реально після комісії Telegram отримаєш менше.</i>")
+    return "\n".join(lines)
+
+
+def admin_stats_keyboard(period: str):
+    row = [
+        InlineKeyboardButton(text=("• " if key == period else "") + label, callback_data=f"adm_st_{key}")
+        for key, (label, _c, _s) in STATS_PERIODS.items()
+    ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[row[:2], row[2:], [InlineKeyboardButton(text="🔄 Оновити", callback_data=f"adm_st_{period}")]]
+    )
+
+
 @dp.callback_query(F.data == "adm_stats")
 @admin_only
 async def adm_stats(call: types.CallbackQuery):
-    total_users = len(users_db)
-    premium_count = sum(1 for u in users_db.values() if is_premium(u))
-    total_referrals = sum(u.get("referral_count", 0) for u in users_db.values())
-    text = (
-        "📊 <b>Статистика</b>\n\n"
-        f"• Користувачів: {total_users}\n"
-        f"• У черзі пошуку: {len(queue)}\n"
-        f"• Активних чатів: {len(active_chats) // 2}\n"
-        f"• Premium: {premium_count}\n"
-        f"• Забанено: {len(banned_users)}\n"
-        f"• Скарг усього: {len(reports)}\n"
-        f"• Дохід з подарунків: {gift_revenue_total:.2f} грн\n"
-        f"• Дохід з рулетки: {lottery_revenue_total:.2f} грн\n"
-        f"• Запрошень за реферальною програмою: {total_referrals}\n"
-        f"• Автобан після {AUTO_BAN_REPORTS} скарг (users у режимі спостереження: "
-        f"{sum(1 for u in users_db.values() if 0 < u.get('reports_received', 0) < AUTO_BAN_REPORTS)})\n"
-        f"• Активних кімнат: {len(rooms)} (учасників: {sum(len(r['members']) for r in rooms.values())})\n"
-    )
-    await call.message.answer(text)
+    await call.message.answer(admin_stats_text("today"), reply_markup=admin_stats_keyboard("today"))
     await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_st_"))
+@admin_only
+async def adm_stats_period(call: types.CallbackQuery):
+    period = call.data[len("adm_st_"):]
+    if period not in STATS_PERIODS:
+        period = "today"
+    try:
+        await call.message.edit_text(admin_stats_text(period), reply_markup=admin_stats_keyboard(period))
+    except TelegramAPIError:
+        pass  # «message is not modified» — нічого не змінилось
+    await call.answer("Оновлено")
 
 
 @dp.callback_query(F.data.startswith("adm_reports_"))
