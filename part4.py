@@ -707,7 +707,8 @@ def task_event(user_id: int, event: str, n: int = 1):
         else:
             notes.append(f"📋 Виконано {done_cnt}/{len(keys)} — решта в «{BTN_TASKS}»")
         request_save()
-        _notify_later(user_id, "\n".join(notes))
+        if u.get("notify_tasks", True):
+            _notify_later(user_id, "\n".join(notes))
     except Exception as e:  # noqa: BLE001 — завдання ніколи не мають ламати бота
         logging.warning("Завдання: %s", e)
 
@@ -738,6 +739,8 @@ def on_chat_ended(a: int, b: int):
         ma, mb = chat_meta.pop(a, None), chat_meta.pop(b, None)
         if ma is None or mb is None:
             return
+        last_chat_mode[a] = ma["mode"]
+        last_chat_mode[b] = mb["mode"]
         duration = time.time() - min(ma["start"], mb["start"])
         if duration < REAL_CHAT_SECONDS or ma["msgs"] < 1 or mb["msgs"] < 1:
             return  # «натиснув і втік» не рахується — щоб завдання не накручували
@@ -787,6 +790,7 @@ def tasks_text(user_id: int, u: dict) -> str:
 @dp.message(Command("tasks"))
 async def tasks_menu(message: types.Message, state: FSMContext):
     await state.clear()
+    await send_banner(message.from_user.id, "tasks")
     u = init_user(message.from_user.id)
     await message.answer(tasks_text(message.from_user.id, u))
 
@@ -819,14 +823,15 @@ def interests_line(u: dict) -> str:
 
 
 async def send_interest_notes(user_id: int, u: dict, partner_id: int, p: dict):
+    u_open, p_open = not u.get("hide_interests"), not p.get("hide_interests")
     common = [k for k in INTEREST_LABELS if k in (u.get("interests") or set()) & (p.get("interests") or set())]
-    if common:
+    if common and u_open and p_open:
         note = "🧩 Спільні інтереси: <b>" + ", ".join(INTEREST_LABELS[k] for k in common) + "</b> — є з чого почати 😉"
         await safe_send(user_id, note)
         await safe_send(partner_id, note)
         return
-    for me, other in ((user_id, p), (partner_id, u)):
-        if other.get("interests"):
+    for me, other, is_open in ((user_id, p, p_open), (partner_id, u, u_open)):
+        if is_open and other.get("interests"):
             await safe_send(me, f"🧩 Інтереси співрозмовника: {interests_line(other)}")
 
 
@@ -937,7 +942,7 @@ filter_nudge_last: dict[int, float] = {}
 
 def schedule_filter_nudge(user_id: int):
     u = init_user(user_id)
-    if filter_active(u, "gender_filter"):
+    if filter_active(u, "gender_filter") or not u.get("notify_tips", True):
         return
     if time.time() - filter_nudge_last.get(user_id, 0) < FILTER_NUDGE_COOLDOWN:
         return
@@ -1152,7 +1157,7 @@ async def _finish_onboarding(chat_id: int, user_id: int, state: FSMContext):
     request_save()
     await safe_send(
         chat_id,
-        f"🎉 Готово! Твій профіль: {short_info(u)}\n\n"
+        f"🎉 Готово! Твій профіль: {short_info(u, public=False)}\n\n"
         f"Тепер тисни «{BTN_SEARCH}» внизу — і знайомся! 🤫\n"
         "Змінити дані можна будь-коли: /edit_profile",
         reply_markup=get_main_keyboard(),
@@ -1210,6 +1215,421 @@ async def onboard_skip(call: types.CallbackQuery, state: FSMContext):
 
 
 # ---------------------------------------------------------------------------
+# Налаштування: медіа, автопошук, приватність, сповіщення
+# ---------------------------------------------------------------------------
+def is_blocked_media(receiver: dict | None, message: types.Message) -> bool:
+    """Чи не приймає отримувач такий тип повідомлення (режим «без фото/відео»)."""
+    if not receiver or receiver.get("media_mode") != "safe":
+        return False
+    return any(getattr(message, kind, None) for kind in ("photo", "video", "video_note", "animation", "document"))
+
+
+class _NoState:
+    """Заглушка FSM для автопошуку співрозмовника (у нього немає власного повідомлення)."""
+
+    async def clear(self):
+        pass
+
+
+class _ChatAnswer:
+    """Мінімальна «відповідь у чат» для run_search, коли пошук запускає не сама людина."""
+
+    def __init__(self, chat_id: int):
+        self.chat_id = chat_id
+
+    async def answer(self, text: str, **kwargs):
+        await safe_send(self.chat_id, text, **kwargs)
+
+
+async def auto_search_after_chat(user_id: int):
+    u = users_db.get(user_id)
+    if not u or not u.get("auto_search"):
+        return
+    if user_id in banned_users or user_id in active_chats or user_id in queue or user_id in user_room:
+        return
+    mode = last_chat_mode.get(user_id, "normal")
+    if mode == "friend" or (mode == "flirt" and flirt_block_reason(u) is not None):
+        mode = "normal"
+    await safe_send(user_id, "🔁 Автопошук: шукаю наступного співрозмовника…\nЗупинити пошук: /stop · вимкнути автопошук: ⚙️ Налаштування")
+    await run_search(_ChatAnswer(user_id), _NoState(), mode, user_id=user_id)
+
+
+def privacy_keyboard(u: dict):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🎂 Приховати вік: {_onoff(u.get('hide_age'))}", callback_data="tg_hide_age")],
+            [InlineKeyboardButton(text=f"🌍 Приховати країну: {_onoff(u.get('hide_country'))}", callback_data="tg_hide_country")],
+            [InlineKeyboardButton(text=f"🧩 Приховати інтереси: {_onoff(u.get('hide_interests'))}", callback_data="tg_hide_interests")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="set_back")],
+        ]
+    )
+
+
+def notify_keyboard(u: dict):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"📋 Виконані завдання: {_onoff(u.get('notify_tasks', True))}", callback_data="tg_notify_tasks")],
+            [InlineKeyboardButton(text=f"💡 Підказки: {_onoff(u.get('notify_tips', True))}", callback_data="tg_notify_tips")],
+            [InlineKeyboardButton(text=f"🔄 Запрошення в чат: {_onoff(u.get('allow_invites', True))}", callback_data="tg_allow_invites")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="set_back")],
+        ]
+    )
+
+
+TOGGLES = {
+    "hide_age": (False, "privacy"),
+    "hide_country": (False, "privacy"),
+    "hide_interests": (False, "privacy"),
+    "notify_tasks": (True, "notify"),
+    "notify_tips": (True, "notify"),
+    "allow_invites": (True, "notify"),
+}
+
+
+async def _set_markup(call: types.CallbackQuery, markup):
+    try:
+        await call.message.edit_reply_markup(reply_markup=markup)
+    except TelegramAPIError:
+        pass
+
+
+@dp.callback_query(F.data == "set_media")
+async def set_media(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    u["media_mode"] = "all" if u.get("media_mode") == "safe" else "safe"
+    request_save()
+    await _set_markup(call, get_settings_keyboard(u))
+    await call.answer(
+        "🛡 Фото, відео, GIF і файли від співрозмовників більше не надходитимуть"
+        if u["media_mode"] == "safe"
+        else "📷 Тепер приймаєш усі повідомлення",
+        show_alert=True,
+    )
+
+
+@dp.callback_query(F.data == "set_auto")
+async def set_auto(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    u["auto_search"] = not u.get("auto_search")
+    request_save()
+    await _set_markup(call, get_settings_keyboard(u))
+    await call.answer(
+        "🔁 Після кожного чату бот одразу шукатиме наступного" if u["auto_search"] else "Автопошук вимкнено"
+    )
+
+
+@dp.callback_query(F.data == "set_privacy")
+async def set_privacy(call: types.CallbackQuery):
+    await _set_markup(call, privacy_keyboard(init_user(call.from_user.id)))
+    await call.answer("Приховане співрозмовник побачить як 🙈. Фільтри пошуку працюють як раніше.", show_alert=True)
+
+
+@dp.callback_query(F.data == "set_notify")
+async def set_notify(call: types.CallbackQuery):
+    await _set_markup(call, notify_keyboard(init_user(call.from_user.id)))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "set_back")
+async def set_back(call: types.CallbackQuery):
+    await _set_markup(call, get_settings_keyboard(init_user(call.from_user.id)))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tg_"))
+async def toggle_setting(call: types.CallbackQuery):
+    key = call.data[len("tg_"):]
+    if key not in TOGGLES:
+        await call.answer()
+        return
+    default, menu = TOGGLES[key]
+    u = init_user(call.from_user.id)
+    u[key] = not u.get(key, default)
+    request_save()
+    await _set_markup(call, privacy_keyboard(u) if menu == "privacy" else notify_keyboard(u))
+    await call.answer("Збережено ✅")
+
+
+# ---------------------------------------------------------------------------
+# Редагування профілю кнопками (без /edit_profile)
+# ---------------------------------------------------------------------------
+class ProfileEditStates(StatesGroup):
+    age = State()
+    country = State()
+
+
+def _archive_profile(u: dict):
+    stamp = time.strftime("%d.%m.%Y %H:%M")
+    u["archive"].append(f"{stamp} — Стать: {u['gender']}, Вік: {u['age']}, Країна: {u['country']}")
+    u["archive"] = u["archive"][-50:]
+
+
+def profile_edit_text(u: dict) -> str:
+    return (
+        "✏️ <b>Мій профіль</b>\n\n"
+        f"👤 Стать: <b>{esc(u['gender'])}</b>\n"
+        f"🎂 Вік: <b>{esc(u['age'])}</b>{' (🙈 прихований)' if u.get('hide_age') else ''}\n"
+        f"🌍 Країна: <b>{esc(u['country'])}</b>{' (🙈 прихована)' if u.get('hide_country') else ''}\n"
+        f"🧩 Інтереси: {interests_line(u)}\n\n"
+        "Що змінити?"
+    )
+
+
+def profile_edit_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👤 Стать", callback_data="pe_gender"),
+                InlineKeyboardButton(text="🎂 Вік", callback_data="pe_age"),
+            ],
+            [
+                InlineKeyboardButton(text="🌍 Країна", callback_data="pe_country"),
+                InlineKeyboardButton(text="🧩 Інтереси", callback_data="pi_open"),
+            ],
+        ]
+    )
+
+
+async def _show_profile_editor(chat_id: int, u: dict):
+    await safe_send(chat_id, profile_edit_text(u), reply_markup=profile_edit_keyboard())
+
+
+@dp.callback_query(F.data == "pe_menu")
+async def pe_menu(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await _show_profile_editor(call.from_user.id, init_user(call.from_user.id))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "pe_gender")
+async def pe_gender(call: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👦 Хлопець", callback_data="pe_g_m"),
+                InlineKeyboardButton(text="👧 Дівчина", callback_data="pe_g_f"),
+            ]
+        ]
+    )
+    try:
+        await call.message.edit_text("👤 Обери стать:", reply_markup=kb)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+@dp.callback_query(F.data.in_({"pe_g_m", "pe_g_f"}))
+async def pe_gender_set(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    new = "Хлопець" if call.data == "pe_g_m" else "Дівчина"
+    if u["gender"] != new:
+        _archive_profile(u)
+        u["gender"] = new
+        request_save()
+    try:
+        await call.message.edit_text(profile_edit_text(u), reply_markup=profile_edit_keyboard())
+    except TelegramAPIError:
+        pass
+    await call.answer("Збережено ✅")
+
+
+@dp.callback_query(F.data == "pe_age")
+async def pe_age(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ProfileEditStates.age)
+    await call.message.answer("🎂 Напиши свій вік числом (наприклад, 19).\nСкасувати: /cancel")
+    await call.answer()
+
+
+@dp.message(ProfileEditStates.age, F.text)
+async def pe_age_set(message: types.Message, state: FSMContext):
+    m = ONBOARD_AGE_REGEX.match(message.text or "")
+    if not m or not (10 <= int(m.group(1)) <= 99):
+        await message.answer("Напиши вік числом від 10 до 99. Скасувати: /cancel")
+        return
+    age = int(m.group(1))
+    u = init_user(message.from_user.id)
+    if u["age"] != str(age):
+        _archive_profile(u)
+        u["age"] = str(age)
+        prev_min = u.get("min_age_seen")
+        u["min_age_seen"] = age if prev_min is None else min(int(prev_min), age)
+        request_save()
+    await state.clear()
+    await _show_profile_editor(message.from_user.id, u)
+
+
+@dp.callback_query(F.data == "pe_country")
+async def pe_country(call: types.CallbackQuery):
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"pe_c_{key}") for key, label, _n in ONBOARD_COUNTRIES[i : i + 2]]
+        for i in range(0, len(ONBOARD_COUNTRIES), 2)
+    ]
+    rows.append([InlineKeyboardButton(text="🌍 Інша — напишу сам(а)", callback_data="pe_c_other")])
+    try:
+        await call.message.edit_text("🌍 Звідки ти?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+def _set_country(u: dict, country: str):
+    if u["country"] != country:
+        _archive_profile(u)
+        u["country"] = country
+        request_save()
+
+
+@dp.callback_query(F.data.startswith("pe_c_"))
+async def pe_country_set(call: types.CallbackQuery, state: FSMContext):
+    key = call.data[len("pe_c_"):]
+    if key == "other":
+        await state.set_state(ProfileEditStates.country)
+        await call.message.answer("🌍 Напиши свою країну або місто. Скасувати: /cancel")
+        await call.answer()
+        return
+    country = next((name for k, _label, name in ONBOARD_COUNTRIES if k == key), None)
+    if country is None:
+        await call.answer("Невідома країна", show_alert=True)
+        return
+    u = init_user(call.from_user.id)
+    _set_country(u, country)
+    try:
+        await call.message.edit_text(profile_edit_text(u), reply_markup=profile_edit_keyboard())
+    except TelegramAPIError:
+        pass
+    await call.answer("Збережено ✅")
+
+
+@dp.message(ProfileEditStates.country, F.text)
+async def pe_country_text(message: types.Message, state: FSMContext):
+    country = (message.text or "").strip()[:50]
+    if len(country) < 2 or LINK_REGEX.search(country):
+        await message.answer("Напиши назву країни або міста. Скасувати: /cancel")
+        return
+    u = init_user(message.from_user.id)
+    _set_country(u, country)
+    await state.clear()
+    await _show_profile_editor(message.from_user.id, u)
+
+
+# ---------------------------------------------------------------------------
+# Банери-картинки: адмін ставить їх з телефона (надсилає фото боту), file_id — у базі
+# ---------------------------------------------------------------------------
+BANNER_PLACES = {
+    "start": "🚀 Привітання (/start)",
+    "premium": "💎 Premium",
+    "shop": "🏪 Магазин",
+    "topup": "💳 Поповнення",
+    "tasks": "📋 Завдання",
+    "lottery": "🎰 Рулетка",
+}
+BANNER_COOLDOWN = 10 * 60  # той самий банер одній людині — не частіше ніж раз на 10 хв
+banner_last_shown: dict[tuple[int, str], float] = {}
+
+
+class BannerStates(StatesGroup):
+    photo = State()
+
+
+async def send_banner(chat_id: int, place: str, caption: str | None = None, **kwargs) -> bool:
+    """Надсилає банер (якщо адмін його поставив). Повертає True, якщо картинку надіслано."""
+    file_id = banners.get(place)
+    if not file_id:
+        return False
+    now = time.time()
+    if caption is None and now - banner_last_shown.get((chat_id, place), 0) < BANNER_COOLDOWN:
+        return False
+    try:
+        await bot.send_photo(chat_id, file_id, caption=caption, **kwargs)
+    except TelegramAPIError as e:
+        logging.warning("Банер %s не надіслано: %s", place, e)
+        return False
+    banner_last_shown[(chat_id, place)] = now
+    return True
+
+
+def _is_banner_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID and user_id in authorized_admins
+
+
+def banners_admin_keyboard():
+    rows = [
+        [InlineKeyboardButton(text=("✅ " if key in banners else "➕ ") + label, callback_data=f"adm_bn_{key}")]
+        for key, label in BANNER_PLACES.items()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+BANNERS_HELP = (
+    "🖼 <b>Банери</b>\n\n"
+    "Картинка над екраном бота. ✅ — банер стоїть, ➕ — немає.\n"
+    "Обери місце і надішли картинку <b>як фото</b> (не файлом).\n"
+    "Найкращий розмір: <b>1280×720</b> (горизонтальна, 16:9)."
+)
+
+
+@dp.callback_query(F.data == "adm_banners")
+@admin_only
+async def adm_banners(call: types.CallbackQuery):
+    await call.message.answer(BANNERS_HELP, reply_markup=banners_admin_keyboard())
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_bn_"))
+@admin_only
+async def adm_banner_pick(call: types.CallbackQuery, state: FSMContext):
+    place = call.data[len("adm_bn_"):]
+    if place not in BANNER_PLACES:
+        await call.answer()
+        return
+    await state.set_state(BannerStates.photo)
+    await state.update_data(banner_place=place)
+    rows = []
+    if place in banners:
+        rows.append([InlineKeyboardButton(text="🗑 Прибрати цей банер", callback_data=f"adm_bnrm_{place}")])
+        await send_banner(call.from_user.id, place, caption="Зараз стоїть оцей 👆")
+    await call.message.answer(
+        f"Надішли картинку для «{BANNER_PLACES[place]}» як фото.\nСкасувати: /cancel",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_bnrm_"))
+@admin_only
+async def adm_banner_remove(call: types.CallbackQuery, state: FSMContext):
+    place = call.data[len("adm_bnrm_"):]
+    banners.pop(place, None)
+    request_save()
+    await state.clear()
+    await call.message.answer(f"🗑 Банер «{BANNER_PLACES.get(place, place)}» прибрано.", reply_markup=banners_admin_keyboard())
+    await call.answer()
+
+
+@dp.message(BannerStates.photo)
+async def adm_banner_photo(message: types.Message, state: FSMContext):
+    if not _is_banner_admin(message.from_user.id):
+        await state.clear()
+        return
+    if not message.photo:
+        await message.answer("Надішли саме картинку як фото (не файлом і не текстом). Скасувати: /cancel")
+        return
+    data = await state.get_data()
+    place = data.get("banner_place")
+    await state.clear()
+    if place not in BANNER_PLACES:
+        await message.answer("Щось пішло не так — обери місце ще раз у 🖼 Банери.")
+        return
+    banners[place] = message.photo[-1].file_id  # найбільший розмір
+    request_save()
+    banner_last_shown.clear()
+    await message.answer(
+        f"✅ Банер для «{BANNER_PLACES[place]}» встановлено! Відкрий цей екран у боті, щоб подивитись.",
+        reply_markup=banners_admin_keyboard(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Пересилання повідомлень (завжди останнім!)
 # ---------------------------------------------------------------------------
 @dp.message()
@@ -1254,6 +1674,10 @@ async def relay_messages(message: types.Message):
         await message.answer(
             "🚫 Повідомлення з посиланнями або контактами заборонено — спілкуйтесь анонімно в боті."
         )
+        return
+
+    if is_blocked_media(users_db.get(partner_id), message):
+        await message.answer("🛡 Співрозмовник не приймає фото, відео й файли — напиши текстом 🙂")
         return
 
     try:
