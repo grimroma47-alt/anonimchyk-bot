@@ -748,6 +748,7 @@ def on_chat_ended(a: int, b: int):
         long_chat = duration >= LONG_CHAT_SECONDS and ma["msgs"] >= 3 and mb["msgs"] >= 3
         mode = ma["mode"]
         for x in (a, b):
+            contest_on_real_chat(x)
             task_event(x, "chat")
             if mode == "flirt":
                 task_event(x, "flirt_chat")
@@ -1630,6 +1631,212 @@ async def adm_banner_photo(message: types.Message, state: FSMContext):
 
 
 # ---------------------------------------------------------------------------
+# Щотижневий конкурс запрошень: топ-3 за тиждень отримують Premium
+# ---------------------------------------------------------------------------
+# Друг зараховується лише тоді, коли поспілкувався в першому справжньому чаті (від 1 хв, обидва писали) —
+# так фейкові акаунти, які просто натиснули /start, нічого не дають.
+CONTEST_PRIZES = [  # (місце, днів Premium)
+    ("🥇", int(os.getenv("CONTEST_PRIZE_1", "30"))),
+    ("🥈", int(os.getenv("CONTEST_PRIZE_2", "14"))),
+    ("🥉", int(os.getenv("CONTEST_PRIZE_3", "7"))),
+]
+CONTEST_MIN_INVITES = int(os.getenv("CONTEST_MIN_INVITES", "3"))  # мінімум друзів, щоб потрапити в призери
+CONTEST_FOREVER_BONUS = float(os.getenv("CONTEST_FOREVER_BONUS", "100"))  # грн, якщо в переможця вже вічний Premium
+CONTEST_TOP_SHOWN = 10
+
+
+def contest_week_key(day: date | None = None) -> str:
+    y, w, _ = (day or kyiv_today()).isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def contest_week_range(key: str) -> str:
+    y, w = key.split("-W")
+    monday = date.fromisocalendar(int(y), int(w), 1)
+    sunday = monday + timedelta(days=6)
+    months = ["січня", "лютого", "березня", "квітня", "травня", "червня",
+              "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
+    if monday.month == sunday.month:
+        return f"{monday.day}–{sunday.day} {months[sunday.month - 1]}"
+    return f"{monday.day} {months[monday.month - 1]} – {sunday.day} {months[sunday.month - 1]}"
+
+
+def _contest_can_write() -> bool:
+    return _lease_held or not DATABASE_URL
+
+
+def contest_ranking() -> list[tuple[int, int]]:
+    """[(user_id, кількість)] — більше друзів вище; при рівності вище той, хто набрав раніше."""
+    items = [(uid, v[0], v[1]) for uid, v in (ref_contest.get("counts") or {}).items() if v[0] > 0]
+    items.sort(key=lambda t: (-t[1], t[2]))
+    return [(uid, n) for uid, n, _ts in items]
+
+
+async def contest_finalize(week: str):
+    """Видає призи за тиждень (рівно один раз) і повідомляє переможців."""
+    if week in ref_contest.setdefault("awarded", []):
+        return
+    ref_contest["awarded"].append(week)
+    ref_contest["awarded"] = ref_contest["awarded"][-20:]
+    winners = []
+    ranking = [(uid, n) for uid, n in contest_ranking() if n >= CONTEST_MIN_INVITES and uid not in banned_users]
+    now = time.time()
+    for (medal, days), (uid, n) in zip(CONTEST_PRIZES, ranking):
+        u = users_db.get(uid)
+        if u is None:
+            continue
+        current = u["perks"].get("premium", 0)
+        if current == float("inf"):
+            u["balance"] += CONTEST_FOREVER_BONUS
+            prize = f"+{CONTEST_FOREVER_BONUS:.0f} грн (у тебе вже вічний Premium)"
+        else:
+            u["perks"]["premium"] = max(now, current) + days * DAY
+            prize = f"Premium на {days} днів"
+        winners.append((uid, n, f"{medal} {prize}"))
+        await safe_send(
+            uid,
+            f"🏆 <b>Ти переміг у конкурсі запрошень!</b>\n\n"
+            f"Тиждень {contest_week_range(week)}: {n} {_plural(n, 'друг', 'друзі', 'друзів')} → {medal} місце.\n"
+            f"Твій приз: <b>{prize}</b> 💎\n\nДякуємо, що розповідаєш про нас! Новий тиждень уже почався — /contest",
+        )
+    ref_contest.setdefault("history", []).append({"week": week, "winners": winners})
+    ref_contest["history"] = ref_contest["history"][-10:]
+    request_save()
+    if ADMIN_ID:
+        lines = [f"{w[2]} — {admin_label(w[0])}: {w[1]} {_plural(w[1], 'друг', 'друзі', 'друзів')}" for w in winners] or ["Призерів немає (ніхто не набрав мінімум)."]
+        await safe_send(ADMIN_ID, f"🏆 Конкурс запрошень за {contest_week_range(week)} завершено:\n" + "\n".join(lines))
+
+
+async def contest_tick():
+    """Перехід на новий тиждень: підсумки минулого і чистий старт."""
+    if not _contest_can_write():
+        return
+    current = contest_week_key()
+    week = ref_contest.get("week")
+    if week == current:
+        return
+    if week:
+        await contest_finalize(week)
+    ref_contest["week"] = current
+    ref_contest["counts"] = {}
+    request_save()
+
+
+async def contest_loop():
+    while True:
+        try:
+            await contest_tick()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Конкурс запрошень: %s", e)
+        await asyncio.sleep(300)
+
+
+def contest_on_real_chat(user_id: int):
+    """Запрошений друг провів перший справжній чат — зараховуємо його тому, хто запросив."""
+    u = users_db.get(user_id)
+    if not u or u.get("ref_qualified") or not u.get("referred_by"):
+        return
+    u["ref_qualified"] = True
+    ref_id = u["referred_by"]
+    if ref_id not in users_db or ref_id in banned_users:
+        return
+    if ref_contest.get("week") != contest_week_key():
+        ref_contest["week"] = ref_contest.get("week") or contest_week_key()
+    entry = ref_contest.setdefault("counts", {}).setdefault(ref_id, [0, 0.0])
+    entry[0] += 1
+    entry[1] = time.time()
+    place = next((i for i, (uid, _n) in enumerate(contest_ranking(), 1) if uid == ref_id), None)
+    _notify_later(
+        ref_id,
+        f"🏆 Твій друг поспілкувався в першому чаті — <b>+1 у конкурсі запрошень</b>!\n"
+        f"Цього тижня: {entry[0]} · місце: {place}. Деталі: /contest",
+    )
+    request_save()
+
+
+def _ref_link(user_id: int) -> str:
+    return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}" if BOT_USERNAME else ""
+
+
+def contest_text(user_id: int) -> str:
+    week = ref_contest.get("week") or contest_week_key()
+    ranking = contest_ranking()
+    lines = [
+        f"🏆 <b>Конкурс запрошень</b> · {contest_week_range(week)}",
+        "",
+        "Запрошуй друзів за своїм посиланням. Друг зараховується, коли поспілкується "
+        "в першому чаті (від 1 хв).",
+        "",
+        "<b>Призи щонеділі опівночі:</b>",
+    ]
+    lines += [f"{medal} Premium на {days} днів" for medal, days in CONTEST_PRIZES]
+    lines.append(f"<i>Щоб потрапити в призери — мінімум {CONTEST_MIN_INVITES} друзі.</i>")
+    lines.append("")
+    if ranking:
+        lines.append("<b>Топ тижня:</b>")
+        medals = [m for m, _d in CONTEST_PRIZES]
+        for i, (uid, n) in enumerate(ranking[:CONTEST_TOP_SHOWN], 1):
+            mark = medals[i - 1] if i <= len(medals) else f"{i}."
+            you = " ← ти" if uid == user_id else ""
+            nick = esc(users_db.get(uid, {}).get("nickname", "Користувач"))
+            lines.append(f"{mark} {nick} — {n}{you}")
+    else:
+        lines.append("Цього тижня ще ніхто не запросив друзів — стань першим! 🚀")
+    mine = next(((i, n) for i, (uid, n) in enumerate(ranking, 1) if uid == user_id), None)
+    lines.append("")
+    if mine:
+        lines.append(f"📍 Ти: <b>{mine[1]}</b> {_plural(mine[1], 'друг', 'друзі', 'друзів')} · <b>{mine[0]}</b> місце")
+    else:
+        lines.append("📍 Ти поки не в рейтингу — надішли посилання другу!")
+    history = ref_contest.get("history") or []
+    if history and history[-1].get("winners"):
+        last = history[-1]
+        names = ", ".join(
+            f"{w[2].split()[0]} {esc(users_db.get(w[0], {}).get('nickname', '?'))}" for w in last["winners"]
+        )
+        lines.append(f"\n🎉 Переможці минулого тижня: {names}")
+    link = _ref_link(user_id)
+    if link:
+        lines.append(f"\n🔗 Твоє посилання:\n<code>{esc(link)}</code>")
+    return "\n".join(lines)
+
+
+def contest_keyboard(user_id: int):
+    link = _ref_link(user_id)
+    rows = []
+    if link:
+        share_text = "Заходь в ANONimchyk — анонімний чат для знайомств і розмов 🎭"
+        share = f"https://t.me/share/url?url={quote(link)}&text={quote(share_text)}"
+        rows.append([InlineKeyboardButton(text="📤 Надіслати другу", url=share)])
+    rows.append([InlineKeyboardButton(text="🔄 Оновити", callback_data="contest_open")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("contest"))
+async def contest_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    init_user(message.from_user.id)
+    await contest_tick()
+    await message.answer(contest_text(message.from_user.id), reply_markup=contest_keyboard(message.from_user.id))
+
+
+@dp.callback_query(F.data == "contest_open")
+async def contest_open(call: types.CallbackQuery):
+    init_user(call.from_user.id)
+    await contest_tick()
+    text, kb = contest_text(call.from_user.id), contest_keyboard(call.from_user.id)
+    if call.message.text and call.message.text.startswith("🏆 Конкурс запрошень"):
+        try:
+            await call.message.edit_text(text, reply_markup=kb)
+        except TelegramAPIError:
+            pass  # нічого не змінилось
+        await call.answer("Оновлено")
+        return
+    await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
 # Пересилання повідомлень (завжди останнім!)
 # ---------------------------------------------------------------------------
 @dp.message()
@@ -1728,6 +1935,7 @@ async def setup_bot_commands():
         types.BotCommand(command="interests", description="🧩 Пошук за інтересами"),
         types.BotCommand(command="myinterests", description="🧩 Мої інтереси в профілі"),
         types.BotCommand(command="tasks", description="📋 Щоденні завдання"),
+        types.BotCommand(command="contest", description="🏆 Конкурс запрошень"),
         types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
@@ -1758,6 +1966,7 @@ async def main():
     save_task = asyncio.create_task(persistence_loop())
     lease_task = asyncio.create_task(lease_heartbeat_loop())
     mono_task = asyncio.create_task(mono_poll_loop())
+    contest_task = asyncio.create_task(contest_loop())
     try:
         # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
         # Telegram API не вбивала весь процес (і "Application exited early" на Render).
@@ -1793,6 +2002,7 @@ async def main():
         save_task.cancel()
         lease_task.cancel()
         mono_task.cancel()
+        contest_task.cancel()
         await save_state_to_db()  # фінальне збереження при зупинці (деплой/перезапуск)
         await release_lease()  # тепер нова копія може забрати свіжі дані
         await bot.session.close()
