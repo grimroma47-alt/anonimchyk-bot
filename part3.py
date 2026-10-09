@@ -399,6 +399,8 @@ async def onboard_age(message: types.Message, state: FSMContext):
         return
     u = init_user(message.from_user.id)
     u["age"] = str(age)
+    prev_min = u.get("min_age_seen")
+    u["min_age_seen"] = age if prev_min is None else min(int(prev_min), age)
     request_save()
     await state.set_state(OnboardStates.country)
     rows = [
@@ -558,6 +560,7 @@ async def setup_bot_commands():
         types.BotCommand(command="friends", description="👫 Друзі"),
         types.BotCommand(command="online", description="👥 Хто зараз онлайн"),
         types.BotCommand(command="premium", description="💎 Premium"),
+        types.BotCommand(command="flirt", description="❤️ Флірт-пошук (18+)"),
         types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
