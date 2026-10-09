@@ -129,6 +129,7 @@ HOBBY_TOPICS = {
 INTEREST_LABELS = {**ROOM_TOPICS, **HOBBY_TOPICS}
 ROOM_CAPACITY = int(os.getenv("ROOM_CAPACITY", "8"))  # макс. учасників в одній кімнаті
 
+pending_rating: dict[int, int] = {}  # хто -> кого ще може оцінити після чату
 rooms: dict[str, dict] = {}  # room_id -> {"topic": ключ з ROOM_TOPICS, "members": set[int]}
 user_room: dict[int, str] = {}  # user_id -> room_id (в якій кімнаті зараз людина)
 room_counter = 0
@@ -687,6 +688,8 @@ def init_user(user_id: int) -> dict:
             "reports_received": 0,  # скільки скарг отримав (для автобану)
             "rating_up": 0,  # 👍 після чатів
             "rating_down": 0,  # 👎 після чатів
+            "low_warned": False,  # чи попереджали про низький рейтинг
+            "interests": set(),  # ключі з INTEREST_LABELS (до 3), для підбору співрозмовника
             "blacklist": set(),  # user_id, яких ця людина заблокувала особисто
             "filter_gender": None,  # бажана стать співрозмовника (None = будь-яка)
             "filter_age_ranges": set(),  # ключі з AGE_RANGES (порожньо = будь-який вік)
@@ -746,10 +749,27 @@ def is_blacklisted(a: dict, a_id: int, b: dict, b_id: int) -> bool:
     return b_id in (a.get("blacklist") or set()) or a_id in (b.get("blacklist") or set())
 
 
+RATING_MIN_VOTES = 5  # з якої кількості оцінок показуємо рейтинг
+LOW_RATING_MIN_VOTES = 8  # з якої кількості оцінок можна вважати рейтинг низьким
+LOW_RATING_PERCENT = 40  # нижче цього % 👍 — «низький рейтинг», такі рідше потрапляють до інших
+
+
+def rating_percent(u: dict) -> int | None:
+    up, down = u.get("rating_up", 0), u.get("rating_down", 0)
+    return round(up * 100 / (up + down)) if up + down else None
+
+
+def is_low_rated(u: dict) -> bool:
+    up, down = u.get("rating_up", 0), u.get("rating_down", 0)
+    return up + down >= LOW_RATING_MIN_VOTES and up * 100 < LOW_RATING_PERCENT * (up + down)
+
+
 def short_info(u: dict) -> str:
     badge = " 💎" if is_premium(u) else ""
     vip = " ⭐VIP" if has_perk(u, "vip_badge") else ""
-    return f"{esc(u['gender'])}, {esc(u['age'])}, {esc(u['country'])}{badge}{vip}"
+    pct = rating_percent(u)
+    rating = f" · 👍 {pct}%" if pct is not None and u.get("rating_up", 0) + u.get("rating_down", 0) >= RATING_MIN_VOTES else ""
+    return f"{esc(u['gender'])}, {esc(u['age'])}, {esc(u['country'])}{badge}{vip}{rating}"
 
 
 async def safe_send(chat_id: int, text: str, **kwargs) -> bool:
@@ -890,6 +910,7 @@ def get_post_chat_keyboard(partner_id: int):
 
 async def send_post_chat_menu(chat_id: int, partner_id: int):
     """Пропонує оцінити співрозмовника й за бажанням надіслати запит на реконект."""
+    pending_rating[chat_id] = partner_id  # оцінити можна лише останнього співрозмовника і лише раз
     await safe_send(
         chat_id,
         "Оціни співрозмовника, будь ласка:",
@@ -1449,13 +1470,20 @@ async def profile_handler(message: types.Message, state: FSMContext):
         f"• <b>Преміум:</b> {'Так 💎' if is_premium(u) else 'Ні ❌'}\n"
         f"• <b>VIP-значок:</b> {'Так ⭐' if has_perk(u, 'vip_badge') else 'Ні'}\n"
         f"• <b>Рівень:</b> {get_level_title(u)} ({u.get('total_chats', 0)} чатів)\n"
-        f"• <b>Серія входів:</b> {u.get('checkin_streak', 0)} 🔥\n\n"
+        f"• <b>Серія входів:</b> {u.get('checkin_streak', 0)} 🔥\n"
+        f"• <b>Рейтинг:</b> {rating_line(u)}\n"
+        f"• <b>Інтереси:</b> {interests_line(u)}\n\n"
         f"🏆 <b>Досягнення:</b> {achievements_text}\n\n"
         f"🎒 <b>Інвентар подарунків:</b> {gifts_text}\n\n"
         f"📜 <b>Архів останніх змін профілю:</b>\n{archive_text}\n\n"
         "Хочеш оновити дані? Введи /edit_profile"
     )
-    await message.answer(text)
+    await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🧩 Мої інтереси", callback_data="pi_open")]]
+        ),
+    )
 
 
 @dp.message(Command("edit_profile"))
