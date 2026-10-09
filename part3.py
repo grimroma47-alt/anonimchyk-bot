@@ -352,6 +352,8 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             await safe_send(partner_id, topic_note)
         if not mode.startswith("int:"):
             await send_interest_notes(user_id, u, partner_id, p)
+        await send_match_safety(user_id, u)
+        await send_match_safety(partner_id, p)
     else:
         if has_perk(u, "priority") or is_premium(u):
             queue.insert(0, user_id)
