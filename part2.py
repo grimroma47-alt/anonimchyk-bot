@@ -1192,6 +1192,7 @@ def premium_page():
         label = f"{title} — {price} грн" + (f" ({note})" if note else "")
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buy_{key}")])
     rows.append([InlineKeyboardButton(text="🎁 Отримати безкоштовно", callback_data="prem_free")])
+    rows.append([InlineKeyboardButton(text="🏆 Конкурс: Premium на 30 днів", callback_data="contest_open")])
     rows.append([InlineKeyboardButton(text="💳 Поповнити баланс", callback_data="topup_open")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
