@@ -111,6 +111,22 @@ ROOM_TOPICS = {
     "books": "📚 Книги",
     "pets": "🐾 Тварини",
 }
+# Друга вкладка пошуку за інтересами — захоплення (лише для пошуку 1-на-1)
+HOBBY_TOPICS = {
+    "cook": "🍳 Кулінарія",
+    "fitness": "💪 Фітнес",
+    "art": "🎨 Малювання",
+    "photo": "📸 Фото",
+    "instr": "🎸 Музичні інструменти",
+    "plants": "🌱 Рослини",
+    "cars": "🚗 Авто",
+    "yoga": "🧘 Йога та медитація",
+    "craft": "✂️ Рукоділля",
+    "fishing": "🎣 Риболовля",
+    "anime": "🍥 Аніме",
+    "dance": "💃 Танці",
+}
+INTEREST_LABELS = {**ROOM_TOPICS, **HOBBY_TOPICS}
 ROOM_CAPACITY = int(os.getenv("ROOM_CAPACITY", "8"))  # макс. учасників в одній кімнаті
 
 rooms: dict[str, dict] = {}  # room_id -> {"topic": ключ з ROOM_TOPICS, "members": set[int]}
@@ -333,6 +349,7 @@ BTN_TOPUP = "💳 Поповнити баланс"
 BTN_ONLINE = "👥 Онлайн"
 BTN_PREMIUM = "💎 Premium"
 BTN_FLIRT = "❤️ Флірт-пошук"
+BTN_INTERESTS = "🧩 За інтересами"
 BTN_ADD_FRIEND = "🤝 Додати в друзі"
 
 
@@ -387,14 +404,14 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_SEARCH)],
-            [KeyboardButton(text=BTN_FLIRT), KeyboardButton(text=BTN_ROOMS)],
+            [KeyboardButton(text=BTN_FLIRT), KeyboardButton(text=BTN_INTERESTS)],
             [KeyboardButton(text=BTN_TOPUP), KeyboardButton(text=BTN_WALLET)],
             [KeyboardButton(text=BTN_PREMIUM), KeyboardButton(text=BTN_SHOP)],
             [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_PROFILE)],
             [KeyboardButton(text=BTN_SETTINGS), KeyboardButton(text=BTN_FRIENDS)],
-            [KeyboardButton(text=BTN_FILTERS), KeyboardButton(text=BTN_ONLINE)],
-            [KeyboardButton(text=BTN_LOTTERY), KeyboardButton(text=BTN_TOP)],
-            [KeyboardButton(text=BTN_HELP)],
+            [KeyboardButton(text=BTN_ROOMS), KeyboardButton(text=BTN_FILTERS)],
+            [KeyboardButton(text=BTN_ONLINE), KeyboardButton(text=BTN_LOTTERY)],
+            [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )
@@ -1996,6 +2013,8 @@ async def change_nick_finish(message: types.Message, state: FSMContext):
     u["nickname"] = nick
     await state.clear()
     await message.answer(f"🎉 Нікнейм змінено на <b>{esc(nick)}</b> (списано {NICK_PRICE} грн).")
+
+
 
 
 # === КІНЕЦЬ part1.py ===
