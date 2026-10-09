@@ -427,12 +427,13 @@ async def online_stats(message: types.Message, state: FSMContext):
     online = max(online, 1)  # той, хто натиснув кнопку, точно онлайн
     in_chats = len(active_chats)
     searching = len(queue)
+    flirting = sum(1 for uid in queue if search_mode.get(uid) == "flirt")
     in_rooms = len(user_room)
     await message.answer(
         "👥 <b>Зараз у боті</b>\n\n"
         f"🟢 Онлайн: <b>{online}</b>\n"
         f"💬 Спілкуються в чатах: <b>{in_chats}</b>\n"
-        f"🔍 Шукають співрозмовника: <b>{searching}</b>\n"
+        f"🔍 Шукають співрозмовника: <b>{searching}</b> (з них ❤️ флірт: {flirting})\n"
         f"🏠 У кімнатах: <b>{in_rooms}</b>\n\n"
         f"<i>Онлайн — ті, хто був активний за останні {ONLINE_WINDOW // 60} хв.</i>"
     )
@@ -754,6 +755,59 @@ async def room_report_submit(call: types.CallbackQuery):
 # ---------------------------------------------------------------------------
 @dp.message(F.text == BTN_SEARCH)
 async def search_partner(message: types.Message, state: FSMContext):
+    await run_search(message, state, "normal")
+
+
+FLIRT_MIN_AGE = 18
+FLIRT_RULES = (
+    "❤️ <b>Флірт-чат</b>\n"
+    "• Повага і згода — понад усе. «Ні» означає «ні».\n"
+    "• Жодних інтимних фото без явної згоди співрозмовника.\n"
+    "• Не тиснемо і не просимо грошей чи контактів.\n"
+    f"• Порушують — тисни «{BTN_REPORT}»."
+)
+
+
+def min_age_ever(u: dict) -> int | None:
+    """Найменший вік, який будь-коли був у профілі (поточний, архів, онбординг)."""
+    ages = []
+    cur = get_age_int(u)
+    if cur is not None:
+        ages.append(cur)
+    if u.get("min_age_seen") is not None:
+        ages.append(int(u["min_age_seen"]))
+    for line in u.get("archive") or []:
+        m = re.search(r"Вік:\s*(\d+)", line)
+        if m:
+            ages.append(int(m.group(1)))
+    return min(ages) if ages else None
+
+
+def flirt_block_reason(u: dict) -> str | None:
+    """Чому людині не можна у флірт-пошук (або None — можна)."""
+    age = get_age_int(u)
+    if age is None or u.get("gender") not in ("Хлопець", "Дівчина"):
+        return "❤️ Щоб увімкнути флірт-пошук, вкажи у профілі стать і вік: /edit_profile"
+    if age < FLIRT_MIN_AGE:
+        return f"❤️ Флірт-пошук доступний лише з {FLIRT_MIN_AGE} років."
+    # Перевірку історії віку (min_age_ever) вимкнено за рішенням власника.
+    # Щоб увімкнути: якщо min_age_ever(u) < FLIRT_MIN_AGE — повертати відмову.
+    return None
+
+
+@dp.message(F.text == BTN_FLIRT)
+@dp.message(Command("flirt"))
+async def flirt_search(message: types.Message, state: FSMContext):
+    u = init_user(message.from_user.id)
+    reason = flirt_block_reason(u)
+    if reason and message.from_user.id not in banned_users:
+        await state.clear()
+        await message.answer(reason)
+        return
+    await run_search(message, state, "flirt")
+
+
+async def run_search(message: types.Message, state: FSMContext, mode: str = "normal"):
     await state.clear()
     user_id = message.from_user.id
 
@@ -776,6 +830,8 @@ async def search_partner(message: types.Message, state: FSMContext):
 
     match_index = None
     for i, candidate_id in enumerate(queue):
+        if search_mode.get(candidate_id, "normal") != mode:
+            continue  # флірт шукає лише флірт, звичайний — лише звичайний
         p_candidate = init_user(candidate_id)
         if is_blacklisted(u, user_id, p_candidate, candidate_id):
             continue
@@ -797,6 +853,7 @@ async def search_partner(message: types.Message, state: FSMContext):
             # співрозмовник заблокував бота — відкочуємо і ставимо користувача в чергу
             end_chat(user_id)
             queue.append(user_id)
+            search_mode[user_id] = mode
             await message.answer("Співрозмовник виявився недоступним. Шукаємо далі... ⏳")
             return
 
@@ -806,12 +863,20 @@ async def search_partner(message: types.Message, state: FSMContext):
         await message.answer(
             f"Партнера знайдено! 🤫\nІнфо: {short_info(p)}", reply_markup=get_chat_keyboard()
         )
+        if mode == "flirt":
+            await message.answer(FLIRT_RULES)
+            await safe_send(partner_id, FLIRT_RULES)
     else:
         if has_perk(u, "priority") or is_premium(u):
             queue.insert(0, user_id)
         else:
             queue.append(user_id)
-        await message.answer("Шукаємо співрозмовника... Зачекай ⏳")
+        search_mode[user_id] = mode
+        await message.answer(
+            "❤️ Шукаємо співрозмовника для флірту... Зачекай ⏳"
+            if mode == "flirt"
+            else "Шукаємо співрозмовника... Зачекай ⏳"
+        )
         await maybe_show_ad(user_id)
 
 
