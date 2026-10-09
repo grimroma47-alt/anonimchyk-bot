@@ -36,12 +36,13 @@ async def start_handler(message: types.Message, state: FSMContext):
                         f"У подарунок — {REFERRAL_PREMIUM_DAYS} днів Premium 💎",
                     )
 
-    await message.answer(
+    welcome = (
         f"Привіт, {esc(message.from_user.first_name)}! Вітаємо в анонімному чаті! 🤫\n\n"
         f"Твій унікальний номер: <b>{u['custom_id']}</b>\n"
-        "Змінити профіль можна будь-коли командою /edit_profile.",
-        reply_markup=get_main_keyboard(),
+        "Змінити профіль можна будь-коли: ⚙️ Налаштування → ✏️ Мій профіль."
     )
+    if not await send_banner(user_id, "start", caption=welcome, reply_markup=get_main_keyboard()):
+        await message.answer(welcome, reply_markup=get_main_keyboard())
     if not profile_complete(u):
         await start_onboarding(message.chat.id, state)
 
@@ -181,7 +182,7 @@ async def settings_handler(message: types.Message, state: FSMContext):
     )
     await message.answer(
         "⚙️ <b>Налаштування</b>\n\n"
-        "/edit_profile — змінити профіль\n"
+        "Натискай кнопки нижче — усе змінюється одразу.\n"
         "/cancel — скасувати поточну дію\n\n"
         "👥 <b>Запрошуй друзів і заробляй:</b>\n"
         f"За кожного друга, що запустить бота за твоїм посиланням — "
@@ -388,6 +389,8 @@ async def blacklist_add_in_chat(message: types.Message, state: FSMContext):
         reply_markup=get_main_keyboard(),
     )
     await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+    await auto_search_after_chat(user_id)
+    await auto_search_after_chat(partner_id)
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +689,7 @@ async def change_nick_finish(message: types.Message, state: FSMContext):
 @dp.message(F.text == BTN_SHOP)
 async def shop_handler(message: types.Message, state: FSMContext):
     await state.clear()
+    await send_banner(message.from_user.id, "shop")
     await message.answer(
         "🏪 <b>Магазин послуг та товарів</b>\n\nОберіть позицію для купівлі:",
         reply_markup=get_shop_keyboard(),
@@ -917,6 +921,7 @@ def _parse_topup_amount(raw: str) -> int | None:
 @dp.message(F.text == BTN_TOPUP)
 @dp.message(Command("topup"))
 async def topup_start(message: types.Message, state: FSMContext):
+    await send_banner(message.from_user.id, "topup")
     await topup_ask_amount(message, message.from_user.id, state)
 
 
@@ -1196,6 +1201,7 @@ def premium_page():
 async def premium_menu(message: types.Message, state: FSMContext):
     await state.clear()
     u = init_user(message.from_user.id)
+    await send_banner(message.from_user.id, "premium")
     text, kb = premium_page()
     text += f"{premium_status_text(u)}\n💰 Баланс: {u['balance']:.2f} грн\n\nОбери тариф:"
     await message.answer(text, reply_markup=kb)
