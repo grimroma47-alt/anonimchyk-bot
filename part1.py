@@ -8,6 +8,7 @@ import functools
 import random
 import re
 import time
+from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
 
 import aiohttp
@@ -81,6 +82,9 @@ chat_meta: dict[int, dict] = {}
 last_chat_mode: dict[int, str] = {}  # у якому режимі був останній чат (для автопошуку)
 # Банери-картинки для екранів: місце -> file_id фото в Telegram. Ставить адмін з телефона.
 banners: dict[str, str] = {}
+# Щотижневий конкурс запрошень: {"week": "2026-W41", "counts": {user_id: [кількість, час останнього]},
+# "awarded": [тижні, за які призи вже видано], "history": [{"week", "winners": [(user_id, n, приз)]}]}
+ref_contest: dict = {"week": None, "counts": {}, "awarded": [], "history": []}
 reports: list[dict] = []  # {"id", "from", "on", "time", "status"}
 report_counter = 0
 ads: list[dict] = []  # реклама в черзі пошуку: {"id","text","url","active","shows","created"}
@@ -593,6 +597,7 @@ def get_settings_keyboard(u: dict | None = None):
                 InlineKeyboardButton(text="🙈 Приватність", callback_data="set_privacy"),
                 InlineKeyboardButton(text="🔔 Сповіщення", callback_data="set_notify"),
             ],
+            [InlineKeyboardButton(text="🏆 Конкурс запрошень", callback_data="contest_open")],
             [InlineKeyboardButton(text="📋 Чорний список", callback_data="bl_view")],
             [
                 InlineKeyboardButton(
@@ -748,6 +753,7 @@ def init_user(user_id: int) -> dict:
             "notify_tasks": True,  # повідомлення про виконані завдання
             "notify_tips": True,  # підказки (напр. про фільтр за статтю)
             "allow_invites": True,  # приймати запрошення в чат від друзів/минулих співрозмовників
+            "ref_qualified": False,  # чи вже зарахований своєму запрошувачу в конкурсі (після першого чату)
             "blacklist": set(),  # user_id, яких ця людина заблокувала особисто
             "filter_gender": None,  # бажана стать співрозмовника (None = будь-яка)
             "filter_age_ranges": set(),  # ключі з AGE_RANGES (порожньо = будь-який вік)
@@ -1252,6 +1258,7 @@ def _make_snapshot() -> bytes:
             "ad_counter": ad_counter,
             "stats_days": stats_days,
             "banners": banners,
+            "ref_contest": ref_contest,
         },
         protocol=4,
     )
@@ -1287,6 +1294,8 @@ def _apply_snapshot(blob: bytes):
     stats_days.update(data.get("stats_days", {}))
     banners.clear()
     banners.update(data.get("banners", {}))
+    ref_contest.clear()
+    ref_contest.update(data.get("ref_contest") or {"week": None, "counts": {}, "awarded": [], "history": []})
 
     # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
     saved_counter = user_counter
@@ -1294,6 +1303,9 @@ def _apply_snapshot(blob: bytes):
     users_db.pop(-1, None)
     user_counter = saved_counter
     for u in users_db.values():
+        if "ref_qualified" not in u:
+            # ті, хто вже спілкувався до запуску конкурсу, не зараховуються в нього заднім числом
+            u["ref_qualified"] = bool(u.get("total_chats"))
         for key, value in template.items():
             if key not in u:
                 u[key] = copy.deepcopy(value)
