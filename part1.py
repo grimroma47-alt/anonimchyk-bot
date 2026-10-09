@@ -68,6 +68,7 @@ async def track_last_seen(handler, event, data):
 # ---------------------------------------------------------------------------
 users_db: dict[int, dict] = {}
 queue: list[int] = []
+search_mode: dict[int, str] = {}  # user_id у черзі -> "normal" або "flirt" (флірт шукає лише флірт)
 active_chats: dict[int, int] = {}
 user_counter = 1000
 
@@ -331,6 +332,7 @@ BTN_FRIENDS = "👫 Друзі"
 BTN_TOPUP = "💳 Поповнити баланс"
 BTN_ONLINE = "👥 Онлайн"
 BTN_PREMIUM = "💎 Premium"
+BTN_FLIRT = "❤️ Флірт-пошук"
 BTN_ADD_FRIEND = "🤝 Додати в друзі"
 
 
@@ -385,13 +387,14 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_SEARCH)],
+            [KeyboardButton(text=BTN_FLIRT), KeyboardButton(text=BTN_ROOMS)],
             [KeyboardButton(text=BTN_TOPUP), KeyboardButton(text=BTN_WALLET)],
             [KeyboardButton(text=BTN_PREMIUM), KeyboardButton(text=BTN_SHOP)],
             [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_PROFILE)],
             [KeyboardButton(text=BTN_SETTINGS), KeyboardButton(text=BTN_FRIENDS)],
-            [KeyboardButton(text=BTN_ROOMS), KeyboardButton(text=BTN_FILTERS)],
-            [KeyboardButton(text=BTN_ONLINE), KeyboardButton(text=BTN_LOTTERY)],
-            [KeyboardButton(text=BTN_TOP), KeyboardButton(text=BTN_HELP)],
+            [KeyboardButton(text=BTN_FILTERS), KeyboardButton(text=BTN_ONLINE)],
+            [KeyboardButton(text=BTN_LOTTERY), KeyboardButton(text=BTN_TOP)],
+            [KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )
