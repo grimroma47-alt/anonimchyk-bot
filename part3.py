@@ -326,6 +326,150 @@ async def mono_status(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
+# Онбординг новачків: стать → вік → країна за кілька натискань
+# (обробники стоять після кнопок меню — натискання меню має пріоритет)
+# ---------------------------------------------------------------------------
+class OnboardStates(StatesGroup):
+    age = State()
+    country = State()
+
+
+ONBOARD_COUNTRIES = [
+    ("ua", "🇺🇦 Україна", "Україна"),
+    ("pl", "🇵🇱 Польща", "Польща"),
+    ("de", "🇩🇪 Німеччина", "Німеччина"),
+    ("cz", "🇨🇿 Чехія", "Чехія"),
+]
+ONBOARD_AGE_REGEX = re.compile(r"^\s*(\d{1,3})\s*$")
+
+
+def profile_complete(u: dict) -> bool:
+    return all(u.get(k) not in (None, "", "Не вказано") for k in ("gender", "age", "country"))
+
+
+def _skip_row():
+    return [InlineKeyboardButton(text="⏭ Пропустити", callback_data="ob_skip")]
+
+
+async def start_onboarding(chat_id: int, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👨 Хлопець", callback_data="ob_g_m"),
+                InlineKeyboardButton(text="👩 Дівчина", callback_data="ob_g_f"),
+            ],
+            _skip_row(),
+        ]
+    )
+    await safe_send(
+        chat_id,
+        "👋 Налаштуймо профіль — це 3 кроки, ~10 секунд. Так ти знаходитимеш кращих співрозмовників.\n\n"
+        "<b>Крок 1/3.</b> Хто ти?",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.in_({"ob_g_m", "ob_g_f"}))
+async def onboard_gender(call: types.CallbackQuery, state: FSMContext):
+    u = init_user(call.from_user.id)
+    u["gender"] = "Хлопець" if call.data == "ob_g_m" else "Дівчина"
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await state.set_state(OnboardStates.age)
+    await call.message.answer(
+        f"✅ {u['gender']}\n\n<b>Крок 2/3.</b> Скільки тобі років? Напиши числом, наприклад <code>19</code>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_skip_row()]),
+    )
+    await call.answer()
+
+
+def _is_onboard_age_text(message: types.Message) -> bool:
+    return bool(message.text and ONBOARD_AGE_REGEX.match(message.text))
+
+
+@dp.message(OnboardStates.age, _is_onboard_age_text)
+async def onboard_age(message: types.Message, state: FSMContext):
+    age = int(ONBOARD_AGE_REGEX.match(message.text).group(1))
+    if not (10 <= age <= 99):
+        await message.answer("Вкажи вік числом від 10 до 99 (або натисни «Пропустити»).")
+        return
+    u = init_user(message.from_user.id)
+    u["age"] = str(age)
+    request_save()
+    await state.set_state(OnboardStates.country)
+    rows = [
+        [InlineKeyboardButton(text=ONBOARD_COUNTRIES[i][1], callback_data=f"ob_c_{ONBOARD_COUNTRIES[i][0]}"),
+         InlineKeyboardButton(text=ONBOARD_COUNTRIES[i + 1][1], callback_data=f"ob_c_{ONBOARD_COUNTRIES[i + 1][0]}")]
+        for i in range(0, len(ONBOARD_COUNTRIES) - 1, 2)
+    ]
+    rows.append([InlineKeyboardButton(text="🌍 Інша — напишу сам(а)", callback_data="ob_c_other")])
+    rows.append(_skip_row())
+    await message.answer(
+        f"✅ {age}\n\n<b>Крок 3/3.</b> Звідки ти?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+
+async def _finish_onboarding(chat_id: int, user_id: int, state: FSMContext):
+    await state.clear()
+    u = init_user(user_id)
+    request_save()
+    await safe_send(
+        chat_id,
+        f"🎉 Готово! Твій профіль: {short_info(u)}\n\n"
+        f"Тепер тисни «{BTN_SEARCH}» внизу — і знайомся! 🤫\n"
+        "Змінити дані можна будь-коли: /edit_profile",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("ob_c_"))
+async def onboard_country(call: types.CallbackQuery, state: FSMContext):
+    key = call.data[len("ob_c_"):]
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if key == "other":
+        await state.set_state(OnboardStates.country)
+        await call.message.answer(
+            "Напиши свою країну або місто:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[_skip_row()])
+        )
+        await call.answer()
+        return
+    country = next((name for k, _label, name in ONBOARD_COUNTRIES if k == key), None)
+    if country:
+        init_user(call.from_user.id)["country"] = country
+    await _finish_onboarding(call.message.chat.id, call.from_user.id, state)
+    await call.answer()
+
+
+@dp.message(OnboardStates.country, F.text)
+async def onboard_country_text(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if text.startswith("/"):
+        return
+    init_user(message.from_user.id)["country"] = text[:50]
+    await _finish_onboarding(message.chat.id, message.from_user.id, state)
+
+
+@dp.callback_query(F.data == "ob_skip")
+async def onboard_skip(call: types.CallbackQuery, state: FSMContext):
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await state.clear()
+    await call.message.answer(
+        "Добре! Заповнити профіль можна будь-коли: /edit_profile", reply_markup=get_main_keyboard()
+    )
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
 # Пересилання повідомлень (завжди останнім!)
 # ---------------------------------------------------------------------------
 @dp.message()
