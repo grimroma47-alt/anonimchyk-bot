@@ -35,12 +35,16 @@ async def buy_item(call: types.CallbackQuery, state: FSMContext):
 
     if u["balance"] < price:
         await call.message.answer(
-            f"❌ Недостатньо коштів. Ціна: {price} грн. Ваш баланс: {u['balance']:.2f} грн."
+            f"❌ Недостатньо коштів. Ціна: {price} грн. Ваш баланс: {u['balance']:.2f} грн.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="💳 Поповнити баланс", callback_data="topup_open")]]
+            ),
         )
         await call.answer()
         return
 
     u["balance"] -= price
+    request_save()
     now = time.time()
     if seconds is None:
         u["perks"][perk] = float("inf")
@@ -432,6 +436,94 @@ async def online_stats(message: types.Message, state: FSMContext):
         f"🏠 У кімнатах: <b>{in_rooms}</b>\n\n"
         f"<i>Онлайн — ті, хто був активний за останні {ONLINE_WINDOW // 60} хв.</i>"
     )
+
+
+# ---------------------------------------------------------------------------
+# Сторінка Premium: переваги, статус, тарифи зі знижкою, безкоштовно через друзів
+# ---------------------------------------------------------------------------
+PREMIUM_PLAN_KEYS = ["prem_1w", "prem_1m", "prem_3m", "prem_6m", "prem_1y", "prem_forever"]
+
+
+def premium_status_text(u: dict) -> str:
+    until = u.get("perks", {}).get("premium", 0)
+    if until == float("inf"):
+        return "✅ У тебе <b>безлімітний Premium</b> 💎"
+    if until > time.time():
+        days = int((until - time.time()) // DAY) + 1
+        return f"✅ Premium активний до <b>{time.strftime('%d.%m.%Y', time.gmtime(until))}</b> (ще ~{days} дн.)"
+    return "❌ Premium не активний"
+
+
+def premium_plans() -> list[tuple[str, str, int, str]]:
+    """(ключ, назва, ціна, примітка про вигоду) — на основі цін у SHOP."""
+    week = SHOP.get("prem_1w")
+    base_per_day = week[1] / 7 if week else None
+    plans = []
+    for key in PREMIUM_PLAN_KEYS:
+        item = SHOP.get(key)
+        if not item:
+            continue
+        title, price, _perk, seconds = item
+        note = ""
+        if seconds and base_per_day and key != "prem_1w":
+            per_day = price / (seconds / DAY)
+            saving = round((1 - per_day / base_per_day) * 100)
+            per_month = per_day * 30
+            if saving > 0:
+                note = f"−{saving}%" if seconds <= 31 * DAY else f"≈{per_month:.0f} грн/міс, −{saving}%"
+        plans.append((key, title.replace("Premium на ", "").replace("Безлімітний Premium (назавжди)", "Назавжди"), price, note))
+    return plans
+
+
+def premium_page():
+    lines = [
+        "💎 <b>Premium</b>\n",
+        "Що дає Premium:",
+        "🚀 <b>Пріоритет у пошуку</b> — ти першим у черзі",
+        "🎯 <b>Фільтри</b> — стать, вік і країна співрозмовника",
+        f"🚫 <b>Більший чорний список</b> — до {BLACKLIST_LIMIT_PLUS} замість {BLACKLIST_LIMIT_FREE}",
+        "🔒 <b>Захист медіа</b> — твої фото й повідомлення не можна переслати чи зберегти (/silent)",
+        "📣 <b>Без реклами</b> під час пошуку",
+        "💎 <b>Значок</b> у профілі й досягнення",
+        "",
+    ]
+    rows = []
+    for key, title, price, note in premium_plans():
+        label = f"{title} — {price} грн" + (f" ({note})" if note else "")
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"buy_{key}")])
+    rows.append([InlineKeyboardButton(text="🎁 Отримати безкоштовно", callback_data="prem_free")])
+    rows.append([InlineKeyboardButton(text="💳 Поповнити баланс", callback_data="topup_open")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(F.text == BTN_PREMIUM)
+@dp.message(Command("premium"))
+async def premium_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    text, kb = premium_page()
+    text += f"{premium_status_text(u)}\n💰 Баланс: {u['balance']:.2f} грн\n\nОбери тариф:"
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "prem_free")
+async def premium_free(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    link = (
+        f"https://t.me/{BOT_USERNAME}?start=ref_{call.from_user.id}"
+        if BOT_USERNAME
+        else "(посилання буде доступне трохи пізніше)"
+    )
+    done = u.get("referral_count", 0)
+    left = REFERRAL_PREMIUM_EVERY - (done % REFERRAL_PREMIUM_EVERY) if REFERRAL_PREMIUM_EVERY else 0
+    await call.message.answer(
+        "🎁 <b>Premium безкоштовно</b>\n\n"
+        f"Запроси {REFERRAL_PREMIUM_EVERY} друзів за своїм посиланням — отримаєш "
+        f"<b>{REFERRAL_PREMIUM_DAYS} днів Premium</b>. А за кожного друга ще й +{REFERRAL_BONUS:.0f} грн на баланс.\n\n"
+        f"Твоє посилання:\n<code>{esc(link)}</code>\n\n"
+        f"Запрошено: {done}. До наступного Premium: {left}."
+    )
+    await call.answer()
 
 
 # ---------------------------------------------------------------------------
