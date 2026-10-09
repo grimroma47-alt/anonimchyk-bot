@@ -326,6 +326,66 @@ async def mono_status(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
+# Підказка про фільтр за статтю: якщо безкоштовний юзер довго чекає у звичайному пошуку
+# ---------------------------------------------------------------------------
+FILTER_NUDGE_DELAY = int(os.getenv("FILTER_NUDGE_DELAY", "40"))  # секунд очікування
+FILTER_NUDGE_COOLDOWN = 24 * 3600  # не частіше разу на добу
+filter_nudge_last: dict[int, float] = {}
+
+
+def schedule_filter_nudge(user_id: int):
+    u = init_user(user_id)
+    if filter_active(u, "gender_filter"):
+        return
+    if time.time() - filter_nudge_last.get(user_id, 0) < FILTER_NUDGE_COOLDOWN:
+        return
+    asyncio.create_task(filter_nudge_after_wait(user_id))
+
+
+async def filter_nudge_after_wait(user_id: int):
+    try:
+        await asyncio.sleep(FILTER_NUDGE_DELAY)
+        u = init_user(user_id)
+        if user_id not in queue or search_mode.get(user_id, "normal") != "normal":
+            return  # уже знайшов співрозмовника або вийшов з пошуку
+        if filter_active(u, "gender_filter"):
+            return
+        if time.time() - filter_nudge_last.get(user_id, 0) < FILTER_NUDGE_COOLDOWN:
+            return
+        filter_nudge_last[user_id] = time.time()
+        if u.get("gender") == "Хлопець":
+            ask = "Хочеш спілкуватися лише з дівчатами? 👧"
+        elif u.get("gender") == "Дівчина":
+            ask = "Хочеш спілкуватися лише з хлопцями? 👦"
+        else:
+            ask = "Хочеш обирати стать співрозмовника? 👫"
+        price = SHOP["gender_filter"][1]
+        await safe_send(
+            user_id,
+            f"{ask}\n\n🎯 <b>Фільтр за статтю</b> — і бот з'єднуватиме лише з тими, кого ти обереш.\n"
+            f"Він входить у 💎 Premium або купується окремо — {price} грн на тиждень.\n\n"
+            "<i>Пошук триває, можеш просто чекати далі ⏳</i>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="💎 Premium", callback_data="prem_open")],
+                    [InlineKeyboardButton(text=f"🎯 Фільтр на тиждень — {price} грн", callback_data="buy_gender_filter")],
+                ]
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — підказка ніколи не має ламати пошук
+        logging.warning("Підказка про фільтр не надіслана: %s", e)
+
+
+@dp.callback_query(F.data == "prem_open")
+async def prem_open(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    text, kb = premium_page()
+    text += f"{premium_status_text(u)}\n💰 Баланс: {u['balance']:.2f} грн\n\nОбери тариф:"
+    await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
 # Пошук за інтересами 1-на-1: з'єднуємо лише людей з однаковою темою
 # ---------------------------------------------------------------------------
 def interests_keyboard(tab: str = "main"):
