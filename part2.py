@@ -807,9 +807,9 @@ async def flirt_search(message: types.Message, state: FSMContext):
     await run_search(message, state, "flirt")
 
 
-async def run_search(message: types.Message, state: FSMContext, mode: str = "normal"):
+async def run_search(message: types.Message, state: FSMContext, mode: str = "normal", user_id: int | None = None):
     await state.clear()
-    user_id = message.from_user.id
+    user_id = user_id or message.from_user.id
 
     if user_id in banned_users:
         ban_text, ban_kb = banned_notice(user_id)
@@ -866,17 +866,26 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
         if mode == "flirt":
             await message.answer(FLIRT_RULES)
             await safe_send(partner_id, FLIRT_RULES)
+        elif mode.startswith("int:"):
+            topic_note = f"🧩 Ваша спільна тема: <b>{INTEREST_LABELS.get(mode[4:], mode[4:])}</b> — є з чого почати 😉"
+            await message.answer(topic_note)
+            await safe_send(partner_id, topic_note)
     else:
         if has_perk(u, "priority") or is_premium(u):
             queue.insert(0, user_id)
         else:
             queue.append(user_id)
         search_mode[user_id] = mode
-        await message.answer(
-            "❤️ Шукаємо співрозмовника для флірту... Зачекай ⏳"
-            if mode == "flirt"
-            else "Шукаємо співрозмовника... Зачекай ⏳"
-        )
+        if mode == "flirt":
+            wait_text = "❤️ Шукаємо співрозмовника для флірту... Зачекай ⏳"
+        elif mode.startswith("int:"):
+            wait_text = (
+                f"🧩 Шукаємо співрозмовника за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}... Зачекай ⏳\n"
+                f"Якщо довго нікого немає — натисни «{BTN_STOP}» і спробуй звичайний пошук."
+            )
+        else:
+            wait_text = "Шукаємо співрозмовника... Зачекай ⏳"
+        await message.answer(wait_text)
         await maybe_show_ad(user_id)
 
 
@@ -2114,6 +2123,8 @@ async def friend_reply(message: types.Message):
         await message.answer(f"❌ {err}")
     else:
         await message.answer("✅ Надіслано другу.")
+
+
 
 
 # === КІНЕЦЬ part2.py ===
