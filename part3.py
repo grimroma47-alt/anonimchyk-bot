@@ -326,6 +326,142 @@ async def mono_status(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
+# Рейтинг і інтереси профілю: кого кому підбирати першим
+# ---------------------------------------------------------------------------
+MAX_PROFILE_INTERESTS = 3
+MATCH_SCORE_MAX = 3  # 2 — однаковий «рівень» рейтингу, +1 — є спільний інтерес
+
+
+def match_score(u: dict, p: dict, mode: str) -> int:
+    """Чим більше балів, тим краща пара. Люди з низьким рейтингом спершу потрапляють одне до одного."""
+    score = 2 if is_low_rated(u) == is_low_rated(p) else 0
+    if not mode.startswith("int:") and (u.get("interests") or set()) & (p.get("interests") or set()):
+        score += 1
+    return score
+
+
+def rating_line(u: dict) -> str:
+    up, down = u.get("rating_up", 0), u.get("rating_down", 0)
+    if not up + down:
+        return "ще немає оцінок"
+    return f"👍 {up} · 👎 {down} ({rating_percent(u)}%)"
+
+
+def interests_line(u: dict) -> str:
+    keys = [k for k in INTEREST_LABELS if k in (u.get("interests") or set())]
+    return ", ".join(INTEREST_LABELS[k] for k in keys) if keys else "не обрано"
+
+
+async def send_interest_notes(user_id: int, u: dict, partner_id: int, p: dict):
+    common = [k for k in INTEREST_LABELS if k in (u.get("interests") or set()) & (p.get("interests") or set())]
+    if common:
+        note = "🧩 Спільні інтереси: <b>" + ", ".join(INTEREST_LABELS[k] for k in common) + "</b> — є з чого почати 😉"
+        await safe_send(user_id, note)
+        await safe_send(partner_id, note)
+        return
+    for me, other in ((user_id, p), (partner_id, u)):
+        if other.get("interests"):
+            await safe_send(me, f"🧩 Інтереси співрозмовника: {interests_line(other)}")
+
+
+async def maybe_warn_low_rating(user_id: int, u: dict):
+    if is_low_rated(u) and not u.get("low_warned"):
+        u["low_warned"] = True
+        await safe_send(
+            user_id,
+            "⚠️ Співрозмовники часто ставлять тобі 👎.\n"
+            "Через це бот рідше підбирає тебе іншим. Будь привітнішим — "
+            "і рейтинг підросте, а з ним і кількість цікавих чатів 🙂",
+        )
+    elif not is_low_rated(u) and u.get("low_warned"):
+        u["low_warned"] = False
+
+
+def profile_interests_keyboard(u: dict, tab: str = "main"):
+    chosen = u.get("interests") or set()
+    topics = HOBBY_TOPICS if tab == "hobby" else ROOM_TOPICS
+    buttons = [
+        InlineKeyboardButton(text=("✅ " if k in chosen else "") + label, callback_data=f"pi_t_{tab}_{k}")
+        for k, label in topics.items()
+    ]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    tabs = [
+        InlineKeyboardButton(text=("• " if tab != "hobby" else "") + "🧩 Інтереси", callback_data="pi_tab_main"),
+        InlineKeyboardButton(text=("• " if tab == "hobby" else "") + "🎯 Захоплення", callback_data="pi_tab_hobby"),
+    ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[tabs] + rows + [[InlineKeyboardButton(text="✅ Готово", callback_data="pi_done")]]
+    )
+
+
+def profile_interests_text(u: dict) -> str:
+    return (
+        f"🧩 <b>Мої інтереси</b> (до {MAX_PROFILE_INTERESTS})\n\n"
+        f"Обрано: {interests_line(u)}\n\n"
+        "Бот спершу шукатиме співрозмовників зі спільними інтересами, "
+        "а після з'єднання покаже, про що вам цікаво поговорити."
+    )
+
+
+@dp.message(Command("myinterests"))
+async def my_interests_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    await message.answer(profile_interests_text(u), reply_markup=profile_interests_keyboard(u))
+
+
+@dp.callback_query(F.data == "pi_open")
+async def my_interests_open(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    await call.message.answer(profile_interests_text(u), reply_markup=profile_interests_keyboard(u))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pi_tab_"))
+async def my_interests_tab(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    tab = "hobby" if call.data == "pi_tab_hobby" else "main"
+    try:
+        await call.message.edit_reply_markup(reply_markup=profile_interests_keyboard(u, tab))
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pi_t_"))
+async def my_interests_toggle(call: types.CallbackQuery):
+    tab, _, key = call.data[len("pi_t_"):].partition("_")
+    if key not in INTEREST_LABELS:
+        await call.answer("Невідома тема", show_alert=True)
+        return
+    u = init_user(call.from_user.id)
+    chosen = u.setdefault("interests", set())
+    if key in chosen:
+        chosen.discard(key)
+    elif len(chosen) >= MAX_PROFILE_INTERESTS:
+        await call.answer(f"Можна обрати до {MAX_PROFILE_INTERESTS}. Спершу зніми якийсь ✅", show_alert=True)
+        return
+    else:
+        chosen.add(key)
+    request_save()
+    try:
+        await call.message.edit_text(profile_interests_text(u), reply_markup=profile_interests_keyboard(u, tab))
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+@dp.callback_query(F.data == "pi_done")
+async def my_interests_done(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    try:
+        await call.message.edit_text(f"✅ Твої інтереси: {interests_line(u)}\n\nЗмінити: /myinterests")
+    except TelegramAPIError:
+        pass
+    await call.answer("Збережено")
+
+
+# ---------------------------------------------------------------------------
 # Підказка про фільтр за статтю: якщо безкоштовний юзер довго чекає у звичайному пошуку
 # ---------------------------------------------------------------------------
 FILTER_NUDGE_DELAY = int(os.getenv("FILTER_NUDGE_DELAY", "40"))  # секунд очікування
@@ -555,6 +691,13 @@ async def _finish_onboarding(chat_id: int, user_id: int, state: FSMContext):
         "Змінити дані можна будь-коли: /edit_profile",
         reply_markup=get_main_keyboard(),
     )
+    await safe_send(
+        chat_id,
+        "🧩 Хочеш, щоб бот підбирав співрозмовників зі спільними інтересами? Обери до 3 тем:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🧩 Обрати інтереси", callback_data="pi_open")]]
+        ),
+    )
 
 
 @dp.callback_query(F.data.startswith("ob_c_"))
@@ -691,6 +834,7 @@ async def setup_bot_commands():
         types.BotCommand(command="premium", description="💎 Premium"),
         types.BotCommand(command="flirt", description="❤️ Флірт-пошук (18+)"),
         types.BotCommand(command="interests", description="🧩 Пошук за інтересами"),
+        types.BotCommand(command="myinterests", description="🧩 Мої інтереси в профілі"),
         types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
