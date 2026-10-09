@@ -53,6 +53,10 @@ async def buy_item(call: types.CallbackQuery, state: FSMContext):
         u["perks"][perk] = start + seconds
 
     await call.message.answer(f"🎉 Куплено: <b>{esc(title)}</b>. Списано {price} грн.")
+    if key == "gender_filter":
+        await call.message.answer(
+            "👫 Яку стать співрозмовника шукати?", reply_markup=get_filter_gender_keyboard(u)
+        )
     await call.answer()
 
 
@@ -428,12 +432,16 @@ async def online_stats(message: types.Message, state: FSMContext):
     in_chats = len(active_chats)
     searching = len(queue)
     flirting = sum(1 for uid in queue if search_mode.get(uid) == "flirt")
+    flirt_boys = sum(
+        1 for uid in queue if search_mode.get(uid) == "flirt" and users_db.get(uid, {}).get("gender") == "Хлопець"
+    )
+    flirt_note = f"{flirting} (👦 {flirt_boys} · 👧 {flirting - flirt_boys})" if flirting else "0"
     in_rooms = len(user_room)
     await message.answer(
         "👥 <b>Зараз у боті</b>\n\n"
         f"🟢 Онлайн: <b>{online}</b>\n"
         f"💬 Спілкуються в чатах: <b>{in_chats}</b>\n"
-        f"🔍 Шукають співрозмовника: <b>{searching}</b> (з них ❤️ флірт: {flirting})\n"
+        f"🔍 Шукають співрозмовника: <b>{searching}</b> (з них ❤️ флірт: {flirt_note})\n"
         f"🏠 У кімнатах: <b>{in_rooms}</b>\n\n"
         f"<i>Онлайн — ті, хто був активний за останні {ONLINE_WINDOW // 60} хв.</i>"
     )
@@ -835,6 +843,8 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
         p_candidate = init_user(candidate_id)
         if is_blacklisted(u, user_id, p_candidate, candidate_id):
             continue
+        if mode == "flirt" and p_candidate.get("gender") == u.get("gender"):
+            continue  # у флірті з'єднуємо лише хлопця з дівчиною
         if not passes_filters(u, p_candidate) or not passes_filters(p_candidate, u):
             continue
         match_index = i
@@ -877,7 +887,8 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             queue.append(user_id)
         search_mode[user_id] = mode
         if mode == "flirt":
-            wait_text = "❤️ Шукаємо співрозмовника для флірту... Зачекай ⏳"
+            looking_for = "дівчину" if u.get("gender") == "Хлопець" else "хлопця"
+            wait_text = f"❤️ Шукаємо {looking_for} для флірту... Зачекай ⏳"
         elif mode.startswith("int:"):
             wait_text = (
                 f"🧩 Шукаємо співрозмовника за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}... Зачекай ⏳\n"
@@ -885,6 +896,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             )
         else:
             wait_text = "Шукаємо співрозмовника... Зачекай ⏳"
+            schedule_filter_nudge(user_id)
         await message.answer(wait_text)
         await maybe_show_ad(user_id)
 
