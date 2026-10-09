@@ -69,6 +69,48 @@ def find_payment_code(comment: str) -> str | None:
     return f"P{m.group(1)}" if m else None
 
 
+MONO_MATCH_WINDOW = 30 * 60  # оплата без коду: шукаємо заявку з тією ж сумою за останні 30 хв
+# Надходження без коду, які чекають вибору адміна (лише в пам'яті): ключ -> {"paid", "comment"}
+mono_unmatched: dict[str, dict] = {}
+_mono_unmatched_seq = [0]
+
+
+def _amount_candidates(paid, item_time: float) -> list[str]:
+    """Неоплачені заявки з точно такою ж сумою, створені незадовго до оплати."""
+    found = []
+    for code, p in manual_payments.items():
+        if p.get("status") != "pending" or not p.get("ts"):
+            continue
+        if abs(float(p["amount"]) - float(paid)) >= 0.01:
+            continue
+        if p["ts"] - 120 <= item_time <= p["ts"] + MONO_MATCH_WINDOW:
+            found.append(code)
+    return found
+
+
+def _recent_pending(item_time: float, limit: int = 5) -> list[str]:
+    recent = [
+        (p["ts"], code)
+        for code, p in manual_payments.items()
+        if p.get("status") == "pending" and p.get("ts") and 0 <= item_time - p["ts"] + 120 <= 86400
+    ]
+    return [code for _ts, code in sorted(recent, reverse=True)[:limit]]
+
+
+async def _credit_jar_payment(code: str, paid, how: str) -> str:
+    p = manual_payments[code]
+    expected = p["amount"]
+    if abs(float(paid) - float(expected)) >= 0.01:
+        p["expected_amount"] = expected
+        p["amount"] = paid  # зараховуємо фактично отриману суму
+    p["method"] = "jar"
+    result = await _resolve_payment(code, True)
+    if ADMIN_ID:
+        note = "" if abs(float(paid) - float(expected)) < 0.01 else f" (очікувалось {expected} грн)"
+        await safe_send(ADMIN_ID, f"🤖 {how}{note}:\n{result}")
+    return result
+
+
 async def process_jar_statement(items: list[dict]) -> int:
     """Обробляє операції з виписки Банки. Повертає, скільки платежів зараховано."""
     credited = 0
@@ -85,33 +127,87 @@ async def process_jar_statement(items: list[dict]) -> int:
         paid = round(amount_kop / 100, 2)
         if float(paid).is_integer():
             paid = int(paid)
+        item_time = float(item.get("time") or time.time())
         comment = item.get("comment") or ""
+
+        # 1) код у коментарі
         code = find_payment_code(comment)
         p = manual_payments.get(code) if code else None
-        if p is None or p.get("status") != "pending":
-            if ADMIN_ID:
-                await safe_send(
-                    ADMIN_ID,
-                    f"🫙 Надходження в Банку без відомого коду: <b>{paid:g} грн</b>\n"
-                    f"Коментар: «{esc(comment) or '—'}»\n"
-                    "Якщо це оплата від користувача — зарахуй вручну (/addbalance або /confirm).",
-                )
+        if p is not None and p.get("status") == "pending":
+            await _credit_jar_payment(code, paid, "Автоматично через Банку")
+            credited += 1
             continue
-        expected = p["amount"]
-        if abs(paid - expected) >= 0.01:
-            p["expected_amount"] = expected
-            p["amount"] = paid  # зараховуємо фактично отриману суму
-        p["method"] = "jar"
-        result = await _resolve_payment(code, True)
-        credited += 1
-        if ADMIN_ID:
-            note = "" if abs(paid - expected) < 0.01 else f" (очікувалось {expected} грн)"
-            await safe_send(ADMIN_ID, f"🤖 Автоматично через Банку{note}:\n{result}")
+
+        # 2) коду немає — шукаємо заявку з тією ж сумою
+        candidates = _amount_candidates(paid, item_time)
+        if len(candidates) == 1:
+            await _credit_jar_payment(candidates[0], paid, "Зараховано за сумою (у коментарі не було коду)")
+            credited += 1
+            continue
+
+        # 3) кілька або жодної — питаємо адміна кнопками
+        if not ADMIN_ID:
+            continue
+        options = candidates or _recent_pending(item_time)
+        text = (
+            f"🫙 Надходження в Банку без коду: <b>{paid:g} грн</b>\n"
+            f"Коментар: «{esc(comment) or '—'}»\n"
+        )
+        kb = None
+        if options:
+            _mono_unmatched_seq[0] += 1
+            key = str(_mono_unmatched_seq[0])
+            mono_unmatched[key] = {"paid": paid, "comment": comment}
+            text += (
+                "Кілька заявок з такою сумою — обери, кому зарахувати:"
+                if candidates
+                else "Заявки з такою сумою немає. Ось останні неоплачені — обери, кому зарахувати:"
+            )
+            rows = []
+            for c in options:
+                cp = manual_payments[c]
+                cu = users_db.get(cp["user_id"]) or {}
+                label = f"✅ {c}: {cu.get('nickname', cp['user_id'])} ({cu.get('custom_id', '?')}), заявка {cp['amount']} грн"
+                rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"jp_{key}_{c}")])
+            kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        else:
+            text += "Неоплачених заявок немає. Якщо це оплата від користувача — зарахуй вручну (/addbalance)."
+        await safe_send(ADMIN_ID, text, reply_markup=kb)
     if len(mono_seen_ids) > MONO_SEEN_LIMIT:
         del mono_seen_ids[: len(mono_seen_ids) - MONO_SEEN_LIMIT]
     if changed:
         request_save()
     return credited
+
+
+@dp.callback_query(F.data.startswith("jp_"))
+async def jar_pick(call: types.CallbackQuery):
+    """Адмін вибрав, кому зарахувати надходження без коду."""
+    if not _is_admin(call.from_user.id):
+        await call.answer("Доступ заборонено", show_alert=True)
+        return
+    try:
+        _prefix, key, code = call.data.split("_", 2)
+    except ValueError:
+        await call.answer()
+        return
+    entry = mono_unmatched.get(key)
+    if entry is None:
+        await call.answer(
+            "Це надходження вже оброблено або бот перезапускався. Зарахуй вручну: /addbalance", show_alert=True
+        )
+        return
+    p = manual_payments.get(code)
+    if p is None or p.get("status") != "pending":
+        await call.answer("Ця заявка вже оброблена. Обери іншу.", show_alert=True)
+        return
+    mono_unmatched.pop(key, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await _credit_jar_payment(code, entry["paid"], "Зараховано вручну з Банки")
+    await call.answer("Зараховано ✅")
 
 
 async def mono_poll_once():
