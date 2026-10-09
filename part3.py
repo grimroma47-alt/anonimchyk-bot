@@ -10,6 +10,7 @@ def get_lottery_keyboard():
 @dp.message(F.text == BTN_LOTTERY)
 async def lottery_menu(message: types.Message, state: FSMContext):
     await state.clear()
+    await send_banner(message.from_user.id, "lottery")
     u = init_user(message.from_user.id)
     await message.answer(
         "🎰 <b>Рулетка</b>\n\n"
@@ -392,6 +393,8 @@ async def stop_chat(message: types.Message, state: FSMContext):
     await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
     await send_post_chat_menu(user_id, partner_id)
     await send_post_chat_menu(partner_id, user_id)
+    await auto_search_after_chat(user_id)
+    await auto_search_after_chat(partner_id)
 
 
 @dp.callback_query(F.data.startswith("rate_up_"))
@@ -449,6 +452,8 @@ async def try_send_chat_invite(requester_id: int, target_id: int | None) -> str:
     p = init_user(target_id)
     if is_blacklisted(u, requester_id, p, target_id):
         return "Недоступно."
+    if not p.get("allow_invites", True):
+        return "Ця людина зараз не приймає запрошень у чат."
 
     reconnect_requests[target_id] = requester_id
     kb = InlineKeyboardMarkup(
@@ -808,6 +813,8 @@ async def report_handler(message: types.Message):
         "🚨 Скаргу надіслано, чат завершено. Дякуємо!", reply_markup=get_main_keyboard()
     )
     await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+    await auto_search_after_chat(user_id)
+    await auto_search_after_chat(partner_id)
 
 
 # ---------------------------------------------------------------------------
