@@ -39,7 +39,8 @@ async def start_handler(message: types.Message, state: FSMContext):
     welcome = (
         f"Привіт, {esc(message.from_user.first_name)}! Вітаємо в анонімному чаті! 🤫\n\n"
         f"Твій унікальний номер: <b>{u['custom_id']}</b>\n"
-        "Змінити профіль можна будь-коли: ⚙️ Налаштування → ✏️ Мій профіль."
+        "Змінити профіль можна будь-коли: ⚙️ Налаштування → ✏️ Мій профіль.\n\n"
+        "📜 Користуючись ботом, ти погоджуєшся з правилами: /rules"
     )
     if not await send_banner(user_id, "start", caption=welcome, reply_markup=get_main_keyboard()):
         await message.answer(welcome, reply_markup=get_main_keyboard())
@@ -166,6 +167,7 @@ async def process_country(message: types.Message, state: FSMContext):
     await state.clear()
     kb = get_chat_keyboard() if message.from_user.id in active_chats else get_main_keyboard()
     await message.answer("✅ Профіль оновлено! Попередні дані збережено в архів.", reply_markup=kb)
+    await maybe_send_safety_memo(message.from_user.id, u)
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +423,7 @@ async def help_faq(call: types.CallbackQuery):
         "• <b>Як поскаржитись на співрозмовника?</b> — кнопка «🚨 Поскаржитися» під час чату.\n"
         "• <b>Що дає Premium?</b> — фільтри пошуку, пріоритет у черзі, VIP-значок (дивись 🏪 Магазин).\n"
         "• <b>Як запросити в друзі?</b> — кнопка «🤝 Додати в друзі» під час чату, за взаємною згодою.\n\n"
+        "• <b>Правила й безпека</b> — /rules та /safety. Питання щодо оплат — /paysupport.\n\n"
         "Не знайшов відповіді? Тисни «💬 Написати адміну»."
     )
     await call.answer()
