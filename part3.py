@@ -413,6 +413,7 @@ async def setup_bot_commands():
         types.BotCommand(command="help", description="🆘 Допомога / зв'язок з адміном"),
         types.BotCommand(command="friends", description="👫 Друзі"),
         types.BotCommand(command="online", description="👥 Хто зараз онлайн"),
+        types.BotCommand(command="premium", description="💎 Premium"),
         types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
