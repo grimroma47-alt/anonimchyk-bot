@@ -11,6 +11,7 @@ async def start_handler(message: types.Message, state: FSMContext):
     # Реферальне посилання: /start ref_<id>
     if is_new_user:
         parts = (message.text or "").split(maxsplit=1)
+        u["source"] = source_from_start(parts[1] if len(parts) == 2 else "")
         if len(parts) == 2 and parts[1].startswith("ref_"):
             try:
                 referrer_id = int(parts[1][len("ref_"):])
