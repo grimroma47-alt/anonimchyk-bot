@@ -373,6 +373,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             schedule_filter_nudge(user_id)
         await message.answer(wait_text)
         await maybe_show_ad(user_id)
+        schedule_wait_ping(user_id, mode)
 
 
 @dp.message(F.text == BTN_STOP)
@@ -1086,6 +1087,7 @@ def admin_stats_text(period: str) -> str:
         f"💬 Чатів: <b>{t['chats']}</b> (справжніх від 1 хв: {t['real_chats']})",
         f"     ❤️ флірт {t['flirt']} · 🧩 інтереси {t['interest']} · 👫 друзі {t['friends']}",
         f"✉️ Повідомлень: {t['msgs']}",
+        f"👋 Покликано «хтось шукає»: {t.get('wait_pings', 0)}",
         "",
         f"💰 Поповнення: <b>{_money(topup_total)} грн</b> ({t['topup_n']} {_plural(t['topup_n'], 'оплата', 'оплати', 'оплат')})",
     ]
@@ -1127,9 +1129,100 @@ def admin_stats_keyboard(period: str):
         InlineKeyboardButton(text=("• " if key == period else "") + label, callback_data=f"adm_st_{key}")
         for key, (label, _c, _s) in STATS_PERIODS.items()
     ]
+    _title, count, skip = STATS_PERIODS.get(period, STATS_PERIODS["today"])
+    new_n = _sum_stats(_days_back(count, skip))["new"]
     return InlineKeyboardMarkup(
-        inline_keyboard=[row[:2], row[2:], [InlineKeyboardButton(text="🔄 Оновити", callback_data=f"adm_st_{period}")]]
+        inline_keyboard=[
+            row[:2],
+            row[2:],
+            [InlineKeyboardButton(text=f"🆕 Нові учасники ({new_n}) →", callback_data=f"adm_new_{period}_0")],
+            [InlineKeyboardButton(text="🔄 Оновити", callback_data=f"adm_st_{period}")],
+        ]
     )
+
+
+NEW_LIST_PER_PAGE = 10
+
+
+def new_users_for_period(period: str) -> list[int]:
+    """Новачки за період, найновіші зверху (без дублів і видалених)."""
+    _title, count, skip = STATS_PERIODS.get(period, STATS_PERIODS["today"])
+    ids = []
+    for day in _days_back(count, skip):
+        ids += list(stats_days.get(day, {}).get("new_ids", []))
+    seen, result = set(), []
+    for uid in ids:
+        if uid in users_db and uid not in seen:
+            seen.add(uid)
+            result.append(uid)
+    result.sort(key=lambda x: users_db[x].get("joined_at") or 0, reverse=True)
+    return result
+
+
+def new_user_line(n: int, uid: int) -> str:
+    u = users_db[uid]
+    if u.get("tg_username"):
+        who = f"@{esc(u['tg_username'])}"
+    else:
+        who = f'<a href="tg://user?id={uid}">{esc(u.get("tg_name") or "профіль")}</a>'
+    if u.get("tg_username") and u.get("tg_name"):
+        who += f" ({esc(u['tg_name'])})"
+    when = ""
+    if u.get("joined_at"):
+        when = datetime.fromtimestamp(u["joined_at"], KYIV_TZ).strftime("%d.%m %H:%M")
+    profile = ", ".join(
+        str(v) for v in (u.get("gender"), u.get("age"), u.get("country")) if v and v != "Не вказано"
+    ) or "профіль не заповнений"
+    extra = [f"💬 чатів: {u.get('total_chats', 0)}"]
+    if is_premium(u):
+        extra.append("💎")
+    if uid in banned_users:
+        extra.append("⛔ бан")
+    ref = u.get("referred_by")
+    if ref and ref in users_db:
+        extra.append(f"🤝 запросив {esc(users_db[ref].get('custom_id', ref))}")
+    head = f"{n}. <b>{esc(u.get('custom_id', ''))}</b> · {who}"
+    if when:
+        head += f" · 🕐 {when}"
+    return f"{head}\n     {esc(profile)} · " + " · ".join(extra) + f"\n     <code>{uid}</code>"
+
+
+@dp.callback_query(F.data.startswith("adm_new_"))
+@admin_only
+async def adm_new_users(call: types.CallbackQuery):
+    try:
+        period, page = call.data[len("adm_new_"):].rsplit("_", 1)
+        page = int(page)
+    except ValueError:
+        period, page = "today", 0
+    if period not in STATS_PERIODS:
+        period = "today"
+    title = STATS_PERIODS[period][0]
+    ids = new_users_for_period(period)
+    pages = max(1, (len(ids) + NEW_LIST_PER_PAGE - 1) // NEW_LIST_PER_PAGE)
+    page = min(max(page, 0), pages - 1)
+    chunk = ids[page * NEW_LIST_PER_PAGE:(page + 1) * NEW_LIST_PER_PAGE]
+    lines = [f"🆕 <b>Нові учасники — {title.lower() if period in ('today', 'yday') else 'за ' + title}</b> ({len(ids)})", ""]
+    if not chunk:
+        lines.append("Поки нікого 🙂")
+    for i, uid in enumerate(chunk, start=page * NEW_LIST_PER_PAGE + 1):
+        lines.append(new_user_line(i, uid))
+        lines.append("")
+    counted = _sum_stats(_days_back(STATS_PERIODS[period][1], STATS_PERIODS[period][2]))["new"]
+    if counted > len(ids):
+        lines.append(f"<i>Ще {counted - len(ids)} — зайшли до оновлення бота, тому їх немає в списку.</i>")
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_new_{period}_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_new_{period}_{page + 1}"))
+    kb = [nav] if nav else []
+    kb.append([InlineKeyboardButton(text="⬅️ До статистики", callback_data=f"adm_st_{period}")])
+    try:
+        await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), disable_web_page_preview=True)
+    except TelegramAPIError:
+        pass
+    await call.answer()
 
 
 @dp.callback_query(F.data == "adm_stats")
