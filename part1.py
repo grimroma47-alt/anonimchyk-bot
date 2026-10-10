@@ -60,6 +60,10 @@ async def track_last_seen(handler, event, data):
         if user is not None:
             last_seen[user.id] = time.time()
             stats_day()["active"].add(user.id)
+            known = users_db.get(user.id)
+            if known is not None:
+                known["tg_username"] = user.username
+                known["tg_name"] = " ".join(x for x in (user.first_name, user.last_name) if x) or None
     except Exception:  # noqa: BLE001 — облік онлайну ніколи не має ламати обробку повідомлень
         pass
     return await handler(event, data)
@@ -753,6 +757,11 @@ def init_user(user_id: int) -> dict:
             "notify_tasks": True,  # повідомлення про виконані завдання
             "notify_tips": True,  # підказки (напр. про фільтр за статтю)
             "allow_invites": True,  # приймати запрошення в чат від друзів/минулих співрозмовників
+            "notify_waiting": True,  # кликати, коли хтось чекає співрозмовника
+            "wait_ping_at": 0.0,  # коли востаннє кликали цю людину (час)
+            "joined_at": None,  # коли вперше зайшов у бот (час); у старих користувачів невідомо
+            "tg_username": None,  # @username у Telegram (для списку новачків в адмінці)
+            "tg_name": None,  # ім'я в Telegram
             "media_mode_set": False,  # чи людина сама обирала режим медіа (інакше для неповнолітніх — «без фото/відео»)
             "safety_memo_shown": False,  # чи показували пам'ятку з безпеки (для неповнолітніх)
             "ref_qualified": False,  # чи вже зарахований своєму запрошувачу в конкурсі (після першого чату)
@@ -769,6 +778,11 @@ def init_user(user_id: int) -> dict:
         }
         if user_id > 0:
             stat_add("new")
+            users_db[user_id]["joined_at"] = time.time()
+            try:
+                stats_day().setdefault("new_ids", []).append(user_id)
+            except Exception as e:  # noqa: BLE001 — статистика ніколи не має ламати бота
+                logging.warning("Статистика новачків: %s", e)
     return users_db[user_id]
 
 
