@@ -1083,6 +1083,10 @@ def admin_stats_text(period: str) -> str:
         "",
         head,
         f"🆕 Нових: <b>{t['new']}</b>",
+        *[
+            f"     {source_label(code)}: {n}" + (f" (спілкувались {chatted})" if n else "")
+            for code, n, chatted in source_breakdown(list(dict.fromkeys(t.get("new_ids", []))))
+        ],
         f"🙋 Активних: <b>{len(t['active'])}</b>",
         f"💬 Чатів: <b>{t['chats']}</b> (справжніх від 1 хв: {t['real_chats']})",
         f"     ❤️ флірт {t['flirt']} · 🧩 інтереси {t['interest']} · 👫 друзі {t['friends']}",
@@ -1173,7 +1177,7 @@ def new_user_line(n: int, uid: int) -> str:
     profile = ", ".join(
         str(v) for v in (u.get("gender"), u.get("age"), u.get("country")) if v and v != "Не вказано"
     ) or "профіль не заповнений"
-    extra = [f"💬 чатів: {u.get('total_chats', 0)}"]
+    extra = [source_label(u.get("source")), f"💬 чатів: {u.get('total_chats', 0)}"]
     if is_premium(u):
         extra.append("💎")
     if uid in banned_users:
@@ -1222,6 +1226,29 @@ async def adm_new_users(call: types.CallbackQuery):
         await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), disable_web_page_preview=True)
     except TelegramAPIError:
         pass
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_links")
+@admin_only
+async def adm_links(call: types.CallbackQuery):
+    base = f"https://t.me/{BOT_USERNAME}?start=" if BOT_USERNAME else "https://t.me/ВАШ_БОТ?start="
+    lines = [
+        "🔗 <b>Посилання з мітками</b>",
+        "Став різні посилання в різних місцях — і в статистиці буде видно, звідки прийшли люди.",
+        "",
+    ]
+    for code in ("tt", "yt", "ig", "tgads"):
+        lines.append(f"{SOURCE_LABELS[code]}\n<code>{base}{code}</code>\n")
+    lines += [
+        "💬 <b>Власна мітка</b> — для конкретного чату чи реклами в каналі:",
+        f"<code>{base}chat1</code>",
+        "Після <code>start=</code> пиши будь-що латиницею й цифрами (напр. <code>kanal_memy</code>) — "
+        "у статистиці з'явиться окремим рядком.",
+        "",
+        "<i>Мітка зараховується лише новим людям — тим, хто відкрив бот уперше.</i>",
+    ]
+    await call.message.answer("\n".join(lines), disable_web_page_preview=True)
     await call.answer()
 
 
