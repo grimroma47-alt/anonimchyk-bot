@@ -697,6 +697,7 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
+            [InlineKeyboardButton(text="🔗 Посилання з мітками", callback_data="adm_links")],
             [InlineKeyboardButton(text="🚨 Скарги", callback_data="adm_reports_0")],
             [
                 InlineKeyboardButton(text="⛔ Забанити", callback_data="adm_ban"),
@@ -762,6 +763,7 @@ def init_user(user_id: int) -> dict:
             "joined_at": None,  # коли вперше зайшов у бот (час); у старих користувачів невідомо
             "tg_username": None,  # @username у Telegram (для списку новачків в адмінці)
             "tg_name": None,  # ім'я в Telegram
+            "source": None,  # звідки прийшов: tt / yt / ig / ref / direct / власна мітка (з посилання ?start=...)
             "media_mode_set": False,  # чи людина сама обирала режим медіа (інакше для неповнолітніх — «без фото/відео»)
             "safety_memo_shown": False,  # чи показували пам'ятку з безпеки (для неповнолітніх)
             "ref_qualified": False,  # чи вже зарахований своєму запрошувачу в конкурсі (після першого чату)
@@ -1476,6 +1478,49 @@ async def persistence_loop():
             pass
         _save_event.clear()
         await save_state_to_db()
+
+
+# ---------------------------------------------------------------------------
+# Мітки джерел: t.me/<бот>?start=tt — щоб бачити, звідки приходять люди
+# ---------------------------------------------------------------------------
+SOURCE_LABELS = {
+    "tt": "🎵 TikTok",
+    "yt": "▶️ YouTube",
+    "ig": "📸 Instagram",
+    "tgads": "📣 Telegram Ads",
+    "ref": "🤝 Запрошення друзів",
+    "direct": "🔎 Напряму / пошук",
+}
+
+
+def source_from_start(arg: str) -> str:
+    arg = (arg or "").strip()
+    if not arg:
+        return "direct"
+    if arg.startswith("ref_"):
+        return "ref"
+    code = re.sub(r"[^a-z0-9_]", "", arg.lower())[:32]
+    return code or "direct"
+
+
+def source_label(code: str | None) -> str:
+    if not code:
+        return "❔ невідомо (до міток)"
+    return SOURCE_LABELS.get(code, f"💬 {code}")
+
+
+def source_breakdown(ids: list[int]) -> list[tuple[str, int, int]]:
+    """[(джерело, скільки прийшло, скільки з них уже спілкувались)] — найбільші зверху."""
+    agg: dict[str, list[int]] = {}
+    for uid in ids:
+        u = users_db.get(uid)
+        if not u:
+            continue
+        row = agg.setdefault(u.get("source") or "", [0, 0])
+        row[0] += 1
+        if u.get("total_chats", 0) > 0:
+            row[1] += 1
+    return sorted(((k, v[0], v[1]) for k, v in agg.items()), key=lambda x: -x[1])
 
 
 
