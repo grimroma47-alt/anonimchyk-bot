@@ -209,6 +209,7 @@ def notify_keyboard(u: dict):
             [InlineKeyboardButton(text=f"📋 Виконані завдання: {_onoff(u.get('notify_tasks', True))}", callback_data="tg_notify_tasks")],
             [InlineKeyboardButton(text=f"💡 Підказки: {_onoff(u.get('notify_tips', True))}", callback_data="tg_notify_tips")],
             [InlineKeyboardButton(text=f"🔄 Запрошення в чат: {_onoff(u.get('allow_invites', True))}", callback_data="tg_allow_invites")],
+            [InlineKeyboardButton(text=f"👋 Хтось шукає співрозмовника: {_onoff(u.get('notify_waiting', True))}", callback_data="tg_notify_waiting")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="set_back")],
         ]
     )
@@ -221,6 +222,7 @@ TOGGLES = {
     "notify_tasks": (True, "notify"),
     "notify_tips": (True, "notify"),
     "allow_invites": (True, "notify"),
+    "notify_waiting": (True, "notify"),
 }
 
 
