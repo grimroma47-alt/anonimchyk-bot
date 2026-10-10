@@ -587,6 +587,7 @@ def _new_stats_day() -> dict:
         "daily_paid": 0.0,  # роздано щоденними бонусами
         "tasks_paid": 0.0,  # роздано за завдання
         "tasks_done": 0,
+        "new_ids": [],  # user_id новачків за день (для списку в адмінці)
     }
 
 
@@ -991,6 +992,115 @@ async def prem_open(call: types.CallbackQuery):
     text += f"{premium_status_text(u)}\n💰 Баланс: {u['balance']:.2f} грн\n\nОбери тариф:"
     await call.message.answer(text, reply_markup=kb)
     await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# «Хтось шукає співрозмовника»: якщо людина довго чекає — кличемо тих, хто зараз не в чаті
+# ---------------------------------------------------------------------------
+WAIT_PING_DELAY = int(os.getenv("WAIT_PING_DELAY", "30"))  # секунд очікування до виклику
+WAIT_PING_USER_COOLDOWN = int(os.getenv("WAIT_PING_USER_COOLDOWN", str(3 * 3600)))  # одну людину кличемо не частіше
+WAIT_PING_SEEKER_COOLDOWN = 10 * 60  # за одного й того самого шукача кличемо не частіше
+WAIT_PING_MAX = int(os.getenv("WAIT_PING_MAX", "40"))  # скільки людей кличемо за раз
+wait_ping_seeker_last: dict[int, float] = {}
+
+
+def _wait_ping_mode_ok(mode: str) -> bool:
+    return mode in ("normal", "flirt") or (mode.startswith("int:") and mode[4:] in INTEREST_LABELS)
+
+
+def schedule_wait_ping(user_id: int, mode: str):
+    if not _wait_ping_mode_ok(mode):
+        return
+    if time.time() - wait_ping_seeker_last.get(user_id, 0) < WAIT_PING_SEEKER_COOLDOWN:
+        return
+    asyncio.create_task(wait_ping_after_wait(user_id, mode))
+
+
+def wait_ping_recipients(seeker_id: int, mode: str) -> list[int]:
+    """Кого можна покликати: не в чаті/черзі/кімнаті, не забанені, сумісні з шукачем і давно не кликані."""
+    s = init_user(seeker_id)
+    now = time.time()
+    result = []
+    for uid, u in users_db.items():
+        if uid <= 0 or uid == seeker_id or uid in banned_users:
+            continue
+        if uid in active_chats or uid in queue or uid in user_room:
+            continue
+        if not u.get("notify_waiting", True) or u.get("gender", "Не вказано") == "Не вказано":
+            continue  # вимкнув сповіщення або ще не пройшов знайомство з ботом
+        if now - u.get("wait_ping_at", 0) < WAIT_PING_USER_COOLDOWN:
+            continue
+        if is_blacklisted(s, seeker_id, u, uid):
+            continue
+        if not passes_filters(s, u) or not passes_filters(u, s):
+            continue
+        if mode == "flirt" and (u.get("gender") == s.get("gender") or flirt_block_reason(u) is not None):
+            continue
+        result.append(uid)
+    result.sort(key=lambda x: last_seen.get(x, 0), reverse=True)  # спершу ті, хто нещодавно заходив
+    return result[:WAIT_PING_MAX]
+
+
+def wait_ping_text(mode: str) -> str:
+    if mode == "flirt":
+        what = "❤️ Зараз хтось шукає пару для флірту"
+    elif mode.startswith("int:"):
+        what = f"🧩 Зараз хтось шукає співрозмовника на тему {INTEREST_LABELS.get(mode[4:], mode[4:])}"
+    else:
+        what = "👋 Зараз хтось шукає співрозмовника"
+    return (
+        f"{what} — і чекає саме на тебе!\n\n"
+        "Натисни кнопку, щоб одразу з'єднатися 👇\n"
+        "<i>Вимкнути такі сповіщення: ⚙️ Налаштування → 🔔 Сповіщення</i>"
+    )
+
+
+async def wait_ping_after_wait(user_id: int, mode: str):
+    try:
+        await asyncio.sleep(WAIT_PING_DELAY)
+        if user_id not in queue or search_mode.get(user_id, "normal") != mode:
+            return  # уже знайшов співрозмовника або вийшов з пошуку
+        if time.time() - wait_ping_seeker_last.get(user_id, 0) < WAIT_PING_SEEKER_COOLDOWN:
+            return
+        wait_ping_seeker_last[user_id] = time.time()
+        recipients = wait_ping_recipients(user_id, mode)
+        if not recipients:
+            return
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data=f"wp_go:{mode}")]]
+        )
+        text = wait_ping_text(mode)
+        sent = 0
+        for uid in recipients:
+            if user_id not in queue:
+                break  # шукач уже знайшов пару — більше нікого не кличемо
+            users_db[uid]["wait_ping_at"] = time.time()
+            if await safe_send(uid, text, reply_markup=kb):
+                sent += 1
+            await asyncio.sleep(0.05)  # не впираємось у ліміти Telegram
+        if sent:
+            stat_add("wait_pings", sent)
+            request_save()
+            if user_id in queue:
+                await safe_send(user_id, "📣 Ми покликали людей, які зараз не в чаті. Зачекай ще трохи ⏳")
+    except Exception as e:  # noqa: BLE001 — сповіщення ніколи не має ламати пошук
+        logging.warning("Виклик «хтось шукає» не надіслано: %s", e)
+
+
+@dp.callback_query(F.data.startswith("wp_go:"))
+async def wait_ping_go(call: types.CallbackQuery, state: FSMContext):
+    mode = call.data[len("wp_go:"):]
+    if not _wait_ping_mode_ok(mode):
+        mode = "normal"
+    u = init_user(call.from_user.id)
+    if mode == "flirt" and flirt_block_reason(u) is not None:
+        mode = "normal"
+    await call.answer()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await run_search(call.message, state, mode, user_id=call.from_user.id)
 
 
 # ---------------------------------------------------------------------------
