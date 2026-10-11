@@ -374,6 +374,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
         await message.answer(wait_text)
         await maybe_show_ad(user_id)
         schedule_wait_ping(user_id, mode)
+        schedule_admin_wait_alert(user_id, mode)
 
 
 @dp.message(F.text == BTN_STOP)
