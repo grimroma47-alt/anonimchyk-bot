@@ -469,6 +469,152 @@ BANNER_COOLDOWN = 10 * 60  # той самий банер одній людин�
 banner_last_shown: dict[tuple[int, str], float] = {}
 
 
+class AdminGiftStates(StatesGroup):
+    target = State()
+    note = State()
+
+
+def admin_gift_keyboard(uid: int):
+    items = [
+        InlineKeyboardButton(text=f"{title}", callback_data=f"adm_gift_pick:{uid}:{key}")
+        for key, (title, _price) in GIFT_CATALOG.items()
+    ]
+    rows = [items[i:i + 3] for i in range(0, len(items), 3)]
+    rows.append([InlineKeyboardButton(text="✖️ Скасувати", callback_data="adm_gift_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _admin_gift_choose(answer, uid: int):
+    u = users_db[uid]
+    await answer(
+        f"🎁 Подарунок для {admin_label(uid)}\n"
+        f"{short_info(u, public=False)}\n\nОбери, що подарувати:",
+        reply_markup=admin_gift_keyboard(uid),
+    )
+
+
+@dp.callback_query(F.data == "adm_gift")
+@admin_only
+async def adm_gift_start(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminGiftStates.target)
+    await call.message.answer(
+        "🎁 <b>Подарунок користувачу</b>\n\n"
+        "Надішли ID людини — наш (напр. <code>ID_1012</code>) або Telegram ID.\n"
+        "Знайти людину зручно в 📊 Статистика → 🆕 Нові учасники (там є кнопки 🎁).\n\nСкасувати: /cancel"
+    )
+    await call.answer()
+
+
+@dp.message(AdminGiftStates.target)
+async def adm_gift_target(message: types.Message, state: FSMContext):
+    if not _is_banner_admin(message.from_user.id):
+        await state.clear()
+        return
+    uid = resolve_user_id(message.text or "")
+    if uid is None or uid not in users_db:
+        await message.answer("Не знайшов такого користувача 🤔 Перевір ID (напр. ID_1012) або /cancel.")
+        return
+    await state.clear()
+    await _admin_gift_choose(message.answer, uid)
+
+
+@dp.callback_query(F.data.startswith("adm_gift_to:"))
+@admin_only
+async def adm_gift_to(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        uid = int(call.data.split(":", 1)[1])
+    except ValueError:
+        await call.answer()
+        return
+    if uid not in users_db:
+        await call.answer("Користувача не знайдено", show_alert=True)
+        return
+    await _admin_gift_choose(call.message.answer, uid)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_gift_pick:"))
+@admin_only
+async def adm_gift_pick(call: types.CallbackQuery, state: FSMContext):
+    try:
+        _, uid, key = call.data.split(":", 2)
+        uid = int(uid)
+    except ValueError:
+        await call.answer()
+        return
+    if uid not in users_db or key not in GIFT_CATALOG:
+        await call.answer("Щось не так 🤔", show_alert=True)
+        return
+    await state.set_state(AdminGiftStates.note)
+    await state.update_data(gift_uid=uid, gift_key=key)
+    await call.message.answer(
+        f"Дарую {GIFT_CATALOG[key][0]} для {admin_label(uid)}.\n\n"
+        "✍️ Напиши коротку записку, яку людина побачить разом з подарунком "
+        "(напр. «Наталіє, це ведмедик з TikTok 🧸»), або натисни кнопку нижче.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📨 Надіслати без записки", callback_data="adm_gift_send")],
+                [InlineKeyboardButton(text="✖️ Скасувати", callback_data="adm_gift_cancel")],
+            ]
+        ),
+    )
+    await call.answer()
+
+
+async def _admin_gift_deliver(state: FSMContext, note: str | None, reply):
+    data = await state.get_data()
+    await state.clear()
+    uid, key = data.get("gift_uid"), data.get("gift_key")
+    if uid not in users_db or key not in GIFT_CATALOG:
+        await reply("Подарунок не знайдено — почни спочатку: /admin → 🎁 Подарувати подарунок")
+        return
+    u = users_db[uid]
+    u.setdefault("gifts", {})
+    u["gifts"][key] = u["gifts"].get(key, 0) + 1
+    request_save()
+    title = GIFT_CATALOG[key][0]
+    text = f"🎁 <b>Тобі подарунок від команди ANONimchyk!</b>\n\n{esc(title)}"
+    if note:
+        text += f"\n\n💌 <i>{esc(note)}</i>"
+    text += (
+        "\n\nВін уже у твоєму інвентарі (👤 Мій профіль). "
+        "Можеш залишити собі або подарувати співрозмовнику під час чату 💜"
+    )
+    ok = await safe_send(uid, text)
+    if ok:
+        await reply(f"✅ Подаровано {title} → {admin_label(uid)}")
+    else:
+        await reply(
+            f"⚠️ Подарунок {title} додано в інвентар {admin_label(uid)}, "
+            "але повідомлення не дійшло (людина могла заблокувати бота)."
+        )
+
+
+@dp.callback_query(F.data == "adm_gift_send")
+@admin_only
+async def adm_gift_send(call: types.CallbackQuery, state: FSMContext):
+    await _admin_gift_deliver(state, None, call.message.answer)
+    await call.answer()
+
+
+@dp.message(AdminGiftStates.note)
+async def adm_gift_note(message: types.Message, state: FSMContext):
+    if not _is_banner_admin(message.from_user.id):
+        await state.clear()
+        return
+    note = (message.text or "").strip()[:300]
+    await _admin_gift_deliver(state, note or None, message.answer)
+
+
+@dp.callback_query(F.data == "adm_gift_cancel")
+@admin_only
+async def adm_gift_cancel(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("Скасовано.")
+    await call.answer()
+
+
 class BannerStates(StatesGroup):
     photo = State()
 
