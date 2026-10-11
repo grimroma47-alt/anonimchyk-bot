@@ -974,6 +974,7 @@ async def setup_bot_commands():
         types.BotCommand(command="myinterests", description="🧩 Мої інтереси в профілі"),
         types.BotCommand(command="tasks", description="📋 Щоденні завдання"),
         types.BotCommand(command="contest", description="🏆 Конкурс запрошень"),
+        types.BotCommand(command="founders", description="👑 Засновники — перші 100"),
         types.BotCommand(command="rules", description="📜 Правила"),
         types.BotCommand(command="safety", description="🛡 Безпека"),
         types.BotCommand(command="paysupport", description="💳 Питання щодо оплат"),
