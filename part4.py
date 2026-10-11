@@ -735,6 +735,69 @@ def on_chat_message(user_id: int):
     task_event(user_id, "msg")
 
 
+# ---------------------------------------------------------------------------
+# 👑 Засновники: перші FOUNDERS_LIMIT людей, які справді поспілкувались, — значок назавжди
+# ---------------------------------------------------------------------------
+FOUNDERS_LIMIT = int(os.getenv("FOUNDERS_LIMIT", "100"))
+
+
+def founders_count() -> int:
+    return max((u.get("founder_no") or 0 for u in users_db.values()), default=0)
+
+
+def founders_left() -> int:
+    return max(0, FOUNDERS_LIMIT - founders_count())
+
+
+def founder_promo_line() -> str:
+    left = founders_left()
+    if not left:
+        return ""
+    return (
+        f"👑 Перші {FOUNDERS_LIMIT} учасників отримують значок <b>засновника</b> назавжди — "
+        f"залишилось <b>{left}</b> {_plural(left, 'місце', 'місця', 'місць')}! Поспілкуйся хоча б раз, щоб забрати своє."
+    )
+
+
+def maybe_make_founder(user_id: int) -> bool:
+    u = users_db.get(user_id)
+    if u is None or u.get("founder_no") or user_id <= 0 or user_id == ADMIN_ID or user_id in banned_users:
+        return False
+    no = founders_count() + 1
+    if no > FOUNDERS_LIMIT:
+        return False
+    u["founder_no"] = no
+    request_save()
+    _notify_later(
+        user_id,
+        f"👑 <b>Вітаємо! Ти — засновник ANONimchyk №{no} з {FOUNDERS_LIMIT}!</b>\n\n"
+        "• Значок 👑 тепер у твоєму профілі назавжди — співрозмовники його бачать.\n"
+        "• Коли вийде велике оновлення «Стиль ANONimchyk», ти автоматично отримаєш "
+        "ексклюзивний 🎁 <b>Пак засновника</b>, який більше ніколи не продаватиметься.\n\n"
+        "Дякуємо, що ти з нами з самого початку 💜",
+    )
+    return True
+
+
+@dp.message(Command("founders"))
+async def founders_cmd(message: types.Message):
+    u = init_user(message.from_user.id)
+    left = founders_left()
+    if u.get("founder_no"):
+        mine = f"Ти — засновник 👑 №{u['founder_no']}. Дякуємо! 💜"
+    elif left:
+        mine = "Щоб стати засновником — знайди співрозмовника і поспілкуйся хоча б хвилину 💬"
+    else:
+        mine = "Усі місця засновників уже зайняті — але попереду ще багато подарунків 🎁"
+    await message.answer(
+        f"👑 <b>Засновники ANONimchyk</b>\n\n"
+        f"Перші {FOUNDERS_LIMIT} учасників, які справді поспілкувались у боті, отримують:\n"
+        "• значок 👑 у профілі назавжди;\n"
+        "• ексклюзивний 🎁 Пак засновника в день запуску «Стилю ANONimchyk».\n\n"
+        f"Зайнято: <b>{founders_count()}</b> з {FOUNDERS_LIMIT} · залишилось <b>{left}</b>\n\n{mine}"
+    )
+
+
 def on_chat_ended(a: int, b: int):
     try:
         ma, mb = chat_meta.pop(a, None), chat_meta.pop(b, None)
@@ -749,6 +812,7 @@ def on_chat_ended(a: int, b: int):
         long_chat = duration >= LONG_CHAT_SECONDS and ma["msgs"] >= 3 and mb["msgs"] >= 3
         mode = ma["mode"]
         for x in (a, b):
+            maybe_make_founder(x)
             contest_on_real_chat(x)
             task_event(x, "chat")
             if mode == "flirt":
