@@ -1082,6 +1082,7 @@ def admin_stats_text(period: str) -> str:
         f"🟢 Зараз: онлайн {online} · у чатах {len(active_chats) // 2} · шукають {len(queue)} · у кімнатах {len(user_room)}",
         "",
         head,
+        f"👑 Засновників: <b>{founders_count()}</b> з {FOUNDERS_LIMIT}",
         f"🆕 Нових: <b>{t['new']}</b>",
         *[
             f"     {source_label(code)}: {n}" + (f" (спілкувались {chatted})" if n else "")
