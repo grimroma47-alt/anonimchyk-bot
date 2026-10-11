@@ -43,6 +43,8 @@ async def start_handler(message: types.Message, state: FSMContext):
         "Змінити профіль можна будь-коли: ⚙️ Налаштування → ✏️ Мій профіль.\n\n"
         "📜 Користуючись ботом, ти погоджуєшся з правилами: /rules"
     )
+    if not u.get("founder_no") and founder_promo_line():
+        welcome += "\n\n" + founder_promo_line()
     if not await send_banner(user_id, "start", caption=welcome, reply_markup=get_main_keyboard()):
         await message.answer(welcome, reply_markup=get_main_keyboard())
     if not profile_complete(u):
@@ -105,7 +107,8 @@ async def profile_handler(message: types.Message, state: FSMContext):
         f"• <b>Країна:</b> {esc(u['country'])}\n"
         f"• <b>Преміум:</b> {'Так 💎' if is_premium(u) else 'Ні ❌'}\n"
         f"• <b>VIP-значок:</b> {'Так ⭐' if has_perk(u, 'vip_badge') else 'Ні'}\n"
-        f"• <b>Рівень:</b> {get_level_title(u)} ({u.get('total_chats', 0)} чатів)\n"
+        + (f"• <b>Засновник:</b> 👑 №{u['founder_no']} з {FOUNDERS_LIMIT}\n" if u.get("founder_no") else "")
+        + f"• <b>Рівень:</b> {get_level_title(u)} ({u.get('total_chats', 0)} чатів)\n"
         f"• <b>Серія входів:</b> {u.get('checkin_streak', 0)} 🔥\n"
         f"• <b>Рейтинг:</b> {rating_line(u)}\n"
         f"• <b>Інтереси:</b> {interests_line(u)}\n\n"
