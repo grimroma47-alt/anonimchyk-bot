@@ -1222,6 +1222,11 @@ async def adm_new_users(call: types.CallbackQuery):
     if page < pages - 1:
         nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_new_{period}_{page + 1}"))
     kb = [nav] if nav else []
+    gift_btns = [
+        InlineKeyboardButton(text=f"🎁 {users_db[uid].get('custom_id', uid)}", callback_data=f"adm_gift_to:{uid}")
+        for uid in chunk
+    ]
+    kb += [gift_btns[i:i + 3] for i in range(0, len(gift_btns), 3)]
     kb.append([InlineKeyboardButton(text="⬅️ До статистики", callback_data=f"adm_st_{period}")])
     try:
         await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), disable_web_page_preview=True)
