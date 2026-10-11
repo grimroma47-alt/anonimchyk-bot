@@ -1151,6 +1151,67 @@ async def wait_ping_after_wait(user_id: int, mode: str):
         logging.warning("Виклик «хтось шукає» не надіслано: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# 👀 Адміну: «хтось уже хвилину шукає співрозмовника» — щоб людина не пішла з порожнього бота
+# ---------------------------------------------------------------------------
+ADMIN_WAIT_ALERT_DELAY = int(os.getenv("ADMIN_WAIT_ALERT_DELAY", "60"))
+ADMIN_WAIT_ALERT_COOLDOWN = 120  # не частіше ніж раз на 2 хв
+admin_wait_alert_last = 0.0
+admin_alerts_enabled = True
+
+
+def schedule_admin_wait_alert(user_id: int, mode: str):
+    if not ADMIN_ID or user_id == ADMIN_ID or not _wait_ping_mode_ok(mode):
+        return
+    asyncio.create_task(admin_wait_alert_after(user_id, mode))
+
+
+async def admin_wait_alert_after(user_id: int, mode: str):
+    global admin_wait_alert_last
+    try:
+        await asyncio.sleep(ADMIN_WAIT_ALERT_DELAY)
+        if not admin_alerts_enabled or user_id not in queue or search_mode.get(user_id, "normal") != mode:
+            return
+        if ADMIN_ID in active_chats or ADMIN_ID in queue or ADMIN_ID in user_room:
+            return  # адмін уже спілкується
+        if time.time() - admin_wait_alert_last < ADMIN_WAIT_ALERT_COOLDOWN:
+            return
+        admin_wait_alert_last = time.time()
+        what = {"normal": "звичайний пошук", "flirt": "флірт"}.get(mode) or (
+            f"тема {INTEREST_LABELS.get(mode[4:], mode[4:])}" if mode.startswith("int:") else mode
+        )
+        await safe_send(
+            ADMIN_ID,
+            f"👀 Хтось уже хвилину шукає співрозмовника ({what}).\nПідключишся, щоб людина не пішла?",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="💬 Підключитися", callback_data=f"wp_go:{mode}")],
+                    [InlineKeyboardButton(text="🔕 Вимкнути такі сповіщення", callback_data="adm_alerts_off")],
+                ]
+            ),
+        )
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Сповіщення адміну не надіслано: %s", e)
+
+
+@dp.callback_query(F.data == "adm_alerts_off")
+@admin_only
+async def adm_alerts_off(call: types.CallbackQuery):
+    global admin_alerts_enabled
+    admin_alerts_enabled = False
+    await call.message.answer("🔕 Вимкнено до перезапуску бота. Увімкнути знову: /alerts")
+    await call.answer()
+
+
+@dp.message(Command("alerts"))
+async def adm_alerts_on(message: types.Message):
+    global admin_alerts_enabled
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    admin_alerts_enabled = True
+    await message.answer("🔔 Сповіщення «хтось шукає співрозмовника» увімкнено.")
+
+
 @dp.callback_query(F.data.startswith("wp_go:"))
 async def wait_ping_go(call: types.CallbackQuery, state: FSMContext):
     mode = call.data[len("wp_go:"):]
