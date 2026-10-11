@@ -698,6 +698,7 @@ def get_admin_keyboard():
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
             [InlineKeyboardButton(text="🔗 Посилання з мітками", callback_data="adm_links")],
+            [InlineKeyboardButton(text="🎁 Подарувати подарунок", callback_data="adm_gift")],
             [InlineKeyboardButton(text="🚨 Скарги", callback_data="adm_reports_0")],
             [
                 InlineKeyboardButton(text="⛔ Забанити", callback_data="adm_ban"),
