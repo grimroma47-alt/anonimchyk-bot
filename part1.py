@@ -763,6 +763,7 @@ def init_user(user_id: int) -> dict:
             "joined_at": None,  # коли вперше зайшов у бот (час); у старих користувачів невідомо
             "tg_username": None,  # @username у Telegram (для списку новачків в адмінці)
             "tg_name": None,  # ім'я в Telegram
+            "founder_no": None,  # 👑 номер засновника (перші FOUNDERS_LIMIT, хто справді поспілкувався)
             "source": None,  # звідки прийшов: tt / yt / ig / ref / direct / власна мітка (з посилання ?start=...)
             "media_mode_set": False,  # чи людина сама обирала режим медіа (інакше для неповнолітніх — «без фото/відео»)
             "safety_memo_shown": False,  # чи показували пам'ятку з безпеки (для неповнолітніх)
@@ -852,6 +853,7 @@ def short_info(u: dict, public: bool = True) -> str:
     """public=True — як бачить співрозмовник (з урахуванням приватності), False — як бачить сам власник."""
     badge = " 💎" if is_premium(u) else ""
     vip = " ⭐VIP" if has_perk(u, "vip_badge") else ""
+    vip += " 👑" if u.get("founder_no") else ""
     pct = rating_percent(u)
     rating = f" · 👍 {pct}%" if pct is not None and u.get("rating_up", 0) + u.get("rating_down", 0) >= RATING_MIN_VOTES else ""
     age = "🙈 вік приховано" if public and u.get("hide_age") else esc(u["age"])
@@ -1334,6 +1336,10 @@ def _apply_snapshot(blob: bytes):
     template = init_user(-1)
     users_db.pop(-1, None)
     user_counter = saved_counter
+    old_chatters = sorted(
+        (uid for uid, u in users_db.items() if "founder_no" not in u and u.get("total_chats") and uid != ADMIN_ID),
+        key=lambda uid: int(re.sub(r"\D", "", str(users_db[uid].get("custom_id", ""))) or 0),
+    )
     for u in users_db.values():
         if "ref_qualified" not in u:
             # ті, хто вже спілкувався до запуску конкурсу, не зараховуються в нього заднім числом
@@ -1341,6 +1347,14 @@ def _apply_snapshot(blob: bytes):
         for key, value in template.items():
             if key not in u:
                 u[key] = copy.deepcopy(value)
+    # 👑 ті, хто спілкувався ще до появи значка, стають першими засновниками (за порядком приходу)
+    next_no = max((u.get("founder_no") or 0 for u in users_db.values()), default=0) + 1
+    for uid in old_chatters:
+        if next_no > FOUNDERS_LIMIT:
+            break
+        if uid not in banned_users and not users_db[uid].get("founder_no"):
+            users_db[uid]["founder_no"] = next_no
+            next_no += 1
 
 
 async def load_state_from_db():
