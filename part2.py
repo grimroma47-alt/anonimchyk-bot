@@ -165,6 +165,7 @@ async def process_country(message: types.Message, state: FSMContext):
     u["archive"] = u["archive"][-50:]
 
     u["gender"] = data.get("gender", u["gender"])
+    refresh_default_nick(u)
     u["age"] = data.get("age", u["age"])
     u["country"] = country
 
@@ -678,6 +679,9 @@ async def change_nick_finish(message: types.Message, state: FSMContext):
     nick = message.text.strip()
     if not (2 <= len(nick) <= 24):
         await message.answer("Нікнейм має містити від 2 до 24 символів. Спробуйте ще раз або /cancel.")
+        return
+    if DEFAULT_NICK_RE.match(nick):
+        await message.answer("Такі ніки бот видає автоматично — придумай свій 🙂 Або /cancel.")
         return
     if u["balance"] < NICK_PRICE:
         await state.clear()
