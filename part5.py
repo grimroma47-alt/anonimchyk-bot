@@ -47,6 +47,7 @@ async def start_onboarding(chat_id: int, state: FSMContext):
 async def onboard_gender(call: types.CallbackQuery, state: FSMContext):
     u = init_user(call.from_user.id)
     u["gender"] = "Хлопець" if call.data == "ob_g_m" else "Дівчина"
+    refresh_default_nick(u)
     request_save()
     try:
         await call.message.edit_reply_markup(reply_markup=None)
@@ -366,6 +367,7 @@ async def pe_gender_set(call: types.CallbackQuery):
     if u["gender"] != new:
         _archive_profile(u)
         u["gender"] = new
+        refresh_default_nick(u)
         request_save()
     try:
         await call.message.edit_text(profile_edit_text(u), reply_markup=profile_edit_keyboard())
@@ -603,7 +605,7 @@ async def adm_gift_note(message: types.Message, state: FSMContext):
     if not _is_banner_admin(message.from_user.id):
         await state.clear()
         return
-    note = (message.text or "").strip()[:300]
+    note = (message.text or "").strip()[:1500]
     await _admin_gift_deliver(state, note or None, message.answer)
 
 
