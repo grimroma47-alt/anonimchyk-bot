@@ -721,13 +721,29 @@ def esc(value) -> str:
     return html.escape(str(value))
 
 
+DEFAULT_NICK_RE = re.compile(r"^(Користувач|Незнайомець|Незнайомка)_\d+$")
+
+
+def default_nickname(u: dict) -> str:
+    """Автонік: «Незнайомка_N» для дівчат, «Незнайомець_N» для решти; N — порядковий номер з ID."""
+    num = re.sub(r"\D", "", str(u.get("custom_id", ""))) or "0"
+    base = "Незнайомка" if u.get("gender") == "Дівчина" else "Незнайомець"
+    return f"{base}_{num}"
+
+
+def refresh_default_nick(u: dict) -> None:
+    """Оновлює нік за статтю, лише якщо людина не ставила власний (купленим ніком не чіпаємо)."""
+    if DEFAULT_NICK_RE.match(str(u.get("nickname", ""))):
+        u["nickname"] = default_nickname(u)
+
+
 def init_user(user_id: int) -> dict:
     global user_counter
     if user_id not in users_db:
         user_counter += 1
         users_db[user_id] = {
             "custom_id": f"ID_{user_counter}",
-            "nickname": f"Користувач_{user_counter}",
+            "nickname": f"Незнайомець_{user_counter}",
             "gender": "Не вказано",
             "age": "Не вказано",
             "country": "Не вказано",
@@ -1348,6 +1364,7 @@ def _apply_snapshot(blob: bytes):
         for key, value in template.items():
             if key not in u:
                 u[key] = copy.deepcopy(value)
+        refresh_default_nick(u)  # «Користувач_N» → «Незнайомець_N» / «Незнайомка_N»
     # 👑 ті, хто спілкувався ще до появи значка, стають першими засновниками (за порядком приходу)
     next_no = max((u.get("founder_no") or 0 for u in users_db.values()), default=0) + 1
     for uid in old_chatters:
