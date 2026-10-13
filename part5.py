@@ -211,6 +211,7 @@ def notify_keyboard(u: dict):
             [InlineKeyboardButton(text=f"💡 Підказки: {_onoff(u.get('notify_tips', True))}", callback_data="tg_notify_tips")],
             [InlineKeyboardButton(text=f"🔄 Запрошення в чат: {_onoff(u.get('allow_invites', True))}", callback_data="tg_allow_invites")],
             [InlineKeyboardButton(text=f"👋 Хтось шукає співрозмовника: {_onoff(u.get('notify_waiting', True))}", callback_data="tg_notify_waiting")],
+            [InlineKeyboardButton(text=f"⏰ Година знайомств: {_onoff(u.get('notify_meet', True))}", callback_data="tg_notify_meet")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="set_back")],
         ]
     )
@@ -224,6 +225,7 @@ TOGGLES = {
     "notify_tips": (True, "notify"),
     "allow_invites": (True, "notify"),
     "notify_waiting": (True, "notify"),
+    "notify_meet": (True, "notify"),
 }
 
 
@@ -821,7 +823,132 @@ async def contest_loop():
             await top_tick()
         except Exception as e:  # noqa: BLE001
             logging.warning("Топ тижня: %s", e)
+        try:
+            await meet_tick()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Година знайомств: %s", e)
         await asyncio.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# ⏰ Година знайомств: щодня 21:00–22:00 (Київ) усі заходять одночасно
+# ---------------------------------------------------------------------------
+MEET_HOUR = int(os.getenv("MEET_HOUR", "21"))  # початок години (за Києвом)
+MEET_REMIND_MINUTES = 5  # за скільки хвилин до початку нагадувати
+
+
+def meet_is_live(now: datetime | None = None) -> bool:
+    now = now or datetime.now(KYIV_TZ)
+    return now.hour == MEET_HOUR
+
+
+def online_now() -> int:
+    now = time.time()
+    return sum(1 for ts in last_seen.values() if now - ts <= ONLINE_WINDOW)
+
+
+def _total_chats_sum() -> int:
+    return sum(u.get("total_chats", 0) for uid, u in users_db.items() if uid > 0)
+
+
+def meet_status_line() -> str:
+    if meet_is_live():
+        return f"🔥 <b>Зараз Година знайомств</b> — до {MEET_HOUR + 1}:00 співрозмовника знайдеш найшвидше!"
+    return f"⏰ Година знайомств — щодня о {MEET_HOUR}:00. Усі заходять одночасно 💬"
+
+
+def meet_reminder_text() -> str:
+    online = max(online_now(), 1)
+    return (
+        f"⏰ <b>Година знайомств</b> — сьогодні о {MEET_HOUR}:00!\n\n"
+        f"Щовечора з {MEET_HOUR}:00 до {MEET_HOUR + 1}:00 усі заходять одночасно, "
+        "тож співрозмовник знаходиться за лічені секунди 💬\n\n"
+        f"🟢 Зараз у боті: <b>{online}</b>\n\n"
+        "Почни пошук уже зараз — або повертайся о дев'ятій 👇\n"
+        "<i>Вимкнути нагадування: ⚙️ Налаштування → 🔔 Сповіщення</i>"
+    )
+
+
+def meet_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")],
+            [InlineKeyboardButton(text="❤️ Флірт-пошук", callback_data="wp_go:flirt")],
+        ]
+    )
+
+
+def meet_recipients() -> list[int]:
+    result = []
+    for uid, u in users_db.items():
+        if uid <= 0 or uid in banned_users:
+            continue
+        if uid in active_chats or uid in queue or uid in user_room:
+            continue  # і так уже спілкується або шукає
+        if not u.get("notify_meet", True) or u.get("gender", "Не вказано") == "Не вказано":
+            continue  # вимкнув нагадування або ще не пройшов знайомство з ботом
+        result.append(uid)
+    result.sort(key=lambda x: last_seen.get(x, 0), reverse=True)
+    return result
+
+
+async def _meet_broadcast(recipients: list[int]):
+    text, kb = meet_reminder_text(), meet_keyboard()
+    sent = 0
+    for uid in recipients:
+        if uid in active_chats or uid in queue:
+            continue
+        if await safe_send(uid, text, reply_markup=kb):
+            sent += 1
+        await asyncio.sleep(0.05)  # ~20 повідомлень за секунду — в межах лімітів Telegram
+    meet_hour["sent"] = sent
+    request_save()
+
+
+async def meet_tick():
+    """Раз на хвилину: нагадування о 20:55, лічимо пік онлайну, о 22:00 — підсумок адміну."""
+    if not _contest_can_write():
+        return
+    now = datetime.now(KYIV_TZ)
+    today = now.date().isoformat()
+    remind_from = MEET_HOUR * 60 - MEET_REMIND_MINUTES
+    minutes = now.hour * 60 + now.minute
+    if remind_from <= minutes < MEET_HOUR * 60 and meet_hour.get("reminded") != today:
+        meet_hour["reminded"] = today  # спершу позначаємо — щоб після перезапуску не надіслати двічі
+        meet_hour["chats_start"] = None
+        meet_hour["peak"] = 0
+        meet_hour["sent"] = 0
+        request_save()
+        task = asyncio.get_running_loop().create_task(_meet_broadcast(meet_recipients()))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    if meet_is_live(now):
+        if meet_hour.get("chats_start") is None:
+            meet_hour["chats_start"] = _total_chats_sum()
+            request_save()
+        meet_hour["peak"] = max(meet_hour.get("peak", 0), online_now())
+    elif now.hour == (MEET_HOUR + 1) % 24 and meet_hour.get("summary") != today and meet_hour.get("chats_start") is not None:
+        meet_hour["summary"] = today
+        chats = max(0, (_total_chats_sum() - meet_hour["chats_start"]) // 2)
+        request_save()
+        if ADMIN_ID:
+            await safe_send(
+                ADMIN_ID,
+                "⏰ <b>Година знайомств — підсумок</b>\n\n"
+                f"📨 Нагадування отримали: <b>{meet_hour.get('sent', 0)}</b>\n"
+                f"🟢 Пік онлайну: <b>{meet_hour.get('peak', 0)}</b>\n"
+                f"💬 Нових чатів за годину: <b>{chats}</b>",
+            )
+
+
+@dp.message(Command("meettest"))
+async def meet_test(message: types.Message, state: FSMContext):
+    """Адмін: подивитися, як виглядає нагадування (надсилається тільки тобі)."""
+    if not _is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer(meet_reminder_text(), reply_markup=meet_keyboard())
+    await message.answer(f"👆 Так виглядатиме нагадування. Отримають зараз: {len(meet_recipients())} людей.")
 
 
 # ---------------------------------------------------------------------------

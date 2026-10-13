@@ -259,6 +259,7 @@ ref_contest: dict = {"week": None, "counts": {}, "awarded": [], "history": []}
 # 🏆 Топ тижня співрозмовників (за 👍/👎). Тиждень = з неділі 20:00 до неділі 20:00 за Києвом.
 # {"week", "votes": {user_id: [👍, 👎]}, "pairs": {"хто:кого"}, "published": [тижні], "history": [{"week","winners"}]}
 top_week: dict = {"week": None, "votes": {}, "pairs": set(), "published": [], "history": []}
+meet_hour: dict = {"reminded": None, "summary": None, "chats_start": None, "peak": 0, "sent": 0}
 last_chat_seconds: dict[int, float] = {}  # тривалість щойно завершеного чату (для права оцінки в топі)
 pending_top: dict[int, bool] = {}  # чи піде наступна оцінка цієї людини в топ тижня
 reports: list[dict] = []  # {"id", "from", "on", "time", "status"}
@@ -951,6 +952,7 @@ def init_user(user_id: int) -> dict:
             "notify_tips": True,  # підказки (напр. про фільтр за статтю)
             "allow_invites": True,  # приймати запрошення в чат від друзів/минулих співрозмовників
             "notify_waiting": True,  # кликати, коли хтось чекає співрозмовника
+            "notify_meet": True,  # ⏰ нагадування про Годину знайомств (щодня о 20:55)
             "wait_ping_at": 0.0,  # коли востаннє кликали цю людину (час)
             "joined_at": None,  # коли вперше зайшов у бот (час); у старих користувачів невідомо
             "tg_username": None,  # @username у Telegram (для списку новачків в адмінці)
@@ -1491,6 +1493,7 @@ def _make_snapshot() -> bytes:
             "banners": banners,
             "ref_contest": ref_contest,
             "top_week": top_week,
+            "meet_hour": meet_hour,
         },
         protocol=4,
     )
@@ -1530,6 +1533,8 @@ def _apply_snapshot(blob: bytes):
     ref_contest.update(data.get("ref_contest") or {"week": None, "counts": {}, "awarded": [], "history": []})
     top_week.clear()
     top_week.update(data.get("top_week") or {"week": None, "votes": {}, "pairs": set(), "published": [], "history": []})
+    meet_hour.clear()
+    meet_hour.update(data.get("meet_hour") or {"reminded": None, "summary": None, "chats_start": None, "peak": 0, "sent": 0})
 
     # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
     saved_counter = user_counter
