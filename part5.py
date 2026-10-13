@@ -1286,6 +1286,7 @@ async def setup_bot_commands():
         types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
+    DEFAULT_COMMANDS[:] = default_commands
     if LANG_RU_ENABLED:
         try:  # меню команд російською — для тих, у кого Telegram російською
             ru_commands = [types.BotCommand(command=c.command, description=tr_ru(c.description)) for c in default_commands]

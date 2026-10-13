@@ -91,6 +91,7 @@ if "RU_PAIRS" not in globals():
             logging.warning("🌐 LANG_RU=1, але файл lang_ru.py не знайдено поруч із ботом — переклад вимкнено")
 
 _CYR = "а-яіїєґёА-ЯІЇЄҐЁ'ʼ"
+_GRN_RX = re.compile(f"(?<![{_CYR}])грн(?![{_CYR}])")
 _tr_rx = None
 _tr_map: dict = {}
 _tr_back: dict = {}
@@ -125,8 +126,11 @@ def tr_ru(text: str) -> str:
     if not text or _tr_rx is None:
         return text
     if text in _tr_map:
-        return _tr_map[text]
-    return _tr_rx.sub(lambda m: _tr_map.get(m.group(0), m.group(0)), text)
+        out = _tr_map[text]
+    else:
+        out = _tr_rx.sub(lambda m: _tr_map.get(m.group(0), m.group(0)), text)
+    # для російськомовних ціни показуємо в зірках Telegram: 1 грн балансу = 1 ⭐
+    return _GRN_RX.sub("⭐", out)
 
 
 def translate_out(text, lang: str):
@@ -142,6 +146,24 @@ def translate_out(text, lang: str):
         else:
             out.append(tr_ru(chunk) if lang == "ru" else chunk)
     return "".join(out)
+
+
+DEFAULT_COMMANDS: list = []  # заповнюється при старті; для меню команд мовою людини
+
+
+async def apply_lang_commands(user_id: int, lang: str):
+    """Меню команд (кнопка «/») мовою, яку людина обрала в боті."""
+    if not DEFAULT_COMMANDS or user_id == ADMIN_ID:
+        return  # у адміна свій список команд — не чіпаємо
+    try:
+        scope = types.BotCommandScopeChat(chat_id=user_id)
+        if lang == "ru":
+            cmds = [types.BotCommand(command=c.command, description=tr_ru(c.description)) for c in DEFAULT_COMMANDS]
+            await bot.set_my_commands(cmds, scope=scope)
+        else:
+            await bot.delete_my_commands(scope=scope)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Команди для мови: %s", e)
 
 
 def user_lang(user_id) -> str:

@@ -80,6 +80,7 @@ async def lang_new_pick(call: types.CallbackQuery, state: FSMContext):
     except TelegramAPIError:
         pass
     await call.answer()
+    await apply_lang_commands(call.from_user.id, u["lang"])
     await send_welcome(call.from_user.id, call.from_user.first_name, u, state)
 
 
@@ -111,6 +112,7 @@ async def lang_set(call: types.CallbackQuery):
     except TelegramAPIError:
         pass
     await call.answer()
+    await apply_lang_commands(uid, new)
     await safe_send(uid, "✅ Мову змінено: українська." if new == "uk" else "✅ Язык изменён: русский.",
                     reply_markup=get_main_keyboard())
 
@@ -972,11 +974,12 @@ async def topup_show_methods(message: types.Message, user_id: int, amount: int):
         buttons.append(
             [InlineKeyboardButton(text=f"💎 Крипта (~{usdt} USDT)", callback_data=f"topup_crypto_{amount}")]
         )
-    if mono_jar_link():
+    ua_only = user_lang(user_id) != "ru"  # Банка й переказ на картку — лише для українців (гривня)
+    if mono_jar_link() and ua_only:
         buttons.append(
             [InlineKeyboardButton(text="🫙 Оплатити через Банку monobank", callback_data=f"topup_jar_{amount}")]
         )
-    if PAY_CARD or PAY_IBAN:
+    if (PAY_CARD or PAY_IBAN) and ua_only:
         buttons.append(
             [InlineKeyboardButton(text="🏦 Переказ на картку / за реквізитами", callback_data=f"topup_bank_{amount}")]
         )
