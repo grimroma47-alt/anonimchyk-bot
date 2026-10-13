@@ -37,8 +37,23 @@ async def start_handler(message: types.Message, state: FSMContext):
                         f"У подарунок — {REFERRAL_PREMIUM_DAYS} днів Premium 💎",
                     )
 
+    code = (getattr(message.from_user, "language_code", None) or "uk").lower()
+    if LANG_RU_ENABLED and is_new_user and not code.startswith("uk"):
+        await message.answer(
+            "🌐 Обери мову / Выбери язык:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=LANG_LABELS["uk"], callback_data="lang_new_uk"),
+                InlineKeyboardButton(text=LANG_LABELS["ru"], callback_data="lang_new_ru"),
+            ]]),
+        )
+        return
+    await send_welcome(message.chat.id, message.from_user.first_name, u, state, message)
+
+
+async def send_welcome(chat_id: int, first_name, u: dict, state: FSMContext, message=None):
+    user_id = chat_id
     welcome = (
-        f"Привіт, {esc(message.from_user.first_name)}! Вітаємо в анонімному чаті! 🤫\n\n"
+        f"Привіт, {protect_text(esc(first_name))}! Вітаємо в анонімному чаті! 🤫\n\n"
         f"Твій унікальний номер: <b>{u['custom_id']}</b>\n"
         "Змінити профіль можна будь-коли: ⚙️ Налаштування → ✏️ Мій профіль.\n\n"
         "📜 Користуючись ботом, ти погоджуєшся з правилами: /rules"
@@ -46,9 +61,58 @@ async def start_handler(message: types.Message, state: FSMContext):
     if not u.get("founder_no") and founder_promo_line():
         welcome += "\n\n" + founder_promo_line()
     if not await send_banner(user_id, "start", caption=welcome, reply_markup=get_main_keyboard()):
-        await message.answer(welcome, reply_markup=get_main_keyboard())
+        if message is not None:
+            await message.answer(welcome, reply_markup=get_main_keyboard())
+        else:
+            await safe_send(chat_id, welcome, reply_markup=get_main_keyboard())
     if not profile_complete(u):
-        await start_onboarding(message.chat.id, state)
+        await start_onboarding(chat_id, state)
+
+
+@dp.callback_query(F.data.in_({"lang_new_uk", "lang_new_ru"}))
+async def lang_new_pick(call: types.CallbackQuery, state: FSMContext):
+    u = init_user(call.from_user.id)
+    u["lang"] = "ru" if call.data == "lang_new_ru" else "uk"
+    request_save()
+    CUR_LANG.set(u["lang"])
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+    await send_welcome(call.from_user.id, call.from_user.first_name, u, state)
+
+
+@dp.callback_query(F.data == "lang_menu")
+async def lang_menu(call: types.CallbackQuery):
+    await call.message.answer(
+        "🌐 Обери мову / Выбери язык:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=LANG_LABELS["uk"], callback_data="lang_set_uk"),
+            InlineKeyboardButton(text=LANG_LABELS["ru"], callback_data="lang_set_ru"),
+        ]]),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.in_({"lang_set_uk", "lang_set_ru"}))
+async def lang_set(call: types.CallbackQuery):
+    uid = call.from_user.id
+    u = init_user(uid)
+    new = "ru" if call.data == "lang_set_ru" else "uk"
+    if uid in active_chats or uid in queue or uid in user_room:
+        await call.answer("Спочатку заверши чат або пошук.", show_alert=True)
+        return
+    u["lang"] = new
+    request_save()
+    CUR_LANG.set(new)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+    await safe_send(uid, "✅ Мову змінено: українська." if new == "uk" else "✅ Язык изменён: русский.",
+                    reply_markup=get_main_keyboard())
 
 
 @dp.message(Command("cancel"))
@@ -456,7 +520,7 @@ async def support_finish(message: types.Message, state: FSMContext):
     )
     ok = await safe_send(
         ADMIN_ID,
-        f"🆘 <b>Повідомлення від</b> {admin_label(user_id)}:\n\n{esc(message.text)}",
+        f"🆘 <b>Повідомлення від</b> {admin_label(user_id)}:\n\n{protect_text(esc(message.text))}",
         reply_markup=kb,
     )
     if ok:

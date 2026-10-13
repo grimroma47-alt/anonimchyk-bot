@@ -578,7 +578,7 @@ async def _admin_gift_deliver(state: FSMContext, note: str | None, reply):
     title = GIFT_CATALOG[key][0]
     text = f"🎁 <b>Тобі подарунок від команди ANONimchyk!</b>\n\n{esc(title)}"
     if note:
-        text += f"\n\n💌 <i>{esc(note)}</i>"
+        text += f"\n\n💌 <i>{protect_text(esc(note))}</i>"
     text += (
         "\n\nВін уже у твоєму інвентарі (👤 Мій профіль). "
         "Можеш залишити собі або подарувати співрозмовнику під час чату 💜"
@@ -817,7 +817,163 @@ async def contest_loop():
             await contest_tick()
         except Exception as e:  # noqa: BLE001
             logging.warning("Конкурс запрошень: %s", e)
-        await asyncio.sleep(300)
+        try:
+            await top_tick()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Топ тижня: %s", e)
+        await asyncio.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# 🏆 Топ тижня: найкращі співрозмовники за 👍/👎, підсумки щонеділі о 20:00 (Київ)
+# ---------------------------------------------------------------------------
+TOP_MIN_CHAT_SECONDS = 90  # коротші чати в топі не оцінюються
+TOP_MIN_VOTES = int(os.getenv("TOP_MIN_VOTES", "20"))  # мінімум оцінок за тиждень, щоб потрапити в топ
+TOP_PUBLISH_HOUR = 20  # неділя, 20:00 за Києвом
+TOP_PRIZES = [("🥇", 7), ("🥈", 3), ("🥉", 3)]  # місце -> днів Premium
+TOP_STICKER_FILE_ID = os.getenv("TOP_STICKER_FILE_ID", "")  # анімований стікер-нагорода (file_id)
+
+
+def top_week_key(now: datetime | None = None) -> str:
+    """Тиждень топу закінчується в неділю о 20:00: зсуваємо час на 4 год, і неділя 20:00 стає понеділком."""
+    now = now or datetime.now(KYIV_TZ)
+    shifted = (now + timedelta(hours=24 - TOP_PUBLISH_HOUR)).date()
+    return contest_week_key(shifted)
+
+
+def top_record_vote(rater_id: int, target_id: int, up: bool):
+    """Оцінка після справжнього чату (≥ 90 с). Одна людина оцінює іншу в топі лише раз на тиждень."""
+    if rater_id == target_id or target_id in banned_users or rater_id in banned_users:
+        return
+    current = top_week_key()
+    if top_week.get("week") is None:
+        top_week["week"] = current
+    if top_week.get("week") != current:
+        return  # тиждень щойно закінчився — підсумки ще рахуються, ця оцінка в топ не йде
+    pairs = top_week.setdefault("pairs", set())
+    key = f"{rater_id}:{target_id}"
+    if key in pairs:
+        return
+    pairs.add(key)
+    v = top_week.setdefault("votes", {}).setdefault(target_id, [0, 0])
+    v[0 if up else 1] += 1
+    request_save()
+
+
+def top_ranking() -> list[tuple[int, int, int, int]]:
+    """[(user_id, 👍, 👎, %)] — вище більший відсоток 👍, при рівності — більше 👍."""
+    items = []
+    for uid, (up, down) in (top_week.get("votes") or {}).items():
+        total = up + down
+        if total < TOP_MIN_VOTES or uid in banned_users or uid == ADMIN_ID or uid not in users_db:
+            continue
+        items.append((uid, up, down, round(up * 100 / total)))
+    items.sort(key=lambda t: (-t[1] / (t[1] + t[2]), -t[1]))
+    return items
+
+
+async def _top_broadcast(text: str):
+    for uid in list(users_db):
+        if uid in banned_users or uid < 0:
+            continue
+        await safe_send(uid, text)
+        await asyncio.sleep(0.05)  # ~20 повідомлень за секунду — в межах лімітів Telegram
+
+
+async def top_publish(week: str):
+    """Підсумки тижня: рівно один раз (навіть після перезапуску на Render)."""
+    published = top_week.setdefault("published", [])
+    if week in published:
+        return
+    published.append(week)
+    top_week["published"] = published[-20:]
+    request_save()
+    now = time.time()
+    winners = []
+    for (medal, days), (uid, up, down, pct) in zip(TOP_PRIZES, top_ranking()):
+        u = users_db[uid]
+        current = u["perks"].get("premium", 0)
+        if current == float("inf"):
+            prize = "у тебе вже вічний Premium 💎"
+        else:
+            # не накопичується: просто N днів від зараз (якщо вже є довший — нічого не забираємо)
+            u["perks"]["premium"] = max(current, now + days * DAY)
+            prize = f"Premium на {days} {_plural(days, 'день', 'дні', 'днів')}"
+        u["top_week_count"] = u.get("top_week_count", 0) + 1
+        winners.append((uid, up, down, pct, medal))
+        await safe_send(
+            uid,
+            f"🏆 <b>Ти в топі тижня!</b> {medal} місце\n\n"
+            f"👍 {up} · 👎 {down} — {pct}% співрозмовників залишились задоволені.\n"
+            f"Твоя нагорода: <b>{prize}</b> + значок «🏆 Був у топі» в профілі.\n\nДякуємо, що робиш чат кращим ❤️",
+        )
+        if TOP_STICKER_FILE_ID:
+            try:
+                await bot.send_sticker(uid, TOP_STICKER_FILE_ID)
+            except TelegramAPIError:
+                pass
+    top_week.setdefault("history", []).append({"week": week, "winners": winners})
+    top_week["history"] = top_week["history"][-10:]
+    request_save()
+    if not winners:
+        if ADMIN_ID:
+            await safe_send(ADMIN_ID, f"🏆 Топ тижня: ніхто не набрав {TOP_MIN_VOTES} оцінок — розсилку пропущено.")
+        return
+    lines = [
+        f"{medal} <b>{esc(users_db[uid]['nickname'])}</b> — 👍 {pct}% ({up + down} оцінок)"
+        for uid, up, down, pct, medal in winners
+    ]
+    text = (
+        "🏆 <b>Топ співрозмовників тижня</b>\n\n" + "\n".join(lines) +
+        "\n\nЇх оцінили найтепліше ❤️ Став 👍 після гарної розмови — "
+        "і наступного тижня тут можеш бути ти. Деталі: /best"
+    )
+    task = asyncio.get_running_loop().create_task(_top_broadcast(text))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def top_tick():
+    if not _contest_can_write():
+        return
+    current = top_week_key()
+    week = top_week.get("week")
+    if week == current:
+        return
+    if week:
+        await top_publish(week)
+    top_week["week"] = current
+    top_week["votes"] = {}
+    top_week["pairs"] = set()
+    request_save()
+
+
+def top_text(user_id: int) -> str:
+    up, down = (top_week.get("votes") or {}).get(user_id, [0, 0])
+    total = up + down
+    lines = ["🏆 <b>Топ співрозмовників тижня</b>\n",
+             "Після чату довше 1,5 хв співрозмовники ставлять 👍 або 👎. "
+             f"Щонеділі о 20:00 трійка з найбільшим відсотком 👍 (від {TOP_MIN_VOTES} оцінок) отримує нагороди:",
+             "🥇 Premium на 7 днів · 🥈🥉 Premium на 3 дні + значок «🏆 Був у топі»\n",
+             f"<b>Твій тиждень:</b> 👍 {up} · 👎 {down}"]
+    if total < TOP_MIN_VOTES:
+        lines.append(f"До участі ще {TOP_MIN_VOTES - total} {_plural(TOP_MIN_VOTES - total, 'оцінка', 'оцінки', 'оцінок')}.")
+    else:
+        place = next((i for i, t in enumerate(top_ranking(), 1) if t[0] == user_id), None)
+        lines.append(f"Зараз ти на <b>{place}</b> місці ({round(up * 100 / total)}% 👍).")
+    last = (top_week.get("history") or [None])[-1]
+    if last and last.get("winners"):
+        lines.append("\n<b>Минулого тижня:</b>")
+        for uid, _up, _down, pct, medal in last["winners"]:
+            lines.append(f"{medal} {esc(users_db.get(uid, {}).get('nickname', '?'))} — {pct}%")
+    return "\n".join(lines)
+
+
+@dp.message(Command("best"))
+async def top_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    init_user(message.from_user.id)
+    await message.answer(top_text(message.from_user.id))
 
 
 def contest_on_real_chat(user_id: int):
@@ -1047,7 +1203,7 @@ async def relay_messages(message: types.Message):
                 return
             u = init_user(user_id)
             task_event(user_id, "room_msg")
-            broadcast_text = f"<b>{esc(u['nickname'])}:</b> {esc(message.text)}"
+            broadcast_text = f"<b>{esc(u['nickname'])}:</b> {protect_text(esc(message.text))}"
             for member_id in list(room["members"]):
                 if member_id == user_id:
                     continue
@@ -1122,6 +1278,7 @@ async def setup_bot_commands():
         types.BotCommand(command="myinterests", description="🧩 Мої інтереси в профілі"),
         types.BotCommand(command="tasks", description="📋 Щоденні завдання"),
         types.BotCommand(command="contest", description="🏆 Конкурс запрошень"),
+        types.BotCommand(command="best", description="🌟 Топ співрозмовників тижня"),
         types.BotCommand(command="founders", description="👑 Засновники — перші 100"),
         types.BotCommand(command="rules", description="📜 Правила"),
         types.BotCommand(command="safety", description="🛡 Безпека"),
@@ -1129,6 +1286,12 @@ async def setup_bot_commands():
         types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
+    if LANG_RU_ENABLED:
+        try:  # меню команд російською — для тих, у кого Telegram російською
+            ru_commands = [types.BotCommand(command=c.command, description=tr_ru(c.description)) for c in default_commands]
+            await bot.set_my_commands(ru_commands, scope=types.BotCommandScopeDefault(), language_code="ru")
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Команди російською: %s", e)
 
     if ADMIN_ID:
         admin_commands = default_commands + [

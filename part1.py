@@ -58,6 +58,7 @@ async def track_last_seen(handler, event, data):
     try:
         user = data.get("event_from_user")
         if user is not None:
+            CUR_LANG.set((users_db.get(user.id) or {}).get("lang", "uk") if LANG_RU_ENABLED else "uk")
             last_seen[user.id] = time.time()
             stats_day()["active"].add(user.id)
             known = users_db.get(user.id)
@@ -67,6 +68,150 @@ async def track_last_seen(handler, event, data):
     except Exception:  # noqa: BLE001 — облік онлайну ніколи не має ламати обробку повідомлень
         pass
     return await handler(event, data)
+
+# ---------------------------------------------------------------------------
+# 🌐 Мови: перекладач «на виході». Українська — основна; російська вмикається LANG_RU=1 у Render.
+# Код бота пише тексти українською, а перед відправкою людині з мовою "ru" вони перекладаються
+# за словником RU_PAIRS (файл lang_ru.py). Кнопки, натиснуті російською, перекладаються назад.
+# Повідомлення людей одне одному НЕ перекладаються (copy_to і захищені шматки protect_text).
+# ---------------------------------------------------------------------------
+import contextvars
+
+LANG_RU_ENABLED = os.getenv("LANG_RU", "0") == "1"
+LANG_LABELS = {"uk": "🇺🇦 Українська", "ru": "🌐 Русский"}
+CUR_LANG: contextvars.ContextVar = contextvars.ContextVar("cur_lang", default="uk")
+_P0, _P1 = "⁣", "⁤"  # невидимі межі «не перекладати» (текст людей)
+
+if "RU_PAIRS" not in globals():
+    try:
+        from lang_ru import RU_PAIRS  # коли main.py запускається напряму, а не через запускач
+    except ImportError:
+        RU_PAIRS = {}
+        if LANG_RU_ENABLED:
+            logging.warning("🌐 LANG_RU=1, але файл lang_ru.py не знайдено поруч із ботом — переклад вимкнено")
+
+_CYR = "а-яіїєґёА-ЯІЇЄҐЁ'ʼ"
+_tr_rx = None
+_tr_map: dict = {}
+_tr_back: dict = {}
+
+
+def _tr_build():
+    global _tr_rx, _tr_map, _tr_back
+    _tr_map = {k: v for k, v in RU_PAIRS.items() if k and k != v}
+    parts = []
+    for k in sorted(_tr_map, key=len, reverse=True):
+        if len(k.strip()) < 3:
+            continue  # короткі шматки («з», «Ні») — лише як цілий текст, не всередині речень
+        pat = re.escape(k)
+        if re.match(f"[{_CYR}]", k[0]):
+            pat = f"(?<![{_CYR}])" + pat
+        if re.match(f"[{_CYR}]", k[-1]):
+            pat += f"(?![{_CYR}])"
+        parts.append(pat)
+    _tr_rx = re.compile("|".join(parts)) if parts else None
+    # зворотний словник лише для цілих фраз (кнопки, короткі відповіді)
+    _tr_back = {v.strip(): k.strip() for k, v in _tr_map.items() if "\n" not in k and len(k) <= 64}
+
+
+def protect_text(text) -> str:
+    """Позначає текст людини, щоб перекладач його не чіпав."""
+    return f"{_P0}{text}{_P1}"
+
+
+def tr_ru(text: str) -> str:
+    if _tr_rx is None:
+        _tr_build()
+    if not text or _tr_rx is None:
+        return text
+    if text in _tr_map:
+        return _tr_map[text]
+    return _tr_rx.sub(lambda m: _tr_map.get(m.group(0), m.group(0)), text)
+
+
+def translate_out(text, lang: str):
+    """Переклад вихідного тексту; шматки між _P0/_P1 лишаються як є. Для "uk" лише прибирає позначки."""
+    if not isinstance(text, str):
+        return text
+    if _P0 not in text:
+        return tr_ru(text) if lang == "ru" else text
+    out = []
+    for i, chunk in enumerate(re.split(f"({_P0}.*?{_P1})", text, flags=re.S)):
+        if chunk.startswith(_P0) and chunk.endswith(_P1):
+            out.append(chunk[1:-1])
+        else:
+            out.append(tr_ru(chunk) if lang == "ru" else chunk)
+    return "".join(out)
+
+
+def user_lang(user_id) -> str:
+    if not LANG_RU_ENABLED:
+        return "uk"
+    u = users_db.get(user_id) if isinstance(user_id, int) else None
+    return (u or {}).get("lang", "uk") if u is not None else CUR_LANG.get()
+
+
+def _tr_markup(markup, lang):
+    if markup is None:
+        return None
+    if hasattr(markup, "inline_keyboard"):
+        rows = [[b.model_copy(update={"text": translate_out(b.text, lang)}) for b in row] for row in markup.inline_keyboard]
+        return markup.model_copy(update={"inline_keyboard": rows})
+    if hasattr(markup, "keyboard"):
+        rows = [[b.model_copy(update={"text": translate_out(b.text, lang)}) for b in row] for row in markup.keyboard]
+        return markup.model_copy(update={"keyboard": rows})
+    return markup
+
+
+async def i18n_request_middleware(make_request, bot_, method):
+    """Перекладає все, що бот надсилає (текст, підписи, кнопки, спливаючі відповіді)."""
+    try:
+        chat_id = getattr(method, "chat_id", None)
+        lang = user_lang(chat_id) if isinstance(chat_id, int) else (CUR_LANG.get() if LANG_RU_ENABLED else "uk")
+        upd = {}
+        for name in ("text", "caption", "title", "description"):
+            val = getattr(method, name, None)
+            if isinstance(val, str) and (lang == "ru" or _P0 in val):
+                upd[name] = translate_out(val, lang)
+        markup = getattr(method, "reply_markup", None)
+        if lang == "ru" and markup is not None:
+            upd["reply_markup"] = _tr_markup(markup, lang)
+        if upd:
+            method = method.model_copy(update=upd)
+    except Exception as e:  # noqa: BLE001 — переклад ніколи не має ламати відправку
+        logging.warning("i18n out: %s", e)
+    return await make_request(bot_, method)
+
+
+try:
+    bot.session.middleware(i18n_request_middleware)
+except Exception as e:  # noqa: BLE001
+    logging.warning("i18n: не вдалося підключити перекладач: %s", e)
+
+
+@dp.message.outer_middleware()
+async def i18n_incoming(handler, event, data):
+    """Кнопки, натиснуті російською, перетворюємо назад на українські — і стара логіка працює як є."""
+    try:
+        uid = event.from_user.id if event.from_user else None
+        text = event.text
+        if text and user_lang(uid) == "ru":
+            if _tr_rx is None:
+                _tr_build()
+            back = _tr_back.get(text.strip())
+            in_talk = uid in active_chats or uid in user_room
+            # у чаті перекладаємо лише кнопки (починаються з емодзі), а не слова, які людина пише співрозмовнику
+            if back and (not in_talk or not re.match(f"[{_CYR}A-Za-z0-9]", text.strip()[0])):
+                new = event.model_copy(update={"text": back})
+                try:
+                    new = new.as_(event.bot)  # прив'язка до бота, щоб message.answer() працював
+                except Exception:  # noqa: BLE001
+                    pass
+                event = new
+    except Exception as e:  # noqa: BLE001
+        logging.warning("i18n in: %s", e)
+    return await handler(event, data)
+
 
 # ---------------------------------------------------------------------------
 # "База даних" у пам'яті (скидається при кожному перезапуску Render!)
@@ -89,6 +234,11 @@ banners: dict[str, str] = {}
 # Щотижневий конкурс запрошень: {"week": "2026-W41", "counts": {user_id: [кількість, час останнього]},
 # "awarded": [тижні, за які призи вже видано], "history": [{"week", "winners": [(user_id, n, приз)]}]}
 ref_contest: dict = {"week": None, "counts": {}, "awarded": [], "history": []}
+# 🏆 Топ тижня співрозмовників (за 👍/👎). Тиждень = з неділі 20:00 до неділі 20:00 за Києвом.
+# {"week", "votes": {user_id: [👍, 👎]}, "pairs": {"хто:кого"}, "published": [тижні], "history": [{"week","winners"}]}
+top_week: dict = {"week": None, "votes": {}, "pairs": set(), "published": [], "history": []}
+last_chat_seconds: dict[int, float] = {}  # тривалість щойно завершеного чату (для права оцінки в топі)
+pending_top: dict[int, bool] = {}  # чи піде наступна оцінка цієї людини в топ тижня
 reports: list[dict] = []  # {"id", "from", "on", "time", "status"}
 report_counter = 0
 ads: list[dict] = []  # реклама в черзі пошуку: {"id","text","url","active","shows","created"}
@@ -329,6 +479,7 @@ ACHIEVEMENTS = {
     "gift10": ("🎁 Щедра душа", lambda u: u.get("gifts_sent_count", 0) >= 10),
     "streak5": ("🔥 На хвилі", lambda u: u.get("checkin_streak", 0) >= 5),
     "premium": ("💎 Преміум-підписник", lambda u: is_premium(u)),
+    "top_week": ("🏆 Був у топі", lambda u: u.get("top_week_count", 0) > 0),
 }
 
 
@@ -603,6 +754,8 @@ def get_settings_keyboard(u: dict | None = None):
             ],
             [InlineKeyboardButton(text="🏆 Конкурс запрошень", callback_data="contest_open")],
             [InlineKeyboardButton(text="📋 Чорний список", callback_data="bl_view")],
+            *([[InlineKeyboardButton(text=f"🌐 Мова / Язык: {LANG_LABELS.get(u.get('lang', 'uk'), '')}", callback_data="lang_menu")]]
+              if LANG_RU_ENABLED else []),
             [
                 InlineKeyboardButton(
                     text=f"🔒 Захист моїх медіа: {'увімк ✅' if u.get('protect_media') else 'вимк'} (💎)",
@@ -780,6 +933,8 @@ def init_user(user_id: int) -> dict:
             "joined_at": None,  # коли вперше зайшов у бот (час); у старих користувачів невідомо
             "tg_username": None,  # @username у Telegram (для списку новачків в адмінці)
             "tg_name": None,  # ім'я в Telegram
+            "lang": "uk",  # мова інтерфейсу: "uk" або "ru"
+            "top_week_count": 0,  # скільки разів потрапляв у топ-3 тижня
             "founder_no": None,  # 👑 номер засновника (перші FOUNDERS_LIMIT, хто справді поспілкувався)
             "source": None,  # звідки прийшов: tt / yt / ig / ref / direct / власна мітка (з посилання ?start=...)
             "media_mode_set": False,  # чи людина сама обирала режим медіа (інакше для неповнолітніх — «без фото/відео»)
@@ -830,6 +985,8 @@ def age_in_ranges(age: int, range_keys: set) -> bool:
 
 def passes_filters(viewer: dict, candidate: dict) -> bool:
     """Чи підходить candidate під активні фільтри пошуку viewer (стать/вік/країна)."""
+    if viewer.get("lang", "uk") != candidate.get("lang", "uk"):
+        return False  # люди з різною мовою інтерфейсу не з'єднуються
     if filter_active(viewer, "gender_filter"):
         want = viewer.get("filter_gender")
         if want and candidate.get("gender") != want:
@@ -1032,6 +1189,7 @@ def get_post_chat_keyboard(partner_id: int):
 async def send_post_chat_menu(chat_id: int, partner_id: int):
     """Пропонує оцінити співрозмовника й за бажанням надіслати запит на реконект."""
     pending_rating[chat_id] = partner_id  # оцінити можна лише останнього співрозмовника і лише раз
+    pending_top[chat_id] = last_chat_seconds.pop(chat_id, 0.0) >= TOP_MIN_CHAT_SECONDS
     await safe_send(
         chat_id,
         "Оціни співрозмовника, будь ласка:",
@@ -1310,6 +1468,7 @@ def _make_snapshot() -> bytes:
             "stats_days": stats_days,
             "banners": banners,
             "ref_contest": ref_contest,
+            "top_week": top_week,
         },
         protocol=4,
     )
@@ -1347,6 +1506,8 @@ def _apply_snapshot(blob: bytes):
     banners.update(data.get("banners", {}))
     ref_contest.clear()
     ref_contest.update(data.get("ref_contest") or {"week": None, "counts": {}, "awarded": [], "history": []})
+    top_week.clear()
+    top_week.update(data.get("top_week") or {"week": None, "votes": {}, "pairs": set(), "published": [], "history": []})
 
     # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
     saved_counter = user_counter

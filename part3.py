@@ -106,14 +106,15 @@ async def room_join(call: types.CallbackQuery):
 
     global room_counter
     target_room_id = None
+    lang = (users_db.get(user_id) or {}).get("lang", "uk")
     for rid, r in rooms.items():
-        if r["topic"] == topic_key and len(r["members"]) < ROOM_CAPACITY:
+        if r["topic"] == topic_key and r.get("lang", "uk") == lang and len(r["members"]) < ROOM_CAPACITY:
             target_room_id = rid
             break
     if target_room_id is None:
         room_counter += 1
         target_room_id = f"room_{room_counter}"
-        rooms[target_room_id] = {"topic": topic_key, "members": set()}
+        rooms[target_room_id] = {"topic": topic_key, "members": set(), "lang": lang}
 
     room = rooms[target_room_id]
     u = init_user(user_id)
@@ -410,6 +411,8 @@ async def rate_up_handler(call: types.CallbackQuery):
     pending_rating.pop(call.from_user.id, None)
     u = init_user(target_id)
     u["rating_up"] = u.get("rating_up", 0) + 1
+    if pending_top.pop(call.from_user.id, False):
+        top_record_vote(call.from_user.id, target_id, True)
     task_event(call.from_user.id, "rate")
     try:
         await call.message.edit_reply_markup(reply_markup=None)
@@ -427,6 +430,8 @@ async def rate_down_handler(call: types.CallbackQuery):
     pending_rating.pop(call.from_user.id, None)
     u = init_user(target_id)
     u["rating_down"] = u.get("rating_down", 0) + 1
+    if pending_top.pop(call.from_user.id, False):
+        top_record_vote(call.from_user.id, target_id, False)
     task_event(call.from_user.id, "rate")
     await maybe_warn_low_rating(target_id, u)
     try:
@@ -678,7 +683,7 @@ async def deliver_friend_message(sender_id: int, target_id: int, message: types.
     try:
         if message.text:
             sent = await bot.send_message(
-                target_id, f"{header}\n{esc(message.text)}", reply_markup=kb, protect_content=protect
+                target_id, f"{header}\n{protect_text(esc(message.text))}", reply_markup=kb, protect_content=protect
             )
             _remember_friend_msg(target_id, sent.message_id, sender_id)
         else:
@@ -1453,7 +1458,7 @@ async def adm_reply_finish(message: types.Message, state: FSMContext):
     if not target_id:
         await message.answer("Помилка: не знайдено отримувача.")
         return
-    ok = await safe_send(target_id, f"📩 <b>Відповідь від підтримки:</b>\n{esc(message.text)}")
+    ok = await safe_send(target_id, f"📩 <b>Відповідь від підтримки:</b>\n{protect_text(esc(message.text))}")
     if ok:
         await message.answer("✅ Відповідь надіслано користувачу.")
     else:
@@ -1489,7 +1494,7 @@ def _ad_keyboard(ad: dict):
 
 
 def _ad_text(ad: dict) -> str:
-    return f"📣 <i>Реклама</i>\n\n{esc(ad['text'])}"
+    return f"📣 <i>Реклама</i>\n\n{protect_text(esc(ad['text']))}"
 
 
 async def maybe_show_ad(user_id: int):
