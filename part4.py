@@ -806,6 +806,9 @@ def on_chat_ended(a: int, b: int):
         last_chat_mode[a] = ma["mode"]
         last_chat_mode[b] = mb["mode"]
         duration = time.time() - min(ma["start"], mb["start"])
+        # оцінка йде в топ тижня лише після справжньої розмови: обидва писали
+        rated = duration if ma["msgs"] >= 1 and mb["msgs"] >= 1 else 0.0
+        last_chat_seconds[a] = last_chat_seconds[b] = rated
         if duration < REAL_CHAT_SECONDS or ma["msgs"] < 1 or mb["msgs"] < 1:
             return  # «натиснув і втік» не рахується — щоб завдання не накручували
         stat_add("real_chats")
@@ -865,7 +868,7 @@ async def tasks_menu(message: types.Message, state: FSMContext):
 # Рейтинг і інтереси профілю: кого кому підбирати першим
 # ---------------------------------------------------------------------------
 MAX_PROFILE_INTERESTS = 3
-MATCH_SCORE_MAX = 3  # 2 — однаковий «рівень» рейтингу, +1 — є спільний інтерес
+MATCH_SCORE_MAX = 4  # 2 — однаковий «рівень» рейтингу, +1 — є спільний інтерес, +1 — однаковий настрій
 
 
 def match_score(u: dict, p: dict, mode: str) -> int:
@@ -873,6 +876,8 @@ def match_score(u: dict, p: dict, mode: str) -> int:
     score = 2 if is_low_rated(u) == is_low_rated(p) else 0
     if not mode.startswith("int:") and (u.get("interests") or set()) & (p.get("interests") or set()):
         score += 1
+    if current_mood(u) and current_mood(u) == current_mood(p):
+        score += 1  # 🎭 на одній хвилі
     return score
 
 
@@ -899,6 +904,243 @@ async def send_interest_notes(user_id: int, u: dict, partner_id: int, p: dict):
     for me, other, is_open in ((user_id, p, p_open), (partner_id, u, u_open)):
         if is_open and other.get("interests"):
             await safe_send(me, f"🧩 Інтереси співрозмовника: {interests_line(other)}")
+
+
+# ---------------------------------------------------------------------------
+# 🎭 Мій настрій · 🎵 Пісня настрою · 💬 Тема дня
+# ---------------------------------------------------------------------------
+MOODS = {
+    "happy": "😊 Гарний настрій",
+    "calm": "😌 Спокійний",
+    "sleepy": "🥱 Сонний",
+    "sad": "😔 Сумно",
+    "laugh": "😂 Хочу посміятись",
+    "talk": "💬 Хочу виговоритись",
+    "deep": "🌌 На глибокі розмови",
+    "bored": "🙃 Нудно",
+}
+MOOD_TTL = 12 * 3600  # настрій «на сьогодні»: діє 12 годин
+SONG_TTL = 24 * 3600  # пісня настрою: 24 години
+SONG_MAX = 60
+TOPIC_COOLDOWN = 20  # секунд між «новими темами» в одному чаті
+_SONG_BAD = re.compile(r"(https?://|www\.|t\.me|@\w|\.com|\.ua|\.ru)", re.I)
+
+DAILY_TOPICS = [
+    "Яка пісня зараз крутиться у тебе в голові?",
+    "Куди б ти поїхав(-ла) прямо зараз, якби квиток був безкоштовний?",
+    "Яка найдивніша їжа, яку ти куштував(-ла)?",
+    "Що тебе сьогодні порадувало, навіть якась дрібниця?",
+    "Ти більше «сова» чи «жайворонок»?",
+    "Який фільм ти можеш переглядати безкінечно?",
+    "Якби ти міг(-ла) мати одну суперсилу — яку б обрав(-ла)?",
+    "Що б ти сказав(-ла) собі п'ять років тому?",
+    "Який для тебе ідеальний вихідний?",
+    "Котики чи собаки — і чому?",
+    "Яке хобі ти давно хочеш спробувати?",
+    "Який найсмішніший випадок стався з тобою цього року?",
+    "Яка пора року твоя — і за що ти її любиш?",
+    "Чого ти точно не пробачиш у дружбі?",
+    "Чай чи кава? І як саме ти його п'єш?",
+    "Яка книга або серіал змінили твій погляд на щось?",
+    "Опиши свій день трьома емодзі.",
+    "Що тебе заспокоює, коли все бісить?",
+    "Яка в тебе «дивна» звичка, про яку мало хто знає?",
+    "Якби ти відкрив(-ла) свій заклад — що б це було?",
+    "Яка мрія в тебе зараз на першому місці?",
+    "Який найкращий подарунок ти колись отримував(-ла)?",
+    "Що б ти робив(-ла), якби завтра не треба було на роботу чи навчання?",
+    "Який звук або запах нагадує тобі дитинство?",
+    "Ти віриш у кохання з першого погляду?",
+    "Що тобі легше: почати розмову чи підтримувати її?",
+    "Яке місто в Україні ти любиш найбільше?",
+    "Що ти вмієш готувати найкраще?",
+    "Чого ти навчився(-лася) за останній місяць?",
+    "Яке маленьке рішення колись сильно змінило твоє життя?",
+]
+topic_last: dict[int, float] = {}  # user_id -> коли востаннє просив нову тему в чаті
+
+
+def current_mood(u: dict) -> str | None:
+    key = u.get("mood")
+    if key in MOODS and time.time() - (u.get("mood_at") or 0) < MOOD_TTL:
+        return key
+    return None
+
+
+def current_song(u: dict) -> str | None:
+    song = u.get("song")
+    if song and time.time() - (u.get("song_at") or 0) < SONG_TTL:
+        return song
+    return None
+
+
+def mood_line(u: dict) -> str:
+    key = current_mood(u)
+    return MOODS[key] if key else "не вказано"
+
+
+def topic_of_day() -> str:
+    return DAILY_TOPICS[kyiv_today().toordinal() % len(DAILY_TOPICS)]
+
+
+def random_topic(exclude: str | None = None) -> str:
+    pool = [t for t in DAILY_TOPICS if t != exclude]
+    return random.choice(pool)
+
+
+def mood_text(u: dict) -> str:
+    song = current_song(u)
+    same = 0
+    key = current_mood(u)
+    if key:
+        same = sum(1 for uid in queue if current_mood(users_db.get(uid, {})) == key)
+    lines = [
+        "🎭 <b>Мій настрій</b>\n",
+        "Обери, як ти зараз. Співрозмовник побачить це на початку чату, "
+        "а бот спершу шукатиме когось на одній хвилі.\n",
+        f"Зараз: <b>{mood_line(u)}</b>" + (" <i>(діє 12 год)</i>" if key else ""),
+        "🎵 Пісня настрою: " + (f"«{esc(song)}»" if song else "не вказано"),
+    ]
+    if key and same:
+        lines.append(f"🔍 З таким самим настроєм зараз шукають: <b>{same}</b>")
+    lines.append(f"\n💬 <b>Тема дня:</b> {topic_of_day()}")
+    return "\n".join(lines)
+
+
+def mood_keyboard(u: dict) -> InlineKeyboardMarkup:
+    cur = current_mood(u)
+    btns = [
+        InlineKeyboardButton(text=("✅ " if k == cur else "") + label, callback_data=f"mood_set:{k}")
+        for k, label in MOODS.items()
+    ]
+    rows = [btns[i : i + 2] for i in range(0, len(btns), 2)]
+    rows.append([InlineKeyboardButton(text="🎵 Пісня настрою", callback_data="mood_song")])
+    if cur or current_song(u):
+        rows.append([InlineKeyboardButton(text="🧹 Скинути настрій і пісню", callback_data="mood_clear")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("mood"))
+async def mood_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    await message.answer(mood_text(u), reply_markup=mood_keyboard(u))
+
+
+@dp.callback_query(F.data == "mood_open")
+async def mood_open(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    await call.message.answer(mood_text(u), reply_markup=mood_keyboard(u))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("mood_set:"))
+async def mood_set(call: types.CallbackQuery):
+    key = call.data.split(":", 1)[1]
+    if key not in MOODS:
+        await call.answer("Невідомий настрій", show_alert=True)
+        return
+    u = init_user(call.from_user.id)
+    u["mood"], u["mood_at"] = key, time.time()
+    request_save()
+    try:
+        await call.message.edit_text(mood_text(u), reply_markup=mood_keyboard(u))
+    except TelegramAPIError:
+        pass
+    await call.answer(f"Настрій: {MOODS[key]}")
+
+
+@dp.callback_query(F.data == "mood_clear")
+async def mood_clear(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    u["mood"], u["mood_at"], u["song"], u["song_at"] = None, 0.0, None, 0.0
+    request_save()
+    try:
+        await call.message.edit_text(mood_text(u), reply_markup=mood_keyboard(u))
+    except TelegramAPIError:
+        pass
+    await call.answer("Скинуто")
+
+
+@dp.callback_query(F.data == "mood_song")
+async def mood_song_ask(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id in active_chats:
+        await call.answer("Пісню можна змінити після чату 🙂", show_alert=True)
+        return
+    await state.set_state(MoodStates.song)
+    await call.message.answer(
+        "🎵 Напиши пісню, яка зараз у тебе в настрої — виконавця і назву "
+        f"(до {SONG_MAX} символів).\nНаприклад: <i>Океан Ельзи — Обійми</i>\n\n"
+        "Без посилань. Скасувати: /cancel"
+    )
+    await call.answer()
+
+
+@dp.message(MoodStates.song, F.text)
+async def mood_song_save(message: types.Message, state: FSMContext):
+    text = " ".join((message.text or "").split())
+    if text.startswith("/"):
+        await state.clear()
+        await message.answer("Дію скасовано.", reply_markup=get_main_keyboard())
+        return
+    if len(text) < 2 or len(text) > SONG_MAX:
+        await message.answer(f"Напиши від 2 до {SONG_MAX} символів, наприклад: Океан Ельзи — Обійми")
+        return
+    if _SONG_BAD.search(text):
+        await message.answer("Без посилань і @нікнеймів, будь ласка — лише виконавець і назва пісні 🙂")
+        return
+    u = init_user(message.from_user.id)
+    u["song"], u["song_at"] = text, time.time()
+    request_save()
+    await state.clear()
+    await message.answer(
+        "✅ Готово! Співрозмовники побачать: 🎵 «" + protect_text(esc(text)) + "»",
+        reply_markup=get_main_keyboard(),
+    )
+    await message.answer(mood_text(u), reply_markup=mood_keyboard(u))
+
+
+def vibe_note_for(me: dict, other: dict) -> str:
+    """Що бачить людина на початку чату: настрій і пісня співрозмовника + тема дня."""
+    lines = []
+    mine, theirs = current_mood(me), current_mood(other)
+    if theirs and theirs == mine:
+        lines.append(f"🎭 Ви на одній хвилі: <b>{MOODS[theirs]}</b>")
+    elif theirs:
+        lines.append(f"🎭 Настрій співрозмовника: <b>{MOODS[theirs]}</b>")
+    song = current_song(other)
+    if song:
+        lines.append("🎵 Співрозмовник зараз слухає: «" + protect_text(esc(song)) + "»")
+    lines.append(f"💬 Тема дня: <b>{topic_of_day()}</b>")
+    lines.append("<i>Інша тема для розмови: /topic</i>")
+    return "\n".join(lines)
+
+
+async def send_vibe_notes(user_id: int, u: dict, partner_id: int, p: dict):
+    await safe_send(user_id, vibe_note_for(u, p))
+    await safe_send(partner_id, vibe_note_for(p, u))
+
+
+@dp.message(Command("topic"))
+async def topic_cmd(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await state.clear()
+        init_user(user_id)
+        await message.answer(
+            f"💬 <b>Тема дня:</b> {topic_of_day()}\n\n"
+            "Під час чату натисни /topic — і бот підкине вам обом нову тему для розмови 🎲"
+        )
+        return
+    now = time.time()
+    if now - max(topic_last.get(user_id, 0), topic_last.get(partner_id, 0)) < TOPIC_COOLDOWN:
+        await message.answer("⏳ Тему щойно змінювали — спершу обговоріть цю 🙂")
+        return
+    topic_last[user_id] = now
+    text = f"🎲 Нова тема для розмови: <b>{random_topic(topic_of_day())}</b>"
+    await message.answer(text)
+    await safe_send(partner_id, text)
 
 
 async def maybe_warn_low_rating(user_id: int, u: dict):

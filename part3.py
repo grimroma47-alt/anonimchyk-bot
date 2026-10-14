@@ -353,6 +353,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             await safe_send(partner_id, topic_note)
         if not mode.startswith("int:"):
             await send_interest_notes(user_id, u, partner_id, p)
+        await send_vibe_notes(user_id, u, partner_id, p)
         await send_match_safety(user_id, u)
         await send_match_safety(partner_id, p)
     else:
@@ -372,6 +373,8 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
         else:
             wait_text = "Шукаємо співрозмовника... Зачекай ⏳"
             schedule_filter_nudge(user_id)
+        if not current_mood(u) and mode != "flirt":
+            wait_text += "\n\n🎭 Поки чекаєш — вкажи свій настрій: /mood. Бот спершу шукатиме когось на одній хвилі."
         await message.answer(wait_text)
         await maybe_show_ad(user_id)
         schedule_wait_ping(user_id, mode)

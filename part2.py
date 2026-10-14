@@ -177,7 +177,8 @@ async def profile_handler(message: types.Message, state: FSMContext):
         + f"• <b>Рівень:</b> {get_level_title(u)} ({u.get('total_chats', 0)} чатів)\n"
         f"• <b>Серія входів:</b> {u.get('checkin_streak', 0)} 🔥\n"
         f"• <b>Рейтинг:</b> {rating_line(u)}\n"
-        f"• <b>Інтереси:</b> {interests_line(u)}\n\n"
+        f"• <b>Інтереси:</b> {interests_line(u)}\n"
+        f"• <b>Настрій:</b> {mood_line(u)}\n\n"
         f"🏆 <b>Досягнення:</b> {achievements_text}\n\n"
         f"🎒 <b>Інвентар подарунків:</b> {gifts_text}\n\n"
         f"📜 <b>Архів останніх змін профілю:</b>\n{archive_text}\n\n"
@@ -186,7 +187,8 @@ async def profile_handler(message: types.Message, state: FSMContext):
     await message.answer(
         text,
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🧩 Мої інтереси", callback_data="pi_open")]]
+            inline_keyboard=[[InlineKeyboardButton(text="🧩 Мої інтереси", callback_data="pi_open"),
+                              InlineKeyboardButton(text="🎭 Мій настрій", callback_data="mood_open")]]
         ),
     )
 
