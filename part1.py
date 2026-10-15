@@ -241,6 +241,7 @@ async def i18n_incoming(handler, event, data):
 # ---------------------------------------------------------------------------
 users_db: dict[int, dict] = {}
 queue: list[int] = []
+queue_since: dict[int, float] = {}  # user_id -> коли став у чергу (щоб прибирати тих, хто пішов)
 search_mode: dict[int, str] = {}  # user_id у черзі -> "normal" або "flirt" (флірт шукає лише флірт)
 active_chats: dict[int, int] = {}
 user_counter = 1000

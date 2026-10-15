@@ -827,7 +827,68 @@ async def contest_loop():
             await meet_tick()
         except Exception as e:  # noqa: BLE001
             logging.warning("Година знайомств: %s", e)
+        try:
+            await queue_cleanup_tick()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Черга: %s", e)
         await asyncio.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# 🧹 Жива черга: хто чекає > 3 хв — спершу «ти тут?»; хто > 10 хв — знімаємо з пошуку
+# ---------------------------------------------------------------------------
+QUEUE_STALE_AFTER = int(os.getenv("QUEUE_STALE_AFTER", "180"))  # після скількох секунд питати «ти тут?»
+QUEUE_MAX_WAIT = int(os.getenv("QUEUE_MAX_WAIT", "600"))  # після скількох секунд знімати з черги
+HERE_PING_COOLDOWN = 120
+here_pinged: dict[int, float] = {}
+
+
+async def ask_still_here(user_id: int):
+    """Хтось шукає, а ця людина в черзі давно — питаємо, чи вона ще тут."""
+    if user_id not in queue or time.time() - here_pinged.get(user_id, 0) < HERE_PING_COOLDOWN:
+        return
+    here_pinged[user_id] = time.time()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Я тут — почати чат", callback_data="here_ok")]])
+    await safe_send(user_id, "🔔 Знайшовся співрозмовник! Ти ще тут?\nНатисни кнопку — і одразу почнемо чат 👇", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "here_ok")
+async def here_ok(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if user_id in active_chats:
+        await call.answer("Ти вже в чаті 🙂")
+        return
+    mode = search_mode.get(user_id, "normal")
+    if user_id in queue:
+        queue.remove(user_id)
+    await call.answer()
+    await run_search(call.message, state, mode, user_id=user_id)
+
+
+async def queue_cleanup_tick():
+    """Раз на хвилину: хто чекає довше QUEUE_MAX_WAIT — знімаємо з пошуку і пояснюємо."""
+    now = time.time()
+    for uid in list(queue):
+        since = queue_since.get(uid)
+        if since is None:
+            queue_since[uid] = now  # старі записи (до оновлення) — відлік з цієї хвилини
+            continue
+        if now - since < QUEUE_MAX_WAIT:
+            continue
+        if uid in queue:
+            queue.remove(uid)
+        mode = search_mode.pop(uid, "normal")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Шукати знову", callback_data=f"wp_go:{mode}")]])
+        await safe_send(
+            uid,
+            f"😔 Поки ніхто не знайшовся — пошук зупинено, щоб ти не чекав(-ла) даремно.\n\n"
+            f"Натисни, щоб шукати знову. А о {MEET_HOUR}:00 — ⏰ Година знайомств, тоді онлайн найбільше людей.",
+            reply_markup=kb,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -303,6 +303,8 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
         return
 
     best = None  # (бали, позиція в черзі)
+    stale = []  # давно чекають — спершу питаємо «ти тут?», а не з'єднуємо наосліп
+    now_ts = time.time()
     for i, candidate_id in enumerate(queue):
         if search_mode.get(candidate_id, "normal") != mode:
             continue  # флірт шукає лише флірт, звичайний — лише звичайний
@@ -312,6 +314,9 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
         if mode == "flirt" and p_candidate.get("gender") == u.get("gender"):
             continue  # у флірті з'єднуємо лише хлопця з дівчиною
         if not passes_filters(u, p_candidate) or not passes_filters(p_candidate, u):
+            continue
+        if now_ts - queue_since.get(candidate_id, now_ts) > QUEUE_STALE_AFTER:
+            stale.append(candidate_id)
             continue
         score = match_score(u, p_candidate, mode)
         if best is None or score > best[0]:
@@ -333,6 +338,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             # співрозмовник заблокував бота — відкочуємо і ставимо користувача в чергу
             end_chat(user_id)
             queue.append(user_id)
+            queue_since[user_id] = time.time()
             search_mode[user_id] = mode
             await message.answer("Співрозмовник виявився недоступним. Шукаємо далі... ⏳")
             return
@@ -361,7 +367,10 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             queue.insert(0, user_id)
         else:
             queue.append(user_id)
+        queue_since[user_id] = time.time()
         search_mode[user_id] = mode
+        for sid in stale:
+            await ask_still_here(sid)
         if mode == "flirt":
             looking_for = "дівчину" if u.get("gender") == "Хлопець" else "хлопця"
             wait_text = f"❤️ Шукаємо {looking_for} для флірту... Зачекай ⏳"
@@ -377,6 +386,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             wait_text += "\n\n🎭 Поки чекаєш — вкажи свій настрій: /mood. Бот спершу шукатиме когось на одній хвилі."
         await message.answer(wait_text)
         await maybe_show_ad(user_id)
+        schedule_stuck_offer(user_id, mode)
         schedule_wait_ping(user_id, mode)
         schedule_admin_wait_alert(user_id, mode)
 
