@@ -14,8 +14,15 @@ async def lottery_menu(message: types.Message, state: FSMContext):
     u = init_user(message.from_user.id)
     await message.answer(
         "🎰 <b>Рулетка</b>\n\n"
-        f"Один спін коштує {LOTTERY_COST:.0f} грн.\n"
-        "Можливі призи: трохи грошей, великий виграш грошей або випадковий подарунок!\n"
+        f"Один спін коштує {LOTTERY_COST:.0f} грн.\n\n"
+        "<b>Що може випасти:</b>\n"
+        "🚀 Пріоритет у пошуку на 1 день — 22%\n"
+        "🎁 Подарунок в інвентар — 21,5%\n"
+        "💎 Premium на 1 день — 15%\n"
+        "🎯 Фільтр за статтю на 3 дні — 7%\n"
+        "💎 Premium на 7 днів — 4%\n"
+        "🏆 Джекпот: Premium на 30 днів — 0,5%\n\n"
+        "Призи діють лише в боті, гривні з рулетки не випадають.\n"
         f"Твій баланс: {u['balance']:.2f} грн.",
         reply_markup=get_lottery_keyboard(),
     )
@@ -36,21 +43,9 @@ async def lottery_spin_handler(call: types.CallbackQuery):
     lottery_revenue_total += LOTTERY_COST
     record_spend("lottery", LOTTERY_COST)
 
-    kind, mult = spin_lottery()
-    if kind == "nothing":
-        text = "😔 На цей раз нічого не випало. Спробуй ще раз!"
-    elif kind == "money":
-        win = round(LOTTERY_COST * mult, 2)
-        u["balance"] += win
-        lottery_revenue_total -= win
-        text = f"🎉 Виграш: <b>{win:.2f} грн</b>! Зараховано на баланс."
-    else:  # gift
-        key = random.choice(list(GIFT_CATALOG.keys()))
-        title, gift_price = GIFT_CATALOG[key]
-        u.setdefault("gifts", {})
-        u["gifts"][key] = u["gifts"].get(key, 0) + 1
-        lottery_revenue_total -= gift_price
-        text = f"🎁 Виграш: подарунок <b>{esc(title)}</b>! Додано в інвентар."
+    kind, param = spin_lottery()
+    text = lottery_apply_prize(u, kind, param)
+    request_save()
 
     text += f"\n\n💰 Баланс: {u['balance']:.2f} грн."
     await call.message.answer(text, reply_markup=get_lottery_keyboard())

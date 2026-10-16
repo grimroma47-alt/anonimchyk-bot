@@ -412,25 +412,70 @@ FRIEND_MSG_MAP_LIMIT = 50000  # щоб пам'ять не росла безкі�
 # Рулетка
 # ---------------------------------------------------------------------------
 LOTTERY_COST = float(os.getenv("LOTTERY_COST", "15"))  # грн за один спін
-# (шанс у %, тип виграшу, множник для money / None для gift)
+# Призи — ТІЛЬКИ всередині бота (перки й подарунки), жодних гривень.
+# Так рулетка не є азартною грою на гроші й не заважає майбутньому виводу коштів.
+# (шанс у %, тип, параметр): perk -> (ключ перка, секунд), gift -> (мін. ціна, макс. ціна)
 LOTTERY_TABLE = [
-    (45, "nothing", None),
-    (25, "money", 1.5),
-    (10, "money", 3),
-    (12, "gift", None),
-    (6, "money", 5),
-    (2, "money", 20),
+    (30, "nothing", None),
+    (22, "perk", ("priority", DAY)),
+    (20, "gift", (10, 25)),
+    (15, "perk", ("premium", DAY)),
+    (7, "perk", ("gender_filter", 3 * DAY)),
+    (4, "perk", ("premium", 7 * DAY)),
+    (1.5, "gift", (35, 100)),
+    (0.5, "perk", ("premium", 30 * DAY)),
 ]
+LOTTERY_PERK_NAMES = {
+    "priority": "🚀 Пріоритет у пошуку",
+    "premium": "💎 Premium",
+    "gender_filter": "🎯 Фільтр за статтю",
+}
 
 
 def spin_lottery():
     r = random.uniform(0, 100)
     cumulative = 0.0
-    for weight, kind, mult in LOTTERY_TABLE:
+    for weight, kind, param in LOTTERY_TABLE:
         cumulative += weight
         if r <= cumulative:
-            return kind, mult
+            return kind, param
     return "nothing", None
+
+
+def lottery_days_word(days: int) -> str:
+    if days % 10 == 1 and days % 100 != 11:
+        return f"{days} день"
+    if days % 10 in (2, 3, 4) and days % 100 not in (12, 13, 14):
+        return f"{days} дні"
+    return f"{days} днів"
+
+
+def lottery_random_gift(lo: float, hi: float) -> str:
+    keys = [k for k, (_t, p) in GIFT_CATALOG.items() if lo <= p <= hi]
+    return random.choice(keys or list(GIFT_CATALOG.keys()))
+
+
+def lottery_apply_prize(u: dict, kind: str, param) -> str:
+    """Видає приз і повертає текст. Гроші на баланс НЕ нараховуються ніколи."""
+    if kind == "nothing":
+        return "😔 На цей раз нічого не випало. Спробуй ще раз!"
+    if kind == "perk":
+        perk, seconds = param
+        current = u["perks"].get(perk, 0)
+        if current == float("inf"):
+            # вже назавжди — замість перка даємо подарунок
+            kind, param = "gift", (10, 25)
+        else:
+            u["perks"][perk] = max(time.time(), current) + seconds
+            days = int(seconds // DAY)
+            big = perk == "premium" and days >= 30
+            head = "🏆 <b>ДЖЕКПОТ!</b> " if big else "🎉 Виграш: "
+            return f"{head}<b>{LOTTERY_PERK_NAMES[perk]} на {lottery_days_word(days)}</b>! Вже активовано."
+    key = lottery_random_gift(*param)
+    title, _price = GIFT_CATALOG[key]
+    u.setdefault("gifts", {})
+    u["gifts"][key] = u["gifts"].get(key, 0) + 1
+    return f"🎁 Виграш: подарунок <b>{esc(title)}</b>! Додано в інвентар."
 
 
 # ---------------------------------------------------------------------------
