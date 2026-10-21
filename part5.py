@@ -1372,6 +1372,134 @@ async def paysupport_cmd(message: types.Message, state: FSMContext):
 
 
 
+
+# ---------------------------------------------------------------------------
+# 🎙 Маска голосу: голосові в анонімному чаті надходять співрозмовнику зміненим голосом.
+# Якщо змінити не вдалося — оригінал НЕ надсилаємо (анонімність понад усе).
+# ---------------------------------------------------------------------------
+VOICE_MASKS = {"low": 0.8, "high": 1.25}  # множник висоти тону
+VOICE_MASK_LABELS = {"off": "вимк", "low": "🐻 низький", "high": "🐭 високий"}
+VOICE_MAX_SECONDS = int(os.getenv("VOICE_MAX_SECONDS", "120"))
+_ffmpeg_path: str | None = None
+
+
+def ffmpeg_exe() -> str | None:
+    global _ffmpeg_path
+    if _ffmpeg_path:
+        return _ffmpeg_path
+    import shutil
+    path = shutil.which("ffmpeg")
+    if not path:
+        try:
+            import imageio_ffmpeg  # pip install imageio-ffmpeg — сам привозить ffmpeg
+            path = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("🎙 ffmpeg не знайдено: %s", e)
+            path = None
+    _ffmpeg_path = path
+    return path
+
+
+async def mask_voice_bytes(data: bytes, factor: float) -> bytes | None:
+    exe = ffmpeg_exe()
+    if not exe:
+        return None
+    af = f"asetrate=48000*{factor},aresample=48000,atempo={1 / factor:.4f},highpass=f=80,lowpass=f=7500"
+    proc = await asyncio.create_subprocess_exec(
+        exe, "-v", "error", "-i", "pipe:0", "-ac", "1", "-af", af,
+        "-c:a", "libopus", "-b:a", "48k", "-f", "ogg", "pipe:1",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(data), timeout=30)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return None
+    if proc.returncode != 0 or len(out) < 200:
+        logging.warning("🎙 ffmpeg: %s", (err or b"")[:300])
+        return None
+    return out
+
+
+async def relay_masked_voice(message: types.Message, user_id: int, partner_id: int):
+    u = users_db.get(user_id) or {}
+    factor = VOICE_MASKS.get(u.get("voice_mask"))
+    voice = message.voice
+    if voice.duration and voice.duration > VOICE_MAX_SECONDS:
+        await message.answer(f"🎙 З маскою голосу — до {VOICE_MAX_SECONDS // 60} хв. Запиши коротше 🙂")
+        return
+    try:
+        buf = await bot.download(voice)
+        raw = buf.read() if buf else b""
+        masked = await mask_voice_bytes(raw, factor) if raw else None
+    except Exception as e:  # noqa: BLE001
+        logging.warning("🎙 Маска голосу: %s", e)
+        masked = None
+    if not masked:
+        await message.answer(
+            "🎙 Не вдалося змінити голос — повідомлення НЕ надіслано, твій голос у безпеці 🛡\n"
+            "Спробуй ще раз або вимкни маску: /voice"
+        )
+        return
+    try:
+        await bot.send_voice(
+            partner_id,
+            BufferedInputFile(masked, filename="voice.ogg"),
+            caption="🎙 <i>голос змінено маскою</i>",
+            protect_content=should_protect(u),
+        )
+        on_chat_message(user_id)
+        stat_add("voice_mask")
+    except TelegramAPIError:
+        end_chat(user_id)
+        await message.answer("Не вдалося доставити повідомлення, чат завершено.", reply_markup=get_main_keyboard())
+
+
+def voice_mask_kb(u: dict):
+    cur = u.get("voice_mask") or "off"
+    def b(key):
+        mark = "✅ " if cur == key else ""
+        return InlineKeyboardButton(text=mark + {"off": "🎙 Мій голос", "low": "🐻 Низький", "high": "🐭 Високий"}[key], callback_data=f"vm_set:{key}")
+    return InlineKeyboardMarkup(inline_keyboard=[[b("off")], [b("low"), b("high")]])
+
+
+def voice_mask_text() -> str:
+    return (
+        "🎙 <b>Маска голосу</b>\n\n"
+        "Надсилай голосові в анонімному чаті — співрозмовник почує змінений голос, а не твій справжній.\n"
+        "Якщо змінити не вийде, бот оригінал не надішле 🛡\n\nОбери маску:"
+    )
+
+
+@dp.message(Command("voice"))
+async def voice_mask_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    await message.answer(voice_mask_text(), reply_markup=voice_mask_kb(u))
+
+
+@dp.callback_query(F.data == "vm_menu")
+async def voice_mask_menu(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    await call.message.answer(voice_mask_text(), reply_markup=voice_mask_kb(u))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("vm_set:"))
+async def voice_mask_set(call: types.CallbackQuery):
+    key = call.data.split(":", 1)[1]
+    if key not in ("off", "low", "high"):
+        await call.answer()
+        return
+    u = init_user(call.from_user.id)
+    u["voice_mask"] = None if key == "off" else key
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=voice_mask_kb(u))
+    except TelegramAPIError:
+        pass
+    await call.answer("🎙 Маску вимкнено" if key == "off" else f"🎙 Маска: {VOICE_MASK_LABELS[key]}")
+
 # ---------------------------------------------------------------------------
 # 🤫 Анонімні зізнання: людина пише історію → модерація адміна → публікація в канал
 # ---------------------------------------------------------------------------
@@ -1806,6 +1934,9 @@ def launch_text() -> str:
         "• тільки якщо погодитесь обоє, ви побачите нік, вік і фото одне одного;",
         "• контакт — лише якщо сам захочеш ним поділитися.",
         "",
+        "🎙 Нове: «Маска голосу» — надсилай голосові, а співрозмовник почує змінений голос. Увімкнути: /voice",
+        "🤫 І канал анонімних зізнань: @ANONimchyk_zizn",
+        "",
         "⏰ А о 21:00 — Година знайомств: найбільше людей онлайн. Саме час 💜",
     ]
     return "\n".join(lines)
@@ -1918,6 +2049,10 @@ async def relay_messages(message: types.Message):
         await message.answer("🛡 Співрозмовник не приймає фото, відео й файли — напиши текстом 🙂")
         return
 
+    if getattr(message, "voice", None) and (users_db.get(user_id) or {}).get("voice_mask") in VOICE_MASKS:
+        await relay_masked_voice(message, user_id, partner_id)
+        return
+
     try:
         await message.copy_to(chat_id=partner_id, protect_content=should_protect(users_db.get(user_id)))
         on_chat_message(user_id)
@@ -1969,6 +2104,8 @@ async def setup_bot_commands():
         types.BotCommand(command="contest", description="🏆 Конкурс запрошень"),
         types.BotCommand(command="best", description="🌟 Топ співрозмовників тижня"),
         types.BotCommand(command="mood", description="🎭 Мій настрій і пісня"),
+        types.BotCommand(command="voice", description="🎙 Маска голосу"),
+        types.BotCommand(command="confess", description="🤫 Анонімне зізнання"),
         types.BotCommand(command="topic", description="💬 Тема для розмови"),
         types.BotCommand(command="founders", description="👑 Засновники — перші 100"),
         types.BotCommand(command="rules", description="📜 Правила"),
