@@ -2517,14 +2517,6 @@ async def unmask_share(call: types.CallbackQuery):
     await safe_send(partner, f"📨 <b>{esc(u['nickname'])}</b> ділиться контактом: @{esc(username)}")
     await call.answer("Контакт надіслано 💜")
 
-
-def launch_text() -> str:
-    lines = [
-        "🎭 <b>Сьогодні о 20:00 ANONimchyk знімає маски!</b>",
-        "",
-        "Тепер у кожному чаті є кнопка «🎭 Зняти маску»:",
-        "• поспілкуйтесь трохи — і запропонуйте зняти маски;",
-        "• тільки якщо погодитесь обоє, ви побачите нік, вік і фото одне одного;",
 def launch_text() -> str:
     lines = [
         "🎭 <b>Сьогодні о 20:00 ANONimchyk знімає маски!</b>",
@@ -2807,3 +2799,4 @@ if __name__ == "__main__":
 
 
 # === КІНЕЦЬ part5.py ===
+
