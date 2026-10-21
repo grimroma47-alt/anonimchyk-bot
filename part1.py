@@ -683,19 +683,20 @@ class ConfessStates(StatesGroup):
 # Клавіатури
 # ---------------------------------------------------------------------------
 def get_main_keyboard():
+    # Зверху — дві головні дії на всю ширину, нижче — решта дрібнішими кнопками
+    K = KeyboardButton
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_SEARCH), KeyboardButton(text=BTN_VOICE_SEARCH)],
-            [KeyboardButton(text=BTN_FLIRT), KeyboardButton(text=BTN_INTERESTS)],
-            [KeyboardButton(text=BTN_TOPUP), KeyboardButton(text=BTN_WALLET)],
-            [KeyboardButton(text=BTN_PREMIUM), KeyboardButton(text=BTN_SHOP)],
-            [KeyboardButton(text=BTN_DAILY), KeyboardButton(text=BTN_TASKS)],
-            [KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_SETTINGS)],
-            [KeyboardButton(text=BTN_FRIENDS), KeyboardButton(text=BTN_ROOMS)],
-            [KeyboardButton(text=BTN_FILTERS), KeyboardButton(text=BTN_ONLINE)],
-            [KeyboardButton(text=BTN_LOTTERY), KeyboardButton(text=BTN_TOP)],
-            [KeyboardButton(text=BTN_CONFESS), KeyboardButton(text=BTN_LETTER)],
-            [KeyboardButton(text=BTN_HELP)],
+            [K(text=BTN_SEARCH)],
+            [K(text=BTN_VOICE_SEARCH)],
+            [K(text=BTN_FLIRT), K(text=BTN_INTERESTS)],
+            [K(text=BTN_PREMIUM), K(text=BTN_SHOP), K(text=BTN_WALLET)],
+            [K(text=BTN_TOPUP), K(text=BTN_DAILY)],
+            [K(text=BTN_TASKS), K(text=BTN_LOTTERY), K(text=BTN_FRIENDS)],
+            [K(text=BTN_PROFILE), K(text=BTN_SETTINGS)],
+            [K(text=BTN_ROOMS), K(text=BTN_FILTERS)],
+            [K(text=BTN_ONLINE), K(text=BTN_CONFESS), K(text=BTN_LETTER)],
+            [K(text=BTN_TOP), K(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )
