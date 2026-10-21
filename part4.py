@@ -1248,6 +1248,90 @@ FILTER_NUDGE_COOLDOWN = 24 * 3600  # не частіше разу на добу
 filter_nudge_last: dict[int, float] = {}
 
 
+# ---------------------------------------------------------------------------
+# 🛟 Порожня черга: якщо у флірті/темі довго нікого — пропонуємо звичайний пошук
+# ---------------------------------------------------------------------------
+STUCK_DELAY = int(os.getenv("STUCK_DELAY", "30"))  # секунд очікування до пропозиції
+stuck_offered: dict[int, float] = {}  # user_id -> коли пропонували (щоб не повторювати в тому ж пошуку)
+
+
+def normal_waiting_for(user_id: int) -> int:
+    """Скільки людей у звичайному пошуку, з якими цю людину реально може з'єднати."""
+    u = init_user(user_id)
+    n = 0
+    for cid in queue:
+        if cid == user_id or search_mode.get(cid, "normal") != "normal":
+            continue
+        p = init_user(cid)
+        if is_blacklisted(u, user_id, p, cid):
+            continue
+        if passes_filters(u, p) and passes_filters(p, u):
+            n += 1
+    return n
+
+
+def schedule_stuck_offer(user_id: int, mode: str):
+    if mode != "flirt" and not mode.startswith("int:"):
+        return
+    task = asyncio.get_running_loop().create_task(stuck_offer_after_wait(user_id, mode, time.time()))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def stuck_offer_after_wait(user_id: int, mode: str, started: float):
+    try:
+        await asyncio.sleep(STUCK_DELAY)
+        if user_id not in queue or search_mode.get(user_id, "normal") != mode:
+            return  # уже знайшов співрозмовника або вийшов з пошуку
+        if stuck_offered.get(user_id, 0) >= started:
+            return
+        stuck_offered[user_id] = time.time()
+        u = init_user(user_id)
+        n = normal_waiting_for(user_id)
+        if mode == "flirt":
+            who = "дівчат" if u.get("gender") == "Хлопець" else "хлопців"
+            head = f"❤️ Зараз {who} у флірт-пошуку немає."
+        else:
+            topic = INTEREST_LABELS.get(mode[4:], mode[4:])
+            head = f"🧩 Зараз ніхто не шукає співрозмовника на тему {topic}."
+        tail = (f"У звичайному пошуку вже чекає <b>{n}</b> — з'єднаю миттєво 👇" if n
+                else "Можеш перейти у звичайний пошук — там шукають усі 👇")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Перейти у звичайний пошук", callback_data="stuck_go")],
+            [InlineKeyboardButton(text="⏳ Чекати далі", callback_data="stuck_wait")],
+        ])
+        await safe_send(user_id, f"{head}\n{tail}", reply_markup=kb)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Порожня черга: %s", e)
+
+
+@dp.callback_query(F.data == "stuck_go")
+async def stuck_go(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if user_id in active_chats:
+        await call.answer("Ти вже в чаті 🙂")
+        return
+    if user_id in queue:
+        queue.remove(user_id)
+    search_mode.pop(user_id, None)
+    await call.answer()
+    await run_search(call.message, state, "normal", user_id=user_id)
+
+
+@dp.callback_query(F.data == "stuck_wait")
+async def stuck_wait(call: types.CallbackQuery):
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer("Добре, чекаємо далі ⏳ Щойно хтось з'явиться — з'єднаю.")
+
+
+
 def schedule_filter_nudge(user_id: int):
     u = init_user(user_id)
     if filter_active(u, "gender_filter") or not u.get("notify_tips", True):
