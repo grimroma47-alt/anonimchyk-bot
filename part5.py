@@ -831,6 +831,10 @@ async def contest_loop():
             await queue_cleanup_tick()
         except Exception as e:  # noqa: BLE001
             logging.warning("Черга: %s", e)
+        try:
+            await launch_tick()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Запуск «Зняти маску»: %s", e)
         await asyncio.sleep(60)
 
 
@@ -1365,6 +1369,503 @@ async def paysupport_cmd(message: types.Message, state: FSMContext):
         ),
     )
 
+
+
+
+# ---------------------------------------------------------------------------
+# 🤫 Анонімні зізнання: людина пише історію → модерація адміна → публікація в канал
+# ---------------------------------------------------------------------------
+CONFESS_CHANNEL = os.getenv("CONFESS_CHANNEL", "@ANONimchyk_zizn")
+CONFESS_MIN, CONFESS_MAX = 30, 1500
+CONFESS_COOLDOWN = int(os.getenv("CONFESS_COOLDOWN", str(3 * 3600)))  # одне зізнання на 3 години
+PHONE_REGEX = re.compile(r"(\+?\d[\d\s\-()]{8,}\d)")
+
+
+def confess_channel_link(msg_id: int | None = None) -> str:
+    name = CONFESS_CHANNEL.lstrip("@")
+    return f"https://t.me/{name}" + (f"/{msg_id}" if msg_id else "")
+
+
+def confess_cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Скасувати", callback_data="conf_cancel")]])
+
+
+@dp.message(F.text == BTN_CONFESS)
+@dp.message(Command("confess"))
+async def confess_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    if user_id in banned_users:
+        return
+    if user_id in active_chats:
+        await message.answer("🤫 Спершу заверши чат — а тоді розкажеш своє зізнання 🙂")
+        return
+    last = (confess_db.get("last_by") or {}).get(str(user_id), 0)
+    wait = int(last + CONFESS_COOLDOWN - time.time())
+    if wait > 0 and not _is_admin(user_id):
+        await message.answer(f"🤫 Наступне зізнання можна надіслати через {wait // 3600} год {wait % 3600 // 60} хв 💜")
+        return
+    await state.set_state(ConfessStates.text)
+    await message.answer(
+        "🤫 <b>Анонімне зізнання</b>\n\n"
+        "Напиши те, що не можеш сказати нікому. Ми опублікуємо це в каналі "
+        f"<a href=\"{confess_channel_link()}\">Анонімні зізнання</a> — без імені, ніку й будь-яких даних про тебе.\n\n"
+        "• не вказуй імена, адреси, телефони й @ніки — ні свої, ні чужі;\n"
+        f"• від {CONFESS_MIN} до {CONFESS_MAX} символів;\n"
+        "• перед публікацією зізнання перевіряє модератор.\n\n"
+        "Напиши своє зізнання одним повідомленням 👇",
+        reply_markup=confess_cancel_kb(),
+        disable_web_page_preview=True,
+    )
+
+
+@dp.message(ConfessStates.text)
+async def confess_got_text(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("🤫 Зізнання приймаємо лише текстом — напиши його одним повідомленням 🙂", reply_markup=confess_cancel_kb())
+        return
+    if len(text) < CONFESS_MIN:
+        await message.answer(f"Трохи коротко 🙂 Напиши хоча б {CONFESS_MIN} символів.", reply_markup=confess_cancel_kb())
+        return
+    if len(text) > CONFESS_MAX:
+        await message.answer(f"Задовго — максимум {CONFESS_MAX} символів (зараз {len(text)}). Скороти, будь ласка.", reply_markup=confess_cancel_kb())
+        return
+    if LINK_REGEX.search(text) or PHONE_REGEX.search(text):
+        await message.answer("🚫 Без посилань, @ніків і телефонів — так ніхто не дізнається, хто ти 💜 Перепиши, будь ласка.", reply_markup=confess_cancel_kb())
+        return
+    await state.update_data(confess_text=text)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Надіслати на перевірку", callback_data="conf_send")],
+            [InlineKeyboardButton(text="✏️ Переписати", callback_data="conf_again"), InlineKeyboardButton(text="❌ Скасувати", callback_data="conf_cancel")],
+        ]
+    )
+    await message.answer(
+        "Ось як це виглядатиме в каналі:\n\n"
+        f"<blockquote>{esc(text)}</blockquote>\n\n"
+        "Публікуємо анонімно? Натискаючи «Надіслати», ти погоджуєшся на публікацію цього тексту в каналі та в озвучених відео ANONimchyk у соцмережах.",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data == "conf_cancel")
+async def confess_cancel(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.message.answer("Скасовано. Повертайся, коли захочеш 💜", reply_markup=get_main_keyboard())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "conf_again")
+async def confess_again(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ConfessStates.text)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.message.answer("✏️ Добре, напиши нову версію одним повідомленням 👇", reply_markup=confess_cancel_kb())
+    await call.answer()
+
+
+def confess_admin_kb(cid: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Опублікувати", callback_data=f"conf_ok:{cid}"),
+            InlineKeyboardButton(text="❌ Відхилити", callback_data=f"conf_no:{cid}"),
+        ]]
+    )
+
+
+@dp.callback_query(F.data == "conf_send")
+async def confess_send(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    text = data.get("confess_text")
+    await state.clear()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if not text:
+        await call.answer("Зізнання не знайдено, спробуй ще раз.", show_alert=True)
+        return
+    user_id = call.from_user.id
+    cid = confess_db.get("next_id", 1)
+    confess_db["next_id"] = cid + 1
+    confess_db.setdefault("items", {})[str(cid)] = {"uid": user_id, "text": text, "at": time.time(), "status": "pending"}
+    confess_db.setdefault("last_by", {})[str(user_id)] = time.time()
+    request_save()
+    stat_add("confess")
+    u = init_user(user_id)
+    if ADMIN_ID:
+        await safe_send(
+            ADMIN_ID,
+            f"🤫 <b>Нове зізнання #{cid}</b> (від {esc(u.get('custom_id', ''))})\n\n<blockquote>{esc(text)}</blockquote>",
+            reply_markup=confess_admin_kb(cid),
+        )
+    await call.message.answer(
+        "📨 Надіслано на перевірку! Щойно зізнання з'явиться в каналі — я тобі повідомлю 💜",
+        reply_markup=get_main_keyboard(),
+    )
+    await call.answer()
+
+
+def confess_post_text(no: int, text: str) -> str:
+    return f"🤫 <b>Зізнання #{no}</b>\n\n{esc(text)}\n\n<i>Розкажи своє — анонімно 👇</i>"
+
+
+def confess_post_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🤫 Зізнатись анонімно", url=f"https://t.me/{BOT_USERNAME or 'ANONimchykbot'}?start=zizn")]]
+    )
+
+
+@dp.callback_query(F.data.startswith("conf_ok:"))
+async def confess_approve(call: types.CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await call.answer()
+        return
+    cid = call.data.split(":", 1)[1]
+    item = (confess_db.get("items") or {}).get(cid)
+    if not item or item.get("status") != "pending":
+        await call.answer("Вже оброблено.", show_alert=True)
+        return
+    no = confess_db.get("pub_no", 0) + 1
+    try:
+        msg = await bot.send_message(CONFESS_CHANNEL, confess_post_text(no, item["text"]), reply_markup=confess_post_kb())
+    except TelegramAPIError as e:
+        await call.answer(f"Не вдалося опублікувати: {e}"[:190], show_alert=True)
+        return
+    confess_db["pub_no"] = no
+    item.update(status="published", no=no, msg_id=getattr(msg, "message_id", None))
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await safe_send(
+        item["uid"],
+        f"✅ Твоє зізнання опубліковано як <b>#{no}</b>: {confess_channel_link(item.get('msg_id'))}\n\nДякуємо за довіру 💜",
+    )
+    await call.answer(f"Опубліковано #{no}")
+
+
+@dp.callback_query(F.data.startswith("conf_no:"))
+async def confess_reject(call: types.CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await call.answer()
+        return
+    cid = call.data.split(":", 1)[1]
+    item = (confess_db.get("items") or {}).get(cid)
+    if not item or item.get("status") != "pending":
+        await call.answer("Вже оброблено.", show_alert=True)
+        return
+    item["status"] = "rejected"
+    item.pop("text", None)  # відхилене не зберігаємо
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await safe_send(
+        item["uid"],
+        "🤫 Цього разу зізнання не пройшло модерацію — можливо, в ньому були чиїсь дані або воно порушує правила. "
+        "Можеш написати нове 💜",
+    )
+    await call.answer("Відхилено")
+
+# ---------------------------------------------------------------------------
+# 🎭 Зняти маску: за взаємною згодою показати одне одному нік, вік і фото профілю;
+# @username — окремою кнопкою, тільки якщо людина сама захоче. Вмикається в UNMASK_AT.
+# ---------------------------------------------------------------------------
+def _parse_unmask_at() -> datetime:
+    raw = os.getenv("UNMASK_AT", "2026-10-23T20:00")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        dt = datetime(2026, 10, 23, 20, 0)
+    return dt if dt.tzinfo else dt.replace(tzinfo=KYIV_TZ)
+
+
+UNMASK_AT = _parse_unmask_at()
+UNMASK_MIN_MSGS = int(os.getenv("UNMASK_MIN_MSGS", "5"))  # скільки повідомлень має написати КОЖЕН
+FOUNDER_PACK_URL = os.getenv("FOUNDER_PACK_URL", "")  # посилання на стікерпак «Пак засновника»
+unmask_requests: dict[int, int] = {}  # кому надіслано запит -> хто просить
+unmask_done: set[frozenset] = set()  # пари, які вже зняли маски в цьому чаті
+
+
+def unmask_live() -> bool:
+    return datetime.now(KYIV_TZ) >= UNMASK_AT
+
+
+def unmask_wait_text() -> str:
+    left = int((UNMASK_AT - datetime.now(KYIV_TZ)).total_seconds())
+    days, rem = divmod(max(left, 0), 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days} {_plural(days, 'день', 'дні', 'днів')}")
+    if hours:
+        parts.append(f"{hours} год")
+    if not days:
+        parts.append(f"{mins} хв")
+    return (
+        "🎭 <b>Зняти маску</b> відкриється в <b>п'ятницю, 23 жовтня о 20:00</b>.\n"
+        f"⏳ Залишилось: {' '.join(parts)}\n\n"
+        "Тоді за взаємною згодою ви зможете показати одне одному нік, вік і фото — "
+        "а контакт тільки якщо самі захочете 💜"
+    )
+
+
+def unmask_pair_blocked(u: dict, p: dict) -> str | None:
+    """Причина, чому пара не може зняти маски (None — можна)."""
+    a, b = get_age_int(u), get_age_int(p)
+    if a is None or b is None:
+        return "🎭 Щоб зняти маску, у вас обох має бути вказаний вік у профілі."
+    if (a < 18) != (b < 18):
+        return "🎭 Зняти маску можна лише з однолітками — так безпечніше для всіх 💜"
+    return None
+
+
+def unmask_card(u: dict) -> str:
+    badge = " 👑" if u.get("founder_no") else ""
+    g = u.get("gender", "")
+    gico = "👨" if g == "Хлопець" else "👩" if g == "Дівчина" else "🙂"
+    age = u.get("age", "")
+    country = u.get("country", "")
+    lines = [f"{gico} <b>{esc(u.get('nickname', ''))}</b>{badge}"]
+    info = ", ".join(x for x in (f"{age} р." if str(age).isdigit() else "", country if country and country != "Не вказано" else "") if x)
+    if info:
+        lines.append(info)
+    ml = mood_line(u)
+    if ml:
+        lines.append(ml)
+    return "\n".join(lines)
+
+
+def unmask_share_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="📨 Поділитися моїм @username", callback_data="unmask_share")]]
+    )
+
+
+@dp.message(F.text == BTN_UNMASK)
+@dp.message(Command("unmask"))
+async def unmask_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    if not unmask_live() and not _is_admin(user_id):
+        await message.answer(unmask_wait_text())
+        return
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await message.answer(
+            "🎭 Зняти маску можна лише під час анонімного чату — знайди співрозмовника 🙂",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+    if frozenset((user_id, partner_id)) in unmask_done:
+        await message.answer("🎭 Ви вже зняли маски в цьому чаті 💜")
+        return
+    if unmask_requests.get(partner_id) == user_id:
+        await message.answer("⏳ Запит уже надіслано — чекаємо відповіді співрозмовника.")
+        return
+    u, p = init_user(user_id), init_user(partner_id)
+    reason = unmask_pair_blocked(u, p)
+    if reason:
+        await message.answer(reason)
+        return
+    mine = (chat_meta.get(user_id) or {}).get("msgs", 0)
+    theirs = (chat_meta.get(partner_id) or {}).get("msgs", 0)
+    if min(mine, theirs) < UNMASK_MIN_MSGS:
+        await message.answer(
+            "🎭 Спершу трохи поспілкуйтесь — маску знімають, коли вже є про що говорити 🙂\n"
+            f"(кожен має написати хоча б {UNMASK_MIN_MSGS} повідомлень)"
+        )
+        return
+    if unmask_requests.get(user_id) == partner_id:  # співрозмовник уже попросив — одразу знімаємо
+        unmask_requests.pop(user_id, None)
+        await unmask_reveal(user_id, partner_id)
+        return
+    unmask_requests[partner_id] = user_id
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="🎭 Так, знімаємо", callback_data="unmask_yes"),
+            InlineKeyboardButton(text="🙈 Ще ні", callback_data="unmask_no"),
+        ]]
+    )
+    ok = await safe_send(
+        partner_id,
+        "🎭 <b>Співрозмовник пропонує зняти маски.</b>\n\n"
+        "Ви обоє побачите нік, вік і фото профілю одне одного. "
+        "Контакт (@username) — тільки якщо кожен сам захоче ним поділитися.\n\nЗнімаємо?",
+        reply_markup=kb,
+    )
+    if ok:
+        await message.answer("🎭 Запит надіслано. Маски знімуться, тільки якщо співрозмовник погодиться 💜")
+    else:
+        unmask_requests.pop(partner_id, None)
+        await message.answer("❌ Не вдалося надіслати запит.")
+
+
+async def _send_unmask_card(to_id: int, about_id: int):
+    about = init_user(about_id)
+    text = "🎭 <b>Маски знято!</b> Ось хто з тобою говорив:\n\n" + unmask_card(about)
+    photo_id = None
+    try:
+        photos = await bot.get_user_profile_photos(about_id, limit=1)
+        if photos and photos.total_count and photos.photos:
+            photo_id = photos.photos[0][-1].file_id
+    except Exception as e:  # noqa: BLE001
+        logging.info("Фото профілю %s: %s", about_id, e)
+    if photo_id:
+        try:
+            await bot.send_photo(to_id, photo_id, caption=text, protect_content=True)
+            return
+        except TelegramAPIError:
+            pass
+    await safe_send(to_id, text + "\n\n<i>(фото профілю приховане)</i>")
+
+
+async def unmask_reveal(a: int, b: int):
+    if active_chats.get(a) != b:
+        return
+    unmask_done.add(frozenset((a, b)))
+    stat_add("unmask")
+    await _send_unmask_card(a, b)
+    await _send_unmask_card(b, a)
+    note = (
+        "Хочеш продовжити спілкування поза ботом? Поділись контактом — тільки якщо сам цього хочеш. "
+        "А можна й далі говорити тут 💜"
+    )
+    await safe_send(a, note, reply_markup=unmask_share_kb())
+    await safe_send(b, note, reply_markup=unmask_share_kb())
+
+
+@dp.callback_query(F.data == "unmask_yes")
+async def unmask_yes(call: types.CallbackQuery):
+    me = call.from_user.id
+    requester = unmask_requests.pop(me, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if requester is None or active_chats.get(me) != requester:
+        await call.answer("Запит уже неактуальний.", show_alert=True)
+        return
+    await call.answer("🎭")
+    await unmask_reveal(me, requester)
+
+
+@dp.callback_query(F.data == "unmask_no")
+async def unmask_no(call: types.CallbackQuery):
+    me = call.from_user.id
+    requester = unmask_requests.pop(me, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if requester is not None:
+        await safe_send(requester, "🎭 Співрозмовник поки не готовий зняти маску. Можливо, пізніше 🙂")
+    await call.answer("Добре, маски лишаються 🙂")
+
+
+@dp.callback_query(F.data == "unmask_share")
+async def unmask_share(call: types.CallbackQuery):
+    me = call.from_user.id
+    partner = active_chats.get(me)
+    if partner is None or frozenset((me, partner)) not in unmask_done:
+        await call.answer("Чат уже завершено.", show_alert=True)
+        return
+    username = call.from_user.username
+    if not username:
+        await call.answer(
+            "У тебе немає @username у Telegram. Додай його в Налаштуваннях Telegram і натисни ще раз.",
+            show_alert=True,
+        )
+        return
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    u = init_user(me)
+    await safe_send(partner, f"📨 <b>{esc(u['nickname'])}</b> ділиться контактом: @{esc(username)}")
+    await call.answer("Контакт надіслано 💜")
+
+
+def launch_text() -> str:
+    lines = [
+        "🎭 <b>Сьогодні о 20:00 ANONimchyk знімає маски!</b>",
+        "",
+        "Тепер у кожному чаті є кнопка «🎭 Зняти маску»:",
+        "• поспілкуйтесь трохи — і запропонуйте зняти маски;",
+        "• тільки якщо погодитесь обоє, ви побачите нік, вік і фото одне одного;",
+        "• контакт — лише якщо сам захочеш ним поділитися.",
+        "",
+        "⏰ А о 21:00 — Година знайомств: найбільше людей онлайн. Саме час 💜",
+    ]
+    return "\n".join(lines)
+
+
+def founder_pack_text(no: int) -> str:
+    return (
+        f"👑 <b>Засновнику №{no} — обіцяний подарунок!</b>\n\n"
+        "Твій ексклюзивний 🎁 <b>Пак засновника</b> — анімовані стікери ANONimchyk, "
+        "які ніколи не продаватимуться:\n"
+        f"{FOUNDER_PACK_URL}\n\nДякуємо, що ти з нами з самого початку 💜"
+    )
+
+
+def launch_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")]]
+    )
+
+
+async def launch_broadcast():
+    sent = 0
+    for uid, u in list(users_db.items()):
+        if uid <= 0 or uid in banned_users:
+            continue
+        if await safe_send(uid, launch_text(), reply_markup=launch_keyboard()):
+            sent += 1
+            if FOUNDER_PACK_URL and u.get("founder_no"):
+                await safe_send(uid, founder_pack_text(u["founder_no"]))
+        await asyncio.sleep(0.05)
+    launch_state["sent"] = sent
+    request_save()
+    if ADMIN_ID:
+        await safe_send(ADMIN_ID, f"🎭 Розсилку про запуск отримали: <b>{sent}</b>")
+
+
+async def launch_tick():
+    """Раз на хвилину: рівно в UNMASK_AT — одна розсилка про запуск (і Пак засновника)."""
+    if not _contest_can_write() or launch_state.get("done") or not unmask_live():
+        return
+    if (datetime.now(KYIV_TZ) - UNMASK_AT).total_seconds() > 6 * 3600:
+        launch_state["done"] = True  # бот прокинувся надто пізно — не спамимо вночі
+        request_save()
+        return
+    launch_state["done"] = True  # спершу позначаємо — щоб після перезапуску не надіслати двічі
+    request_save()
+    await launch_broadcast()
+
+
+@dp.message(Command("launchtest"))
+async def launch_test(message: types.Message):
+    """Адмін: подивитись текст розсилки й Пак засновника (надсилається лише тобі)."""
+    if not _is_admin(message.from_user.id):
+        return
+    await message.answer(launch_text(), reply_markup=launch_keyboard())
+    if FOUNDER_PACK_URL:
+        await message.answer(founder_pack_text(1))
+    else:
+        await message.answer("⚠️ FOUNDER_PACK_URL не задано в Render — Пак засновника не надішлеться.")
+    await message.answer(f"Запуск: {UNMASK_AT.strftime('%d.%m %H:%M')} · розсилка вже була: {launch_state.get('done')}")
 
 # ---------------------------------------------------------------------------
 # Пересилання повідомлень (завжди останнім!)
