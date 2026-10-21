@@ -1376,11 +1376,50 @@ async def paysupport_cmd(message: types.Message, state: FSMContext):
 # ---------------------------------------------------------------------------
 # 🎙 Маска голосу: голосові в анонімному чаті надходять співрозмовнику зміненим голосом.
 # Якщо змінити не вдалося — оригінал НЕ надсилаємо (анонімність понад усе).
+# Поза чатом надіслане боту голосове повертається як 🎧 прослуховування.
 # ---------------------------------------------------------------------------
-VOICE_MASKS = {"low": 0.8, "high": 1.25}  # множник висоти тону
-VOICE_MASK_LABELS = {"off": "вимк", "low": "🐻 низький", "high": "🐭 високий"}
+VOICE_PRESETS = {  # ключ -> (назва, фільтр ffmpeg)
+    "low": ("🐻 Низький", "rubberband=pitch=0.8"),
+    "high": ("🐭 Високий", "rubberband=pitch=1.25"),
+    "female": ("👩 Жіночий", "rubberband=pitch=1.5:formant=shifted,highpass=f=160"),
+    "male": ("👨 Чоловічий", "rubberband=pitch=0.72,lowpass=f=6000"),
+    "robot": ("🤖 Робот", "afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)':win_size=512:overlap=0.75,chorus=0.6:0.8:30:0.4:0.25:2"),
+    "radio": ("📻 Рація", "highpass=f=350,lowpass=f=3200,acrusher=bits=8:mix=0.25:mode=log,volume=1.6"),
+    "ghost": ("👻 Привид", "rubberband=pitch=0.88,aecho=0.8:0.85:70|140:0.45|0.3"),
+    "cartoon": ("🐿 Мультик", "rubberband=pitch=1.75"),
+    "monster": ("👾 Монстр", "rubberband=pitch=0.58,flanger=delay=2:depth=3,lowpass=f=5000"),
+    "alien": ("👽 Прибулець", "rubberband=pitch=1.35,vibrato=f=7:d=0.35,aphaser=type=t:speed=0.6"),
+    "cave": ("🕳 Печера", "aecho=0.8:0.9:180|360|540:0.5|0.35|0.2,lowpass=f=5000"),
+    "demon": ("😈 Демон", "rubberband=pitch=0.5,aecho=0.8:0.8:40:0.5,lowpass=f=4000,volume=1.4"),
+}
+VOICE_PITCH_MIN, VOICE_PITCH_MAX = -8, 8  # «Свій тон» у півтонах
 VOICE_MAX_SECONDS = int(os.getenv("VOICE_MAX_SECONDS", "120"))
 _ffmpeg_path: str | None = None
+
+
+def voice_mask_active(u: dict) -> bool:
+    m = u.get("voice_mask")
+    return m in VOICE_PRESETS or (m == "custom" and int(u.get("voice_pitch") or 0) != 0)
+
+
+def voice_mask_label(u: dict) -> str:
+    m = u.get("voice_mask")
+    if m in VOICE_PRESETS:
+        return VOICE_PRESETS[m][0]
+    if m == "custom" and int(u.get("voice_pitch") or 0):
+        return f"🎚 Свій тон ({int(u['voice_pitch']):+d})"
+    return "вимк"
+
+
+def voice_filter(u: dict) -> str | None:
+    m = u.get("voice_mask")
+    if m in VOICE_PRESETS:
+        return VOICE_PRESETS[m][1]
+    if m == "custom":
+        n = int(u.get("voice_pitch") or 0)
+        if n:
+            return f"rubberband=pitch={2 ** (n / 12):.4f}"
+    return None
 
 
 def ffmpeg_exe() -> str | None:
@@ -1400,18 +1439,17 @@ def ffmpeg_exe() -> str | None:
     return path
 
 
-async def mask_voice_bytes(data: bytes, factor: float) -> bytes | None:
+async def mask_voice_bytes(data: bytes, af: str) -> bytes | None:
     exe = ffmpeg_exe()
-    if not exe:
+    if not exe or not af:
         return None
-    af = f"asetrate=48000*{factor},aresample=48000,atempo={1 / factor:.4f},highpass=f=80,lowpass=f=7500"
     proc = await asyncio.create_subprocess_exec(
-        exe, "-v", "error", "-i", "pipe:0", "-ac", "1", "-af", af,
+        exe, "-v", "error", "-i", "pipe:0", "-ac", "1", "-ar", "48000", "-af", af,
         "-c:a", "libopus", "-b:a", "48k", "-f", "ogg", "pipe:1",
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(data), timeout=30)
+        out, err = await asyncio.wait_for(proc.communicate(data), timeout=40)
     except asyncio.TimeoutError:
         proc.kill()
         return None
@@ -1421,20 +1459,23 @@ async def mask_voice_bytes(data: bytes, factor: float) -> bytes | None:
     return out
 
 
+async def _masked_from_message(message: types.Message, u: dict) -> bytes | None:
+    try:
+        buf = await bot.download(message.voice)
+        raw = buf.read() if buf else b""
+        return await mask_voice_bytes(raw, voice_filter(u)) if raw else None
+    except Exception as e:  # noqa: BLE001
+        logging.warning("🎙 Маска голосу: %s", e)
+        return None
+
+
 async def relay_masked_voice(message: types.Message, user_id: int, partner_id: int):
     u = users_db.get(user_id) or {}
-    factor = VOICE_MASKS.get(u.get("voice_mask"))
     voice = message.voice
     if voice.duration and voice.duration > VOICE_MAX_SECONDS:
         await message.answer(f"🎙 З маскою голосу — до {VOICE_MAX_SECONDS // 60} хв. Запиши коротше 🙂")
         return
-    try:
-        buf = await bot.download(voice)
-        raw = buf.read() if buf else b""
-        masked = await mask_voice_bytes(raw, factor) if raw else None
-    except Exception as e:  # noqa: BLE001
-        logging.warning("🎙 Маска голосу: %s", e)
-        masked = None
+    masked = await _masked_from_message(message, u)
     if not masked:
         await message.answer(
             "🎙 Не вдалося змінити голос — повідомлення НЕ надіслано, твій голос у безпеці 🛡\n"
@@ -1455,19 +1496,46 @@ async def relay_masked_voice(message: types.Message, user_id: int, partner_id: i
         await message.answer("Не вдалося доставити повідомлення, чат завершено.", reply_markup=get_main_keyboard())
 
 
+async def voice_preview(message: types.Message, u: dict):
+    voice = message.voice
+    if voice.duration and voice.duration > 30:
+        await message.answer("🎧 Для прослуховування надішли голосове до 30 секунд 🙂")
+        return
+    masked = await _masked_from_message(message, u)
+    if not masked:
+        await message.answer("🎧 Не вдалося обробити голос, спробуй ще раз.")
+        return
+    await bot.send_voice(
+        message.from_user.id,
+        BufferedInputFile(masked, filename="preview.ogg"),
+        caption=f"🎧 Так тебе почують з маскою «{voice_mask_label(u)}». Змінити: /voice",
+    )
+
+
 def voice_mask_kb(u: dict):
     cur = u.get("voice_mask") or "off"
-    def b(key):
-        mark = "✅ " if cur == key else ""
-        return InlineKeyboardButton(text=mark + {"off": "🎙 Мій голос", "low": "🐻 Низький", "high": "🐭 Високий"}[key], callback_data=f"vm_set:{key}")
-    return InlineKeyboardMarkup(inline_keyboard=[[b("off")], [b("low"), b("high")]])
+    def b(key, label):
+        return InlineKeyboardButton(text=("✅ " if cur == key else "") + label, callback_data=f"vm_set:{key}")
+    keys = list(VOICE_PRESETS)
+    rows = [[b("off", "🎙 Мій голос")]]
+    for i in range(0, len(keys), 3):
+        rows.append([b(k, VOICE_PRESETS[k][0]) for k in keys[i:i + 3]])
+    n = int(u.get("voice_pitch") or 0)
+    rows.append([
+        InlineKeyboardButton(text="➖", callback_data="vm_pitch:-1"),
+        InlineKeyboardButton(text=("✅ " if cur == "custom" else "") + f"🎚 Свій тон: {n:+d}", callback_data="vm_set:custom"),
+        InlineKeyboardButton(text="➕", callback_data="vm_pitch:1"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def voice_mask_text() -> str:
     return (
         "🎙 <b>Маска голосу</b>\n\n"
         "Надсилай голосові в анонімному чаті — співрозмовник почує змінений голос, а не твій справжній.\n"
-        "Якщо змінити не вийде, бот оригінал не надішле 🛡\n\nОбери маску:"
+        "Якщо змінити не вийде, бот оригінал не надішле 🛡\n\n"
+        "🎚 <b>Свій тон</b> — підкрути ➖/➕ як подобається.\n"
+        "🎧 <b>Прослухати</b>: поза чатом надішли боту голосове — він поверне, як тебе почують.\n\nОбери маску:"
     )
 
 
@@ -1488,17 +1556,34 @@ async def voice_mask_menu(call: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("vm_set:"))
 async def voice_mask_set(call: types.CallbackQuery):
     key = call.data.split(":", 1)[1]
-    if key not in ("off", "low", "high"):
+    if key not in VOICE_PRESETS and key not in ("off", "custom"):
         await call.answer()
         return
     u = init_user(call.from_user.id)
+    if key == "custom" and not int(u.get("voice_pitch") or 0):
+        u["voice_pitch"] = -3  # стартова точка, щоб одразу було чутно
     u["voice_mask"] = None if key == "off" else key
     request_save()
     try:
         await call.message.edit_reply_markup(reply_markup=voice_mask_kb(u))
     except TelegramAPIError:
         pass
-    await call.answer("🎙 Маску вимкнено" if key == "off" else f"🎙 Маска: {VOICE_MASK_LABELS[key]}")
+    await call.answer("🎙 Маску вимкнено" if key == "off" else f"🎙 Маска: {voice_mask_label(u)}")
+
+
+@dp.callback_query(F.data.startswith("vm_pitch:"))
+async def voice_mask_pitch(call: types.CallbackQuery):
+    step = 1 if call.data.endswith(":1") else -1
+    u = init_user(call.from_user.id)
+    n = max(VOICE_PITCH_MIN, min(VOICE_PITCH_MAX, int(u.get("voice_pitch") or 0) + step))
+    u["voice_pitch"] = n
+    u["voice_mask"] = "custom" if n else None
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=voice_mask_kb(u))
+    except TelegramAPIError:
+        pass
+    await call.answer(f"🎚 Тон: {n:+d}" if n else "🎙 Тон 0 — твій звичайний голос")
 
 # ---------------------------------------------------------------------------
 # 🤫 Анонімні зізнання: людина пише історію → модерація адміна → публікація в канал
@@ -2035,6 +2120,10 @@ async def relay_messages(message: types.Message):
 
     partner_id = active_chats.get(user_id)
     if partner_id is None:
+        pu = users_db.get(user_id) or {}
+        if getattr(message, "voice", None) and voice_mask_active(pu):
+            await voice_preview(message, pu)
+            return
         await message.answer("Скористайтеся меню нижче:", reply_markup=get_main_keyboard())
         return
 
@@ -2049,7 +2138,7 @@ async def relay_messages(message: types.Message):
         await message.answer("🛡 Співрозмовник не приймає фото, відео й файли — напиши текстом 🙂")
         return
 
-    if getattr(message, "voice", None) and (users_db.get(user_id) or {}).get("voice_mask") in VOICE_MASKS:
+    if getattr(message, "voice", None) and voice_mask_active(users_db.get(user_id) or {}):
         await relay_masked_voice(message, user_id, partner_id)
         return
 
