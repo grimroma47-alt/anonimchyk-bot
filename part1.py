@@ -255,6 +255,8 @@ banned_users: set[int] = set()
 stats_days: dict[str, dict] = {}
 # Поточні чати: user_id -> {"start": час, "mode": режим, "msgs": скільки написав} (лише в пам'яті)
 chat_meta: dict[int, dict] = {}
+compat_last: dict[int, str] = {}  # 💯 сумісність щойно завершеного чату
+game_state: dict[frozenset, dict] = {}  # 🎲 ігри в чаті
 last_chat_mode: dict[int, str] = {}  # у якому режимі був останній чат (для автопошуку)
 # Банери-картинки для екранів: місце -> file_id фото в Telegram. Ставить адмін з телефона.
 banners: dict[str, str] = {}
@@ -264,6 +266,7 @@ ref_contest: dict = {"week": None, "counts": {}, "awarded": [], "history": []}
 # 🏆 Топ тижня співрозмовників (за 👍/👎). Тиждень = з неділі 20:00 до неділі 20:00 за Києвом.
 # {"week", "votes": {user_id: [👍, 👎]}, "pairs": {"хто:кого"}, "published": [тижні], "history": [{"week","winners"}]}
 top_week: dict = {"week": None, "votes": {}, "pairs": set(), "published": [], "history": []}
+letters_db: dict = {"items": [], "delivered_day": None}  # 💌 нічні листи
 confess_db: dict = {"next_id": 1, "pub_no": 0, "items": {}, "last_by": {}}  # 🤫 анонімні зізнання
 launch_state: dict = {"done": False, "sent": 0}  # 🎭 розсилка про запуск «Зняти маску»
 meet_hour: dict = {"reminded": None, "summary": None, "chats_start": None, "peak": 0, "sent": 0}
@@ -612,6 +615,9 @@ BTN_ROOM_LEAVE = "🚪 Вийти з кімнати"
 BTN_ROOM_REPORT = "🚨 Поскаржитися на учасника"
 BTN_HELP = "🆘 Допомога"
 BTN_CONFESS = "🤫 Зізнання"
+BTN_LETTER = "💌 Нічний лист"
+BTN_VOICE_SEARCH = "🎙 Голосовий чат"
+BTN_GAME = "🎲 Гра"
 BTN_FRIENDS = "👫 Друзі"
 BTN_TOPUP = "💳 Поповнити баланс"
 BTN_ONLINE = "👥 Онлайн"
@@ -679,7 +685,7 @@ class ConfessStates(StatesGroup):
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_SEARCH)],
+            [KeyboardButton(text=BTN_SEARCH), KeyboardButton(text=BTN_VOICE_SEARCH)],
             [KeyboardButton(text=BTN_FLIRT), KeyboardButton(text=BTN_INTERESTS)],
             [KeyboardButton(text=BTN_TOPUP), KeyboardButton(text=BTN_WALLET)],
             [KeyboardButton(text=BTN_PREMIUM), KeyboardButton(text=BTN_SHOP)],
@@ -688,7 +694,8 @@ def get_main_keyboard():
             [KeyboardButton(text=BTN_FRIENDS), KeyboardButton(text=BTN_ROOMS)],
             [KeyboardButton(text=BTN_FILTERS), KeyboardButton(text=BTN_ONLINE)],
             [KeyboardButton(text=BTN_LOTTERY), KeyboardButton(text=BTN_TOP)],
-            [KeyboardButton(text=BTN_CONFESS), KeyboardButton(text=BTN_HELP)],
+            [KeyboardButton(text=BTN_CONFESS), KeyboardButton(text=BTN_LETTER)],
+            [KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )
@@ -726,7 +733,8 @@ def get_chat_keyboard():
         keyboard=[
             [KeyboardButton(text=BTN_GIFT), KeyboardButton(text=BTN_ADD_FRIEND)],
             [KeyboardButton(text=BTN_STOP), KeyboardButton(text=BTN_REPORT)],
-            [KeyboardButton(text=BTN_UNMASK), KeyboardButton(text=BTN_BLACKLIST_ADD)],
+            [KeyboardButton(text=BTN_UNMASK), KeyboardButton(text=BTN_GAME)],
+            [KeyboardButton(text=BTN_BLACKLIST_ADD)],
         ],
         resize_keyboard=True,
     )
@@ -1246,6 +1254,7 @@ def end_chat(user_id: int):
         unmask_requests.pop(user_id, None)
         unmask_requests.pop(partner_id, None)
         unmask_done.discard(frozenset((user_id, partner_id)))
+        game_state.pop(frozenset((user_id, partner_id)), None)
         on_chat_ended(user_id, partner_id)
         if user_id in users_db:
             users_db[user_id]["last_partner_id"] = partner_id
@@ -1284,6 +1293,9 @@ async def send_post_chat_menu(chat_id: int, partner_id: int):
     """Пропонує оцінити співрозмовника й за бажанням надіслати запит на реконект."""
     pending_rating[chat_id] = partner_id  # оцінити можна лише останнього співрозмовника і лише раз
     pending_top[chat_id] = last_chat_seconds.pop(chat_id, 0.0) >= TOP_MIN_CHAT_SECONDS
+    compat = compat_last.pop(chat_id, None)
+    if compat:
+        await safe_send(chat_id, compat)
     await safe_send(
         chat_id,
         "Оціни співрозмовника, будь ласка:",
@@ -1566,6 +1578,7 @@ def _make_snapshot() -> bytes:
             "meet_hour": meet_hour,
             "launch_state": launch_state,
             "confess_db": confess_db,
+            "letters_db": letters_db,
         },
         protocol=4,
     )
@@ -1611,6 +1624,8 @@ def _apply_snapshot(blob: bytes):
     launch_state.update(data.get("launch_state") or {"done": False, "sent": 0})
     confess_db.clear()
     confess_db.update(data.get("confess_db") or {"next_id": 1, "pub_no": 0, "items": {}, "last_by": {}})
+    letters_db.clear()
+    letters_db.update(data.get("letters_db") or {"items": [], "delivered_day": None})
 
     # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
     saved_counter = user_counter
