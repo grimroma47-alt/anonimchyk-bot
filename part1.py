@@ -21,6 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -832,6 +833,7 @@ def get_settings_keyboard(u: dict | None = None):
             [InlineKeyboardButton(text=BTN_FILTERS, callback_data="filters_menu")],
             [InlineKeyboardButton(text=f"📷 Медіа від співрозмовника: {media}", callback_data="set_media")],
             [InlineKeyboardButton(text=f"🔁 Автопошук після чату: {_onoff(u.get('auto_search'))}", callback_data="set_auto")],
+            [InlineKeyboardButton(text=f"🎙 Маска голосу: {VOICE_MASK_LABELS.get(u.get('voice_mask') or 'off')}", callback_data="vm_menu")],
             [
                 InlineKeyboardButton(text="🙈 Приватність", callback_data="set_privacy"),
                 InlineKeyboardButton(text="🔔 Сповіщення", callback_data="set_notify"),
