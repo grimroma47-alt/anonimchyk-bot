@@ -725,6 +725,8 @@ def on_chat_started(a: int, b: int, mode: str):
         stat_add("interest")
     elif mode == "friend":
         stat_add("friends")
+    elif mode == "voice":
+        stat_add("voice_chats")
 
 
 def on_chat_message(user_id: int):
@@ -809,6 +811,12 @@ def on_chat_ended(a: int, b: int):
         # оцінка йде в топ тижня лише після справжньої розмови: обидва писали
         rated = duration if ma["msgs"] >= 1 and mb["msgs"] >= 1 else 0.0
         last_chat_seconds[a] = last_chat_seconds[b] = rated
+        if ma["msgs"] >= 2 and mb["msgs"] >= 2:
+            try:
+                txt = compat_text(users_db.get(a) or {}, users_db.get(b) or {}, duration, min(ma["msgs"], mb["msgs"]))
+                compat_last[a] = compat_last[b] = txt
+            except Exception as e:  # noqa: BLE001
+                logging.warning("Сумісність: %s", e)
         if duration < REAL_CHAT_SECONDS or ma["msgs"] < 1 or mb["msgs"] < 1:
             return  # «натиснув і втік» не рахується — щоб завдання не накручували
         stat_add("real_chats")
@@ -1271,7 +1279,7 @@ def normal_waiting_for(user_id: int) -> int:
 
 
 def schedule_stuck_offer(user_id: int, mode: str):
-    if mode != "flirt" and not mode.startswith("int:"):
+    if mode not in ("flirt", "voice") and not mode.startswith("int:"):
         return
     task = asyncio.get_running_loop().create_task(stuck_offer_after_wait(user_id, mode, time.time()))
     _background_tasks.add(task)
@@ -1291,6 +1299,8 @@ async def stuck_offer_after_wait(user_id: int, mode: str, started: float):
         if mode == "flirt":
             who = "дівчат" if u.get("gender") == "Хлопець" else "хлопців"
             head = f"❤️ Зараз {who} у флірт-пошуку немає."
+        elif mode == "voice":
+            head = "🎙 Зараз у голосовому чаті більше нікого немає."
         else:
             topic = INTEREST_LABELS.get(mode[4:], mode[4:])
             head = f"🧩 Зараз ніхто не шукає співрозмовника на тему {topic}."
@@ -1395,7 +1405,7 @@ wait_ping_seeker_last: dict[int, float] = {}
 
 
 def _wait_ping_mode_ok(mode: str) -> bool:
-    return mode in ("normal", "flirt") or (mode.startswith("int:") and mode[4:] in INTEREST_LABELS)
+    return mode in ("normal", "flirt", "voice") or (mode.startswith("int:") and mode[4:] in INTEREST_LABELS)
 
 
 def schedule_wait_ping(user_id: int, mode: str):
