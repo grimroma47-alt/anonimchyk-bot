@@ -352,6 +352,9 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             topic_note = f"🧩 Ваша спільна тема: <b>{INTEREST_LABELS.get(mode[4:], mode[4:])}</b> — є з чого почати 😉"
             await message.answer(topic_note)
             await safe_send(partner_id, topic_note)
+        elif mode == "voice":
+            await message.answer(voice_chat_note(u))
+            await safe_send(partner_id, voice_chat_note(p))
         if not mode.startswith("int:"):
             await send_interest_notes(user_id, u, partner_id, p)
         await send_vibe_notes(user_id, u, partner_id, p)
@@ -369,6 +372,11 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
         if mode == "flirt":
             looking_for = "дівчину" if u.get("gender") == "Хлопець" else "хлопця"
             wait_text = f"❤️ Шукаємо {looking_for} для флірту... Зачекай ⏳"
+        elif mode == "voice":
+            wait_text = (
+                "🎙 Шукаємо співрозмовника для голосового чату... Зачекай ⏳\n"
+                f"Твій голос змінить маска: <b>{voice_mask_label(u, for_voice_chat=True)}</b> (змінити: /voice)"
+            )
         elif mode.startswith("int:"):
             wait_text = (
                 f"🧩 Шукаємо співрозмовника за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}... Зачекай ⏳\n"
