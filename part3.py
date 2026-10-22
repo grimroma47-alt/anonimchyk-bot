@@ -387,7 +387,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             schedule_filter_nudge(user_id)
         if not current_mood(u) and mode != "flirt":
             wait_text += "\n\n🎭 Поки чекаєш — вкажи свій настрій: /mood. Бот спершу шукатиме когось на одній хвилі."
-        await message.answer(wait_text)
+        await message.answer(wait_text, reply_markup=get_main_keyboard())
         await maybe_show_ad(user_id)
         schedule_stuck_offer(user_id, mode)
         schedule_wait_ping(user_id, mode)
@@ -395,6 +395,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
 
 
 @dp.message(F.text == BTN_STOP)
+@dp.message(F.text == BTN_SEARCHING)
 @dp.message(Command("stop"))
 async def stop_chat(message: types.Message, state: FSMContext):
     await state.clear()
