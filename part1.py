@@ -642,6 +642,7 @@ BTN_CONFESS = "🤫 Зізнання"
 BTN_LETTER = "💌 Нічний лист"
 BTN_VOICE_SEARCH = "🎙 Голосовий чат"
 BTN_GAME = "🎲 Гра"
+BTN_FUN = "✨ Розваги"
 BTN_BACK_CHAT = "💬 Ти в чаті — повернутися"
 BTN_SEARCHING = "⏳ Йде пошук · зупинити"
 BTN_BACK_ROOM = "👥 Ти в кімнаті — повернутися"
@@ -722,8 +723,9 @@ def get_main_keyboard():
             [K(text=BTN_TASKS), K(text=BTN_LOTTERY), K(text=BTN_FRIENDS)],
             [K(text=BTN_PROFILE), K(text=BTN_SETTINGS)],
             [K(text=BTN_ROOMS), K(text=BTN_FILTERS)],
-            [K(text=BTN_ONLINE), K(text=BTN_CONFESS), K(text=BTN_LETTER)],
-            [K(text=BTN_TOP), K(text=BTN_HELP)],
+            [K(text=BTN_FUN), K(text=BTN_CONFESS), K(text=BTN_LETTER)],
+            [K(text=BTN_ONLINE), K(text=BTN_TOP)],
+            [K(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )
