@@ -4,7 +4,7 @@
 # Щоб додати нову частину — створи наступний partN.py і допиши його в PARTS.
 import pathlib
 
-PARTS = ["part1.py", "part2.py", "part3.py", "part4.py", "part5.py"]
+PARTS = ["part1.py", "part2.py", "part3.py", "part4.py", "part5.py", "part6.py"]
 
 _here = pathlib.Path(__file__).resolve().parent
 _code = ""
