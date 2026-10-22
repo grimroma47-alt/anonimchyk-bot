@@ -189,6 +189,25 @@ def _tr_markup(markup, lang):
     return markup
 
 
+def status_markup(chat_id: int, markup):
+    """Якщо людина в чаті / пошуку / кімнаті — над головним меню з'являється мітка, як туди повернутися."""
+    try:
+        rows = getattr(markup, "keyboard", None)
+        if not rows or rows[0][0].text != BTN_SEARCH:
+            return markup
+        if chat_id in active_chats:
+            label = BTN_BACK_CHAT
+        elif chat_id in queue:
+            label = BTN_SEARCHING
+        elif chat_id in user_room:
+            label = BTN_BACK_ROOM
+        else:
+            return markup
+        return markup.model_copy(update={"keyboard": [[KeyboardButton(text=label)]] + list(rows)})
+    except Exception:  # noqa: BLE001
+        return markup
+
+
 async def i18n_request_middleware(make_request, bot_, method):
     """Перекладає все, що бот надсилає (текст, підписи, кнопки, спливаючі відповіді)."""
     try:
@@ -200,6 +219,11 @@ async def i18n_request_middleware(make_request, bot_, method):
             if isinstance(val, str) and (lang == "ru" or _P0 in val):
                 upd[name] = translate_out(val, lang)
         markup = getattr(method, "reply_markup", None)
+        if isinstance(chat_id, int) and markup is not None:
+            marked = status_markup(chat_id, markup)
+            if marked is not markup:
+                markup = marked
+                upd["reply_markup"] = marked
         if lang == "ru" and markup is not None:
             upd["reply_markup"] = _tr_markup(markup, lang)
         if upd:
@@ -618,6 +642,9 @@ BTN_CONFESS = "🤫 Зізнання"
 BTN_LETTER = "💌 Нічний лист"
 BTN_VOICE_SEARCH = "🎙 Голосовий чат"
 BTN_GAME = "🎲 Гра"
+BTN_BACK_CHAT = "💬 Ти в чаті — повернутися"
+BTN_SEARCHING = "⏳ Йде пошук · зупинити"
+BTN_BACK_ROOM = "👥 Ти в кімнаті — повернутися"
 BTN_FRIENDS = "👫 Друзі"
 BTN_TOPUP = "💳 Поповнити баланс"
 BTN_ONLINE = "👥 Онлайн"
