@@ -49,6 +49,258 @@ async def where_cmd(message: types.Message, state: FSMContext):
     await message.answer(where_text(uid), reply_markup=kb)
 
 # ---------------------------------------------------------------------------
+# ✨ Розваги: гороскоп, карта дня, сумісність знаків, що нового, канал зізнань
+# ---------------------------------------------------------------------------
+import hashlib
+
+ZODIAC = {k: (uk, el) for k, uk, el in [('aries', '♈ Овен', 'fire'), ('taurus', '♉ Телець', 'earth'), ('gemini', '♊ Близнюки', 'air'), ('cancer', '♋ Рак', 'water'), ('leo', '♌ Лев', 'fire'), ('virgo', '♍ Діва', 'earth'), ('libra', '♎ Терези', 'air'), ('scorpio', '♏ Скорпіон', 'water'), ('sagittarius', '♐ Стрілець', 'fire'), ('capricorn', '♑ Козоріг', 'earth'), ('aquarius', '♒ Водолій', 'air'), ('pisces', '♓ Риби', 'water')]}
+H_DAY = [
+    'Сьогодні вдалий день, щоб почати те, що давно відкладав(-ла).',
+    'Енергії багато — направ її на одну справу, а не на десять.',
+    'День спокійний: ідеальний час навести лад у думках.',
+    'Хтось чекає від тебе першого кроку. Можливо, варто його зробити.',
+    'Невелика несподіванка підніме настрій ближче до вечора.',
+    'Не поспішай із висновками — до вечора все проясниться.',
+    'Сьогодні твоя сила — у словах. Говори щиро.',
+    'Гарний день для нових знайомств і цікавих розмов.',
+    'Дай собі відпочити — продуктивність повернеться завтра.',
+    'Маленька перемога сьогодні важливіша, ніж здається.',
+]
+H_LOVE = [
+    'У коханні: щирий комплімент зробить більше, ніж ти думаєш.',
+    'У коханні: хтось думає про тебе частіше, ніж показує.',
+    'У коханні: відкрийся трохи більше — і отримаєш у відповідь тепло.',
+    'У коханні: не шукай ідеального — шукай свого.',
+    'У коханні: ввечері можлива розмова, яка багато змінить.',
+    'У коханні: зірки радять бути сміливішим(-ою).',
+    'У коханні: тиша теж буває відповіддю — дай людині час.',
+    'У коханні: несподіване знайомство може стати чимось більшим.',
+]
+H_TIP = [
+    'Порада дня: випий води й посміхнись незнайомцю 🙂',
+    'Порада дня: напиши тому, за ким сумуєш.',
+    'Порада дня: зроби одну справу до кінця.',
+    'Порада дня: прогулянка вирішить більше, ніж ти думаєш.',
+    'Порада дня: скажи «ні» тому, що забирає твою енергію.',
+    'Порада дня: увімкни улюблену пісню на повну.',
+    'Порада дня: похвали себе — ти багато робиш.',
+]
+H_COLORS = ['фіолетовий', 'золотий', 'бірюзовий', 'рожевий', 'смарагдовий', 'сріблястий', 'синій', 'бордовий']
+TAROT = [
+    ('🃏 Блазень', 'Новий початок і легкість. Не бійся зробити крок у невідоме.'),
+    ('🪄 Маг', 'Усе потрібне вже в тебе є. Дій — і вийде.'),
+    ('🌙 Верховна Жриця', 'Довірся інтуїції — вона сьогодні не підведе.'),
+    ('🌸 Імператриця', 'День турботи, краси й тепла. Подаруй його собі й іншим.'),
+    ('👑 Імператор', 'Час взяти ситуацію під контроль і поставити межі.'),
+    ('📜 Ієрофант', 'Мудра порада прийде від того, кого ти поважаєш.'),
+    ('💞 Закохані', 'Важливий вибір серцем. Слухай, що відчуваєш.'),
+    ('🏇 Колісниця', 'Рух уперед і перемога, якщо тримаєш курс.'),
+    ('🦁 Сила', "Твоя м'якість — це теж сила. Спокій переможе."),
+    ('🏮 Відлюдник', 'Побудь трохи наодинці — відповідь прийде зсередини.'),
+    ('🎡 Колесо Фортуни', 'Удача повертається до тебе обличчям. Лови момент.'),
+    ('⚖️ Справедливість', 'Чесність повернеться до тебе сторицею.'),
+    ('🙃 Повішений', 'Подивись на ситуацію під іншим кутом — і все зміниться.'),
+    ('🦋 Зміни', 'Щось старе завершується, щоб звільнити місце новому.'),
+    ('🍯 Помірність', 'Баланс і терпіння — сьогодні твої найкращі друзі.'),
+    ('😈 Спокуса', 'Помітиш спокусу — запитай себе, чи справді воно тобі треба.'),
+    ('⚡ Вежа', 'Несподіванка струсне рутину — і це на краще.'),
+    ('⭐ Зірка', 'Надія й натхнення. Мрій сміливо — сьогодні можна.'),
+    ('🌕 Місяць', 'Не все таке, яким здається. Не поспішай з висновками.'),
+    ('☀️ Сонце', 'Радість, тепло й успіх. Найкраща карта дня ✨'),
+    ('📯 Суд', 'Час підбити підсумки й пробачити — собі теж.'),
+    ('🌍 Світ', 'Завершення й гармонія. Ти саме там, де маєш бути.'),
+]
+COMPAT_TEXT = {k: v[0] for k, v in {'same': ('Ви говорите однією мовою стихії — легко, тепло й зрозуміло 💜', 'Вы говорите на одном языке стихии — легко, тепло и понятно 💜'), 'good': ('Ви чудово доповнюєте одне одного: де одному бракує — інший має з надлишком ✨', 'Вы отлично дополняете друг друга: где одному не хватает — у другого с избытком ✨'), 'mid': ('Цікава пара: будуть і іскри, і суперечки — нудно точно не буде 😉', 'Интересная пара: будут и искры, и споры — скучно точно не будет 😉'), 'hard': ('Різні стихії — складніше, але якщо вдасться, це буде дуже сильна пара 🔥', 'Разные стихии — сложнее, но если получится, это будет очень сильная пара 🔥')}.items()}
+HOROSCOPE_CHANNEL = os.getenv("HOROSCOPE_CHANNEL", "")  # напр. @ANONimchyk_goroskop — з'явиться кнопка
+NEWS_CHANNEL = os.getenv("NEWS_CHANNEL", "")  # напр. @ANONimchyk_news
+
+
+def _seed(*parts) -> int:
+    return int(hashlib.md5(":".join(map(str, parts)).encode()).hexdigest(), 16)
+
+
+def fun_menu_kb():
+    rows = [
+        [InlineKeyboardButton(text="🔮 Гороскоп на сьогодні", callback_data="fun_horo")],
+        [InlineKeyboardButton(text="🃏 Карта дня", callback_data="fun_tarot"),
+         InlineKeyboardButton(text="💞 Сумісність знаків", callback_data="fun_compat")],
+        [InlineKeyboardButton(text="📰 Що нового", callback_data="fun_news"),
+         InlineKeyboardButton(text="🤫 Канал зізнань", url=confess_channel_link())],
+    ]
+    if HOROSCOPE_CHANNEL:
+        rows.append([InlineKeyboardButton(text="🌙 Канал «ANONimchyk Гороскоп»", url=f"https://t.me/{HOROSCOPE_CHANNEL.lstrip('@')}")])
+    if NEWS_CHANNEL:
+        rows.append([InlineKeyboardButton(text="📣 Канал «ANONimchyk News»", url=f"https://t.me/{NEWS_CHANNEL.lstrip('@')}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+FUN_MENU_TEXT = "✨ <b>Розваги</b>\nЧим зайнятись, поки шукаєш співрозмовника 👇\n<i>Гороскоп і карти — для настрою й розваги 😉</i>"
+
+
+@dp.message(F.text == BTN_FUN)
+@dp.message(Command("fun"))
+async def fun_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
+
+
+@dp.callback_query(F.data == "fun_menu")
+async def fun_menu_cb(call: types.CallbackQuery):
+    await call.message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
+    await call.answer()
+
+
+def zodiac_kb(prefix: str):
+    keys = list(ZODIAC)
+    rows = [[InlineKeyboardButton(text=ZODIAC[k][0], callback_data=f"{prefix}{k}") for k in keys[i:i + 3]]
+            for i in range(0, 12, 3)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def horoscope_text(sign: str, day) -> str:
+    s = _seed("horo", sign, day.isoformat())
+    return (
+        f"🔮 <b>{ZODIAC[sign][0]} · {day.strftime('%d.%m')}</b>\n\n"
+        f"{H_DAY[s % len(H_DAY)]}\n\n"
+        f"💜 {H_LOVE[(s // 7) % len(H_LOVE)]}\n\n"
+        f"✨ {H_TIP[(s // 49) % len(H_TIP)]}\n\n"
+        f"🍀 Щасливе число: <b>{(s // 343) % 33 + 1}</b> · колір: <b>{H_COLORS[(s // 11) % len(H_COLORS)]}</b>"
+    )
+
+
+def horo_after_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Змінити знак", callback_data="fun_horo_pick"),
+         InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")],
+    ])
+
+
+@dp.callback_query(F.data == "fun_horo")
+async def fun_horo(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    sign = u.get("zodiac")
+    await call.answer()
+    if sign in ZODIAC:
+        await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
+        stat_add("horoscope")
+        return
+    await call.message.answer("🔮 Обери свій знак — я запам'ятаю, і далі гороскоп буде в один дотик:", reply_markup=zodiac_kb("fun_z:"))
+
+
+@dp.callback_query(F.data == "fun_horo_pick")
+async def fun_horo_pick(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer("🔮 Обери свій знак:", reply_markup=zodiac_kb("fun_z:"))
+
+
+@dp.callback_query(F.data.startswith("fun_z:"))
+async def fun_zodiac_set(call: types.CallbackQuery):
+    sign = call.data.split(":", 1)[1]
+    if sign not in ZODIAC:
+        await call.answer()
+        return
+    u = init_user(call.from_user.id)
+    u["zodiac"] = sign
+    request_save()
+    await call.answer(f"Запам'ятав: {ZODIAC[sign][0]}")
+    await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
+    stat_add("horoscope")
+
+
+@dp.callback_query(F.data == "fun_tarot")
+async def fun_tarot(call: types.CallbackQuery):
+    i = _seed("tarot", call.from_user.id, kyiv_today().isoformat()) % len(TAROT)
+    name, meaning = TAROT[i]
+    await call.answer()
+    await call.message.answer(
+        f"🃏 <b>Твоя карта дня</b>\n\n<b>{name}</b>\n{meaning}\n\n<i>Завтра — нова карта 🌙</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")]]),
+    )
+    stat_add("tarot")
+
+
+def compat_kind(a: str, b: str) -> str:
+    ea, eb = ZODIAC[a][1], ZODIAC[b][1]
+    if ea == eb:
+        return "same"
+    pair = {ea, eb}
+    if pair in ({"fire", "air"}, {"earth", "water"}):
+        return "good"
+    if pair in ({"fire", "water"}, {"earth", "air"}):
+        return "hard"
+    return "mid"
+
+
+def compat_percent(a: str, b: str) -> int:
+    base = {"same": 88, "good": 80, "mid": 64, "hard": 50}[compat_kind(a, b)]
+    return min(99, base + _seed("zc", *sorted((a, b))) % 10)
+
+
+@dp.callback_query(F.data == "fun_compat")
+async def fun_compat(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    await call.answer()
+    if u.get("zodiac") in ZODIAC:
+        await call.message.answer(f"💞 Твій знак: {ZODIAC[u['zodiac']][0]}. А який знак у нього / неї?", reply_markup=zodiac_kb("fun_c2:"))
+    else:
+        await call.message.answer("💞 Спершу обери свій знак:", reply_markup=zodiac_kb("fun_c1:"))
+
+
+@dp.callback_query(F.data.startswith("fun_c1:"))
+async def fun_compat_mine(call: types.CallbackQuery):
+    sign = call.data.split(":", 1)[1]
+    if sign not in ZODIAC:
+        await call.answer()
+        return
+    u = init_user(call.from_user.id)
+    u["zodiac"] = sign
+    request_save()
+    await call.answer()
+    await call.message.answer(f"💞 Твій знак: {ZODIAC[sign][0]}. А який знак у нього / неї?", reply_markup=zodiac_kb("fun_c2:"))
+
+
+@dp.callback_query(F.data.startswith("fun_c2:"))
+async def fun_compat_result(call: types.CallbackQuery):
+    other = call.data.split(":", 1)[1]
+    u = init_user(call.from_user.id)
+    mine = u.get("zodiac")
+    if other not in ZODIAC or mine not in ZODIAC:
+        await call.answer()
+        return
+    p = compat_percent(mine, other)
+    bar = "💜" * round(p / 20) + "🤍" * (5 - round(p / 20))
+    await call.answer()
+    await call.message.answer(
+        f"💞 <b>{ZODIAC[mine][0]} + {ZODIAC[other][0]}</b>\n\n<b>{p}%</b>  {bar}\n{COMPAT_TEXT[compat_kind(mine, other)]}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔁 Інший знак", callback_data="fun_compat"),
+             InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")],
+        ]),
+    )
+    stat_add("zodiac_compat")
+
+
+NEWS_TEXT = (
+    "📰 <b>Що нового в ANONimchyk</b>\n\n"
+    "🎭 <b>Зняти маску</b> — за взаємною згодою покажіть одне одному нік, вік і фото\n"
+    "🎙 <b>Маска голосу</b> — 12 голосів у голосових: робот, привид, демон… (/voice)\n"
+    "🎙 <b>Голосовий чат</b> — спілкування лише голосом, і голос завжди змінений\n"
+    "🎲 <b>Ігри в чаті</b> — «Правда чи дія», «Що обереш?», «2 правди і 1 брехня»\n"
+    "💌 <b>Нічний лист</b> — напиши незнайомцю, а вранці отримай чийсь\n"
+    "🤫 <b>Анонімні зізнання</b> — і канал, де їх публікують\n"
+    "💯 <b>Сумісність</b> після кожної розмови\n"
+    "✨ <b>Розваги</b> — гороскоп, карта дня, сумісність знаків\n"
+    "👑 <b>Пак засновника</b> — стікери для перших учасників"
+)
+
+
+@dp.callback_query(F.data == "fun_news")
+async def fun_news(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer(NEWS_TEXT, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")]]))
+
+
+# ---------------------------------------------------------------------------
 # 🎙 Голосовий чат: окремий пошук, де спілкуються лише голосовими з маскою
 # ---------------------------------------------------------------------------
 def voice_chat_note(u: dict) -> str:
@@ -1200,6 +1452,7 @@ def launch_text() -> str:
         "",
         "🎙 Нове: «Маска голосу» — надсилай голосові, а співрозмовник почує змінений голос. Увімкнути: /voice",
         "🤫 І канал анонімних зізнань: @ANONimchyk_zizn",
+        "✨ А ще «Розваги»: гороскоп, карта дня і сумісність знаків — /fun",
         "",
         "⏰ А о 21:00 — Година знайомств: найбільше людей онлайн. Саме час 💜",
     ]
@@ -1379,6 +1632,7 @@ async def setup_bot_commands():
         types.BotCommand(command="voice", description="🎙 Маска голосу"),
         types.BotCommand(command="game", description="🎲 Гра в чаті"),
         types.BotCommand(command="where", description="📍 Де я зараз"),
+        types.BotCommand(command="fun", description="✨ Розваги: гороскоп, карта дня"),
         types.BotCommand(command="letter", description="💌 Нічний лист"),
         types.BotCommand(command="confess", description="🤫 Анонімне зізнання"),
         types.BotCommand(command="topic", description="💬 Тема для розмови"),
