@@ -1,58 +1,4 @@
 # ---------------------------------------------------------------------------
-# Рулетка (лотерея за грн)
-# ---------------------------------------------------------------------------
-def get_lottery_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🎲 Крутити", callback_data="lottery_spin")]]
-    )
-
-
-@dp.message(F.text == BTN_LOTTERY)
-async def lottery_menu(message: types.Message, state: FSMContext):
-    await state.clear()
-    await send_banner(message.from_user.id, "lottery")
-    u = init_user(message.from_user.id)
-    await message.answer(
-        "🎰 <b>Рулетка</b>\n\n"
-        f"Один спін коштує {LOTTERY_COST:.0f} грн.\n\n"
-        "<b>Що може випасти:</b>\n"
-        "🚀 Пріоритет у пошуку на 1 день — 22%\n"
-        "🎁 Подарунок в інвентар — 21,5%\n"
-        "💎 Premium на 1 день — 15%\n"
-        "🎯 Фільтр за статтю на 3 дні — 7%\n"
-        "💎 Premium на 7 днів — 4%\n"
-        "🏆 Джекпот: Premium на 30 днів — 0,5%\n\n"
-        "Призи діють лише в боті, гривні з рулетки не випадають.\n"
-        f"Твій баланс: {u['balance']:.2f} грн.",
-        reply_markup=get_lottery_keyboard(),
-    )
-
-
-@dp.callback_query(F.data == "lottery_spin")
-async def lottery_spin_handler(call: types.CallbackQuery):
-    global lottery_revenue_total
-    u = init_user(call.from_user.id)
-
-    if u["balance"] < LOTTERY_COST:
-        await call.answer(
-            f"❌ Недостатньо коштів. Ціна спіну: {LOTTERY_COST:.0f} грн.", show_alert=True
-        )
-        return
-
-    u["balance"] -= LOTTERY_COST
-    lottery_revenue_total += LOTTERY_COST
-    record_spend("lottery", LOTTERY_COST)
-
-    kind, param = spin_lottery()
-    text = lottery_apply_prize(u, kind, param)
-    request_save()
-
-    text += f"\n\n💰 Баланс: {u['balance']:.2f} грн."
-    await call.message.answer(text, reply_markup=get_lottery_keyboard())
-    await call.answer()
-
-
-# ---------------------------------------------------------------------------
 # Групові кімнати за інтересами
 # ---------------------------------------------------------------------------
 @dp.message(F.text == BTN_ROOMS)
@@ -273,6 +219,7 @@ async def flirt_search(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer(reason)
         return
+    await send_banner(message.from_user.id, "flirt")
     await run_search(message, state, "flirt")
 
 
@@ -649,6 +596,7 @@ async def friend_decline(call: types.CallbackQuery):
 @dp.message(Command("friends"))
 async def friends_list(message: types.Message, state: FSMContext):
     await state.clear()
+    await send_banner(message.from_user.id, "friends")
     u = init_user(message.from_user.id)
     kb = get_friends_keyboard(u)
     if kb is None:
@@ -964,12 +912,15 @@ async def send_gift_item(call: types.CallbackQuery):
 
     p = init_user(partner_id)
     p["balance"] += recipient_amount
+    earned = earn_from_gift(u, p, price)
+    request_save()
 
     await call.message.answer(f"🎁 Подаровано: <b>{esc(title)}</b>!")
     await safe_send(
         partner_id,
         f"🎁 Співрозмовник подарував вам: <b>{esc(title)}</b>!\n"
-        f"На баланс нараховано {recipient_amount:.2f} грн.",
+        f"На баланс нараховано {recipient_amount:.2f} грн."
+        + (f"\n💸 {uah(earned)} з них можна буде вивести на карту через {EARN_HOLD_DAYS} днів." if earned else ""),
     )
     await call.answer()
 
@@ -1670,6 +1621,211 @@ async def adm_ad_delete(call: types.CallbackQuery):
     except TelegramAPIError:
         await call.message.answer(text, reply_markup=kb)
     await call.answer("Видалено")
+
+
+# ---------------------------------------------------------------------------
+# Оплата за реквізитами: код у призначенні + квитанція → адмін підтверджує кнопкою
+# ---------------------------------------------------------------------------
+def new_payment_code() -> str:
+    while True:
+        code = f"P{random.randint(100000, 999999)}"
+        if code not in manual_payments:
+            return code
+
+
+def bank_details_text(code: str, amount: int) -> str:
+    lines = ["🏦 <b>Оплата за реквізитами</b>\n", f"💵 До сплати: <b>{amount} грн</b>\n"]
+    lines.append("Переказ через банківський застосунок (дані копіюються натисканням):")
+    if PAY_RECIPIENT:
+        lines.append(f"▶️ Отримувач: <code>{esc(PAY_RECIPIENT)}</code>")
+    if PAY_CARD:
+        lines.append(f"▶️ Картка: <code>{esc(PAY_CARD)}</code>")
+    if PAY_IBAN:
+        lines.append(f"▶️ IBAN: <code>{esc(PAY_IBAN)}</code>")
+    if PAY_TAX_ID:
+        lines.append(f"▶️ ЄДРПОУ / ІПН: <code>{esc(PAY_TAX_ID)}</code>")
+    lines.append(f"▶️ Призначення / коментар: <code>Поповнення {code}</code>")
+    lines.append(f"▶️ Сума: <code>{amount}</code> грн\n")
+    lines.append(
+        f"⚠️ <b>Обов'язково</b> вкажи код <b>{code}</b> у призначенні або коментарі до переказу "
+        "і переказуй рівно цю суму — інакше ми не зможемо знайти твій платіж."
+    )
+    lines.append("📸 Після оплати натисни кнопку нижче і надішли скріншот квитанції — так зарахуємо швидше.")
+    lines.append("⏳ Платежі перевіряються вручну, зазвичай — протягом кількох годин.")
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data.startswith("topup_bank_"))
+async def topup_pay_bank(call: types.CallbackQuery):
+    if not (PAY_CARD or PAY_IBAN):
+        await call.answer("Цей спосіб оплати зараз недоступний", show_alert=True)
+        return
+    amount = _parse_topup_amount(call.data[len("topup_bank_"):])
+    if amount is None:
+        await call.answer("Недоступна сума.", show_alert=True)
+        return
+    code = new_payment_code()
+    manual_payments[code] = {
+        "user_id": call.from_user.id,
+        "amount": amount,
+        "created": time.strftime("%d.%m.%Y %H:%M"),
+        "ts": time.time(),
+        "status": "pending",
+        "receipt": False,
+    }
+    request_save()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✅ Я оплатив — надіслати квитанцію", callback_data=f"bank_paid_{code}")]]
+    )
+    await call.message.answer(bank_details_text(code, amount), reply_markup=kb)
+    await call.answer()
+
+
+def _payment_admin_kb(code: str):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Підтвердити", callback_data=f"pay_ok_{code}"),
+                InlineKeyboardButton(text="❌ Відхилити", callback_data=f"pay_no_{code}"),
+            ]
+        ]
+    )
+
+
+def _payment_caption(code: str, p: dict) -> str:
+    return (
+        f"🏦 <b>Оплата за реквізитами {code}</b>\n"
+        f"Від: {admin_label(p['user_id'])}\n"
+        f"Сума: <b>{p['amount']} грн</b>\nСтворено: {p['created']}\n\n"
+        f"Перевір у банку надходження з призначенням «Поповнення {code}»."
+    )
+
+
+@dp.callback_query(F.data.startswith("bank_paid_"))
+async def bank_paid(call: types.CallbackQuery, state: FSMContext):
+    code = call.data[len("bank_paid_"):]
+    p = manual_payments.get(code)
+    if p is None or p["user_id"] != call.from_user.id:
+        await call.answer("Платіж не знайдено.", show_alert=True)
+        return
+    if p["status"] != "pending":
+        await call.answer("Цей платіж уже оброблено.", show_alert=True)
+        return
+    await state.set_state(TopupStates.receipt)
+    await state.update_data(payment_code=code)
+    await call.message.answer("📸 Надішли скріншот або файл квитанції про оплату (або /cancel).")
+    await call.answer()
+
+
+@dp.message(TopupStates.receipt)
+async def bank_receipt(message: types.Message, state: FSMContext):
+    if not (message.photo or message.document):
+        await message.answer("Потрібен скріншот або файл квитанції 📸 (або /cancel).")
+        return
+    data = await state.get_data()
+    await state.clear()
+    code = data.get("payment_code")
+    p = manual_payments.get(code or "")
+    if p is None or p["status"] != "pending":
+        await message.answer("Цей платіж уже оброблено або не знайдено.")
+        return
+    p["receipt"] = True
+    request_save()
+    if ADMIN_ID:
+        try:
+            await message.copy_to(
+                chat_id=ADMIN_ID, caption=_payment_caption(code, p), reply_markup=_payment_admin_kb(code)
+            )
+        except TelegramAPIError as e:
+            logging.warning("Не вдалося надіслати квитанцію адміну: %s", e)
+            await safe_send(ADMIN_ID, _payment_caption(code, p), reply_markup=_payment_admin_kb(code))
+    await message.answer(
+        f"✅ Квитанцію отримано! Як тільки адміністратор підтвердить платіж {code}, "
+        "баланс поповниться і тобі прийде повідомлення."
+    )
+
+
+async def _resolve_payment(code: str, approve: bool) -> str:
+    """Підтвердити/відхилити платіж. Повертає текст для адміна."""
+    p = manual_payments.get(code)
+    if p is None:
+        return f"Платіж {code} не знайдено."
+    if p["status"] != "pending":
+        return f"Платіж {code} уже оброблено ({'підтверджено' if p['status'] == 'confirmed' else 'відхилено'})."
+    if approve:
+        p["status"] = "confirmed"
+        u = init_user(p["user_id"])
+        u["balance"] += p["amount"]
+        record_topup("jar" if p.get("method") == "jar" else "card", p["amount"])
+        bonus = apply_topup_bonus(u, p["amount"])
+        request_save()
+        text = f"✅ Оплату {code} підтверджено! Баланс поповнено на {p['amount']} грн."
+        if bonus:
+            text += f"\n🎉 Бонус +{bonus:.0f} грн за кожні {TOPUP_BONUS_STEP:.0f} грн поповнень!"
+        progress = topup_progress_text(u)
+        if progress:
+            text += f"\n\n{progress}"
+        await safe_send(p["user_id"], text)
+        return f"✅ {code}: зараховано {p['amount']} грн користувачу {admin_label(p['user_id'])}."
+    p["status"] = "rejected"
+    request_save()
+    await safe_send(
+        p["user_id"],
+        f"❌ Платіж {code} не знайдено в банку. Якщо ти точно оплатив — напиши в «{BTN_HELP}» "
+        "і додай квитанцію.",
+    )
+    return f"❌ {code}: відхилено."
+
+
+def _is_admin(user_id: int) -> bool:
+    return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
+@dp.callback_query(F.data.startswith("pay_ok_") | F.data.startswith("pay_no_"))
+async def pay_resolve_button(call: types.CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await call.answer("Доступ заборонено", show_alert=True)
+        return
+    approve = call.data.startswith("pay_ok_")
+    code = call.data[len("pay_ok_"):]
+    result = await _resolve_payment(code, approve)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.message.answer(result)
+    await call.answer()
+
+
+@dp.message(Command("confirm"))
+@dp.message(Command("reject"))
+async def pay_resolve_command(message: types.Message):
+    """Адмін: /confirm P123456 або /reject P123456 — якщо платіж прийшов без квитанції."""
+    if not _is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Формат: /confirm P123456 або /reject P123456")
+        return
+    approve = parts[0].lower().startswith("/confirm")
+    await message.answer(await _resolve_payment(parts[1].strip().upper(), approve))
+
+
+@dp.callback_query(F.data == "adm_payments")
+async def adm_payments(call: types.CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await call.answer("Доступ заборонено", show_alert=True)
+        return
+    pending = [(c, p) for c, p in manual_payments.items() if p["status"] == "pending"]
+    if not pending:
+        await call.message.answer("🏦 Немає оплат, що очікують перевірки.")
+        await call.answer()
+        return
+    await call.message.answer(f"🏦 <b>Оплати на перевірці: {len(pending)}</b> (показую останні 10)")
+    for code, p in pending[-10:]:
+        mark = "📸 є квитанція" if p.get("receipt") else "без квитанції"
+        await call.message.answer(f"{_payment_caption(code, p)}\n({mark})", reply_markup=_payment_admin_kb(code))
+    await call.answer()
 
 
 
