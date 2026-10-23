@@ -1,305 +1,10 @@
 # ---------------------------------------------------------------------------
-# Онбординг новачків: стать → вік → країна за кілька натискань
-# (обробники стоять після кнопок меню — натискання меню має пріоритет)
-# ---------------------------------------------------------------------------
-class OnboardStates(StatesGroup):
-    age = State()
-    country = State()
-
-
-ONBOARD_COUNTRIES = [
-    ("ua", "🇺🇦 Україна", "Україна"),
-    ("pl", "🇵🇱 Польща", "Польща"),
-    ("de", "🇩🇪 Німеччина", "Німеччина"),
-    ("cz", "🇨🇿 Чехія", "Чехія"),
-]
-ONBOARD_AGE_REGEX = re.compile(r"^\s*(\d{1,3})\s*$")
-
-
-def profile_complete(u: dict) -> bool:
-    return all(u.get(k) not in (None, "", "Не вказано") for k in ("gender", "age", "country"))
-
-
-def _skip_row():
-    return [InlineKeyboardButton(text="⏭ Пропустити", callback_data="ob_skip")]
-
-
-async def start_onboarding(chat_id: int, state: FSMContext):
-    await state.clear()
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="👨 Хлопець", callback_data="ob_g_m"),
-                InlineKeyboardButton(text="👩 Дівчина", callback_data="ob_g_f"),
-            ],
-            _skip_row(),
-        ]
-    )
-    await safe_send(
-        chat_id,
-        "👋 Налаштуймо профіль — це 3 кроки, ~10 секунд. Так ти знаходитимеш кращих співрозмовників.\n\n"
-        "<b>Крок 1/3.</b> Хто ти?",
-        reply_markup=kb,
-    )
-
-
-@dp.callback_query(F.data.in_({"ob_g_m", "ob_g_f"}))
-async def onboard_gender(call: types.CallbackQuery, state: FSMContext):
-    u = init_user(call.from_user.id)
-    u["gender"] = "Хлопець" if call.data == "ob_g_m" else "Дівчина"
-    refresh_default_nick(u)
-    request_save()
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await state.set_state(OnboardStates.age)
-    await call.message.answer(
-        f"✅ {u['gender']}\n\n<b>Крок 2/3.</b> Скільки тобі років? Напиши числом, наприклад <code>19</code>.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_skip_row()]),
-    )
-    await call.answer()
-
-
-def _is_onboard_age_text(message: types.Message) -> bool:
-    return bool(message.text and ONBOARD_AGE_REGEX.match(message.text))
-
-
-@dp.message(OnboardStates.age, _is_onboard_age_text)
-async def onboard_age(message: types.Message, state: FSMContext):
-    age = int(ONBOARD_AGE_REGEX.match(message.text).group(1))
-    if not (10 <= age <= 99):
-        await message.answer("Вкажи вік числом від 10 до 99 (або натисни «Пропустити»).")
-        return
-    u = init_user(message.from_user.id)
-    u["age"] = str(age)
-    prev_min = u.get("min_age_seen")
-    u["min_age_seen"] = age if prev_min is None else min(int(prev_min), age)
-    request_save()
-    await state.set_state(OnboardStates.country)
-    rows = [
-        [InlineKeyboardButton(text=ONBOARD_COUNTRIES[i][1], callback_data=f"ob_c_{ONBOARD_COUNTRIES[i][0]}"),
-         InlineKeyboardButton(text=ONBOARD_COUNTRIES[i + 1][1], callback_data=f"ob_c_{ONBOARD_COUNTRIES[i + 1][0]}")]
-        for i in range(0, len(ONBOARD_COUNTRIES) - 1, 2)
-    ]
-    rows.append([InlineKeyboardButton(text="🌍 Інша — напишу сам(а)", callback_data="ob_c_other")])
-    rows.append(_skip_row())
-    await message.answer(
-        f"✅ {age}\n\n<b>Крок 3/3.</b> Звідки ти?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-    )
-
-
-async def _finish_onboarding(chat_id: int, user_id: int, state: FSMContext):
-    await state.clear()
-    u = init_user(user_id)
-    request_save()
-    await safe_send(
-        chat_id,
-        f"🎉 Готово! Твій профіль: {short_info(u, public=False)}\n\n"
-        f"Тепер тисни «{BTN_SEARCH}» внизу — і знайомся! 🤫\n"
-        "Змінити дані можна будь-коли: /edit_profile",
-        reply_markup=get_main_keyboard(),
-    )
-    await safe_send(
-        chat_id,
-        "🧩 Хочеш, щоб бот підбирав співрозмовників зі спільними інтересами? Обери до 3 тем:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🧩 Обрати інтереси", callback_data="pi_open")]]
-        ),
-    )
-    await maybe_send_safety_memo(user_id, u)
-
-
-@dp.callback_query(F.data.startswith("ob_c_"))
-async def onboard_country(call: types.CallbackQuery, state: FSMContext):
-    key = call.data[len("ob_c_"):]
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    if key == "other":
-        await state.set_state(OnboardStates.country)
-        await call.message.answer(
-            "Напиши свою країну або місто:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[_skip_row()])
-        )
-        await call.answer()
-        return
-    country = next((name for k, _label, name in ONBOARD_COUNTRIES if k == key), None)
-    if country:
-        init_user(call.from_user.id)["country"] = country
-    await _finish_onboarding(call.message.chat.id, call.from_user.id, state)
-    await call.answer()
-
-
-@dp.message(OnboardStates.country, F.text)
-async def onboard_country_text(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text.startswith("/"):
-        return
-    init_user(message.from_user.id)["country"] = text[:50]
-    await _finish_onboarding(message.chat.id, message.from_user.id, state)
-
-
-@dp.callback_query(F.data == "ob_skip")
-async def onboard_skip(call: types.CallbackQuery, state: FSMContext):
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await state.clear()
-    await call.message.answer(
-        "Добре! Заповнити профіль можна будь-коли: /edit_profile", reply_markup=get_main_keyboard()
-    )
-    await call.answer()
-
-
-# ---------------------------------------------------------------------------
-# Налаштування: медіа, автопошук, приватність, сповіщення
-# ---------------------------------------------------------------------------
-def is_blocked_media(receiver: dict | None, message: types.Message) -> bool:
-    """Чи не приймає отримувач такий тип повідомлення (режим «без фото/відео»)."""
-    if not media_is_safe(receiver):
-        return False
-    return any(getattr(message, kind, None) for kind in ("photo", "video", "video_note", "animation", "document"))
-
-
-class _NoState:
-    """Заглушка FSM для автопошуку співрозмовника (у нього немає власного повідомлення)."""
-
-    async def clear(self):
-        pass
-
-
-class _ChatAnswer:
-    """Мінімальна «відповідь у чат» для run_search, коли пошук запускає не сама людина."""
-
-    def __init__(self, chat_id: int):
-        self.chat_id = chat_id
-
-    async def answer(self, text: str, **kwargs):
-        await safe_send(self.chat_id, text, **kwargs)
-
-
-async def auto_search_after_chat(user_id: int):
-    u = users_db.get(user_id)
-    if not u or not u.get("auto_search"):
-        return
-    if user_id in banned_users or user_id in active_chats or user_id in queue or user_id in user_room:
-        return
-    mode = last_chat_mode.get(user_id, "normal")
-    if mode == "friend" or (mode == "flirt" and flirt_block_reason(u) is not None):
-        mode = "normal"
-    await safe_send(user_id, "🔁 Автопошук: шукаю наступного співрозмовника…\nЗупинити пошук: /stop · вимкнути автопошук: ⚙️ Налаштування")
-    await run_search(_ChatAnswer(user_id), _NoState(), mode, user_id=user_id)
-
-
-def privacy_keyboard(u: dict):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"🎂 Приховати вік: {_onoff(u.get('hide_age'))}", callback_data="tg_hide_age")],
-            [InlineKeyboardButton(text=f"🌍 Приховати країну: {_onoff(u.get('hide_country'))}", callback_data="tg_hide_country")],
-            [InlineKeyboardButton(text=f"🧩 Приховати інтереси: {_onoff(u.get('hide_interests'))}", callback_data="tg_hide_interests")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="set_back")],
-        ]
-    )
-
-
-def notify_keyboard(u: dict):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"📋 Виконані завдання: {_onoff(u.get('notify_tasks', True))}", callback_data="tg_notify_tasks")],
-            [InlineKeyboardButton(text=f"💡 Підказки: {_onoff(u.get('notify_tips', True))}", callback_data="tg_notify_tips")],
-            [InlineKeyboardButton(text=f"🔄 Запрошення в чат: {_onoff(u.get('allow_invites', True))}", callback_data="tg_allow_invites")],
-            [InlineKeyboardButton(text=f"👋 Хтось шукає співрозмовника: {_onoff(u.get('notify_waiting', True))}", callback_data="tg_notify_waiting")],
-            [InlineKeyboardButton(text=f"⏰ Година знайомств: {_onoff(u.get('notify_meet', True))}", callback_data="tg_notify_meet")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="set_back")],
-        ]
-    )
-
-
-TOGGLES = {
-    "hide_age": (False, "privacy"),
-    "hide_country": (False, "privacy"),
-    "hide_interests": (False, "privacy"),
-    "notify_tasks": (True, "notify"),
-    "notify_tips": (True, "notify"),
-    "allow_invites": (True, "notify"),
-    "notify_waiting": (True, "notify"),
-    "notify_meet": (True, "notify"),
-}
-
-
-async def _set_markup(call: types.CallbackQuery, markup):
-    try:
-        await call.message.edit_reply_markup(reply_markup=markup)
-    except TelegramAPIError:
-        pass
-
-
-@dp.callback_query(F.data == "set_media")
-async def set_media(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    u["media_mode"] = "all" if media_is_safe(u) else "safe"
-    u["media_mode_set"] = True
-    request_save()
-    await _set_markup(call, get_settings_keyboard(u))
-    await call.answer(
-        "🛡 Фото, відео, GIF і файли від співрозмовників більше не надходитимуть"
-        if u["media_mode"] == "safe"
-        else "📷 Тепер приймаєш усі повідомлення",
-        show_alert=True,
-    )
-
-
-@dp.callback_query(F.data == "set_auto")
-async def set_auto(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    u["auto_search"] = not u.get("auto_search")
-    request_save()
-    await _set_markup(call, get_settings_keyboard(u))
-    await call.answer(
-        "🔁 Після кожного чату бот одразу шукатиме наступного" if u["auto_search"] else "Автопошук вимкнено"
-    )
-
-
-@dp.callback_query(F.data == "set_privacy")
-async def set_privacy(call: types.CallbackQuery):
-    await _set_markup(call, privacy_keyboard(init_user(call.from_user.id)))
-    await call.answer("Приховане співрозмовник побачить як 🙈. Фільтри пошуку працюють як раніше.", show_alert=True)
-
-
-@dp.callback_query(F.data == "set_notify")
-async def set_notify(call: types.CallbackQuery):
-    await _set_markup(call, notify_keyboard(init_user(call.from_user.id)))
-    await call.answer()
-
-
-@dp.callback_query(F.data == "set_back")
-async def set_back(call: types.CallbackQuery):
-    await _set_markup(call, get_settings_keyboard(init_user(call.from_user.id)))
-    await call.answer()
-
-
-@dp.callback_query(F.data.startswith("tg_"))
-async def toggle_setting(call: types.CallbackQuery):
-    key = call.data[len("tg_"):]
-    if key not in TOGGLES:
-        await call.answer()
-        return
-    default, menu = TOGGLES[key]
-    u = init_user(call.from_user.id)
-    u[key] = not u.get(key, default)
-    request_save()
-    await _set_markup(call, privacy_keyboard(u) if menu == "privacy" else notify_keyboard(u))
-    await call.answer("Збережено ✅")
-
-
-# ---------------------------------------------------------------------------
 # Редагування профілю кнопками (без /edit_profile)
 # ---------------------------------------------------------------------------
 class ProfileEditStates(StatesGroup):
     age = State()
     country = State()
+    bio = State()
 
 
 def _archive_profile(u: dict):
@@ -314,7 +19,8 @@ def profile_edit_text(u: dict) -> str:
         f"👤 Стать: <b>{esc(u['gender'])}</b>\n"
         f"🎂 Вік: <b>{esc(u['age'])}</b>{' (🙈 прихований)' if u.get('hide_age') else ''}\n"
         f"🌍 Країна: <b>{esc(u['country'])}</b>{' (🙈 прихована)' if u.get('hide_country') else ''}\n"
-        f"🧩 Інтереси: {interests_line(u)}\n\n"
+        f"🧩 Інтереси: {interests_line(u)}\n"
+        f"📝 Про себе: {('«' + protect_text(esc(u['bio'])) + '»') if u.get('bio') else 'не заповнено'}\n\n"
         "Що змінити?"
     )
 
@@ -330,6 +36,7 @@ def profile_edit_keyboard():
                 InlineKeyboardButton(text="🌍 Країна", callback_data="pe_country"),
                 InlineKeyboardButton(text="🧩 Інтереси", callback_data="pi_open"),
             ],
+            [InlineKeyboardButton(text="📝 Про себе", callback_data="pe_bio")],
         ]
     )
 
@@ -343,6 +50,54 @@ async def pe_menu(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await _show_profile_editor(call.from_user.id, init_user(call.from_user.id))
     await call.answer()
+
+
+BIO_MAX = 70
+
+
+@dp.callback_query(F.data == "pe_bio")
+async def pe_bio(call: types.CallbackQuery, state: FSMContext):
+    u = init_user(call.from_user.id)
+    await state.set_state(ProfileEditStates.bio)
+    rows = [[InlineKeyboardButton(text="🗑 Прибрати опис", callback_data="pe_bio_del")]] if u.get("bio") else []
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="pe_menu")])
+    await call.message.answer(
+        f"📝 Напиши коротко про себе — до {BIO_MAX} символів. Співрозмовник побачить це на початку чату.\n\n"
+        "Наприклад: «Люблю нічні прогулянки й інді-музику 🎧»\n"
+        "<i>Без імені, контактів, @ніків і посилань — анонімність понад усе.</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "pe_bio_del")
+async def pe_bio_del(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    u = init_user(call.from_user.id)
+    u.pop("bio", None)
+    request_save()
+    await _show_profile_editor(call.from_user.id, u)
+    await call.answer("Опис прибрано")
+
+
+@dp.message(ProfileEditStates.bio)
+async def pe_bio_save(message: types.Message, state: FSMContext):
+    text = " ".join((message.text or "").split())
+    if not text:
+        await message.answer("Напиши опис текстом 🙂")
+        return
+    if len(text) > BIO_MAX:
+        await message.answer(f"Задовго — {len(text)} символів. Скороти до {BIO_MAX} 🙂")
+        return
+    if LINK_REGEX.search(text) or PHONE_REGEX.search(text) or "@" in text:
+        await message.answer("🚫 Без контактів, @ніків і посилань — напиши інакше 🙂")
+        return
+    await state.clear()
+    u = init_user(message.from_user.id)
+    u["bio"] = text
+    request_save()
+    await message.answer("✅ Збережено!")
+    await _show_profile_editor(message.from_user.id, u)
 
 
 @dp.callback_query(F.data == "pe_gender")
@@ -468,6 +223,16 @@ BANNER_PLACES = {
     "topup": "💳 Поповнення",
     "tasks": "📋 Завдання",
     "lottery": "🎰 Рулетка",
+    "voicechat": "🎙 Голосовий чат",
+    "voice": "🎙 Маска голосу",
+    "flirt": "❤️ Флірт-пошук",
+    "interests": "🧩 За інтересами",
+    "games": "🎲 Ігри",
+    "fun": "✨ Розваги",
+    "confess": "🤫 Зізнання",
+    "letter": "💌 Нічний лист",
+    "unmask": "🎭 Маски знято",
+    "friends": "👫 Друзі",
 }
 BANNER_COOLDOWN = 10 * 60  # той самий банер одній людині — не частіше ніж раз на 10 хв
 banner_last_shown: dict[tuple[int, str], float] = {}
@@ -645,10 +410,11 @@ def _is_banner_admin(user_id: int) -> bool:
 
 
 def banners_admin_keyboard():
-    rows = [
-        [InlineKeyboardButton(text=("✅ " if key in banners else "➕ ") + label, callback_data=f"adm_bn_{key}")]
+    btns = [
+        InlineKeyboardButton(text=("✅ " if key in banners else "➕ ") + label, callback_data=f"adm_bn_{key}")
         for key, label in BANNER_PLACES.items()
     ]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1376,6 +1142,596 @@ async def paysupport_cmd(message: types.Message, state: FSMContext):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# 📍 Де я зараз: статус чату/пошуку/кімнати і швидке повернення
+# ---------------------------------------------------------------------------
+def chat_mode_label(mode: str) -> str:
+    if mode == "flirt":
+        return "❤️ Флірт-чат"
+    if mode == "voice":
+        return "🎙 Голосовий чат"
+    if mode.startswith("int:"):
+        return f"🧩 Чат за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}"
+    return "🔍 Анонімний чат"
+
+
+def where_text(user_id: int) -> str:
+    now = time.time()
+    if user_id in active_chats:
+        meta = chat_meta.get(user_id) or {}
+        p = users_db.get(active_chats[user_id]) or {}
+        mins = int((now - meta.get("start", now)) // 60)
+        return (
+            f"💬 <b>Ти зараз у чаті</b>: {chat_mode_label(meta.get('mode', 'normal'))}\n"
+            f"👤 Співрозмовник: {short_info(p)}\n"
+            f"⏱ {mins} хв · твоїх повідомлень: {meta.get('msgs', 0)}\n\n"
+            "Просто пиши — повідомлення йдуть співрозмовнику. Завершити: «❌ Завершити чат»."
+        )
+    if user_id in queue:
+        mode = search_mode.get(user_id, "normal")
+        mins = int((now - queue_since.get(user_id, now)) // 60)
+        return f"⏳ <b>Йде пошук</b>: {chat_mode_label(mode)} · {mins} хв\nЩойно когось знайду — одразу з'єдную."
+    if user_id in user_room:
+        room = rooms.get(user_room[user_id]) or {}
+        title = ROOM_TOPICS.get(room.get("topic"), "кімната")
+        return f"👥 <b>Ти в кімнаті</b>: {title} · учасників: {len(room.get('members') or ())}"
+    return "🙂 Ти зараз не в чаті й не в пошуку. Натисни «🔍 Шукати співрозмовника» 👇"
+
+
+@dp.message(F.text == BTN_BACK_CHAT)
+@dp.message(F.text == BTN_BACK_ROOM)
+@dp.message(Command("where", "chat"))
+async def where_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    if uid in active_chats:
+        kb = get_chat_keyboard()
+    elif uid in user_room:
+        kb = get_room_keyboard()
+    else:
+        kb = get_main_keyboard()
+    await message.answer(where_text(uid), reply_markup=kb)
+
+# ---------------------------------------------------------------------------
+# ✨ Розваги: гороскоп, карта дня, сумісність знаків, що нового, канал зізнань
+# ---------------------------------------------------------------------------
+import hashlib
+
+ZODIAC = {k: (uk, el) for k, uk, el in [('aries', '♈ Овен', 'fire'), ('taurus', '♉ Телець', 'earth'), ('gemini', '♊ Близнюки', 'air'), ('cancer', '♋ Рак', 'water'), ('leo', '♌ Лев', 'fire'), ('virgo', '♍ Діва', 'earth'), ('libra', '♎ Терези', 'air'), ('scorpio', '♏ Скорпіон', 'water'), ('sagittarius', '♐ Стрілець', 'fire'), ('capricorn', '♑ Козоріг', 'earth'), ('aquarius', '♒ Водолій', 'air'), ('pisces', '♓ Риби', 'water')]}
+H_DAY = [
+    'Сьогодні вдалий день, щоб почати те, що давно відкладав(-ла).',
+    'Енергії багато — направ її на одну справу, а не на десять.',
+    'День спокійний: ідеальний час навести лад у думках.',
+    'Хтось чекає від тебе першого кроку. Можливо, варто його зробити.',
+    'Невелика несподіванка підніме настрій ближче до вечора.',
+    'Не поспішай із висновками — до вечора все проясниться.',
+    'Сьогодні твоя сила — у словах. Говори щиро.',
+    'Гарний день для нових знайомств і цікавих розмов.',
+    'Дай собі відпочити — продуктивність повернеться завтра.',
+    'Маленька перемога сьогодні важливіша, ніж здається.',
+]
+H_LOVE = [
+    'У коханні: щирий комплімент зробить більше, ніж ти думаєш.',
+    'У коханні: хтось думає про тебе частіше, ніж показує.',
+    'У коханні: відкрийся трохи більше — і отримаєш у відповідь тепло.',
+    'У коханні: не шукай ідеального — шукай свого.',
+    'У коханні: ввечері можлива розмова, яка багато змінить.',
+    'У коханні: зірки радять бути сміливішим(-ою).',
+    'У коханні: тиша теж буває відповіддю — дай людині час.',
+    'У коханні: несподіване знайомство може стати чимось більшим.',
+]
+H_TIP = [
+    'Порада дня: випий води й посміхнись незнайомцю 🙂',
+    'Порада дня: напиши тому, за ким сумуєш.',
+    'Порада дня: зроби одну справу до кінця.',
+    'Порада дня: прогулянка вирішить більше, ніж ти думаєш.',
+    'Порада дня: скажи «ні» тому, що забирає твою енергію.',
+    'Порада дня: увімкни улюблену пісню на повну.',
+    'Порада дня: похвали себе — ти багато робиш.',
+]
+H_COLORS = ['фіолетовий', 'золотий', 'бірюзовий', 'рожевий', 'смарагдовий', 'сріблястий', 'синій', 'бордовий']
+TAROT = [
+    ('🃏 Блазень', 'Новий початок і легкість. Не бійся зробити крок у невідоме.'),
+    ('🪄 Маг', 'Усе потрібне вже в тебе є. Дій — і вийде.'),
+    ('🌙 Верховна Жриця', 'Довірся інтуїції — вона сьогодні не підведе.'),
+    ('🌸 Імператриця', 'День турботи, краси й тепла. Подаруй його собі й іншим.'),
+    ('👑 Імператор', 'Час взяти ситуацію під контроль і поставити межі.'),
+    ('📜 Ієрофант', 'Мудра порада прийде від того, кого ти поважаєш.'),
+    ('💞 Закохані', 'Важливий вибір серцем. Слухай, що відчуваєш.'),
+    ('🏇 Колісниця', 'Рух уперед і перемога, якщо тримаєш курс.'),
+    ('🦁 Сила', "Твоя м'якість — це теж сила. Спокій переможе."),
+    ('🏮 Відлюдник', 'Побудь трохи наодинці — відповідь прийде зсередини.'),
+    ('🎡 Колесо Фортуни', 'Удача повертається до тебе обличчям. Лови момент.'),
+    ('⚖️ Справедливість', 'Чесність повернеться до тебе сторицею.'),
+    ('🙃 Повішений', 'Подивись на ситуацію під іншим кутом — і все зміниться.'),
+    ('🦋 Зміни', 'Щось старе завершується, щоб звільнити місце новому.'),
+    ('🍯 Помірність', 'Баланс і терпіння — сьогодні твої найкращі друзі.'),
+    ('😈 Спокуса', 'Помітиш спокусу — запитай себе, чи справді воно тобі треба.'),
+    ('⚡ Вежа', 'Несподіванка струсне рутину — і це на краще.'),
+    ('⭐ Зірка', 'Надія й натхнення. Мрій сміливо — сьогодні можна.'),
+    ('🌕 Місяць', 'Не все таке, яким здається. Не поспішай з висновками.'),
+    ('☀️ Сонце', 'Радість, тепло й успіх. Найкраща карта дня ✨'),
+    ('📯 Суд', 'Час підбити підсумки й пробачити — собі теж.'),
+    ('🌍 Світ', 'Завершення й гармонія. Ти саме там, де маєш бути.'),
+]
+COMPAT_TEXT = {k: v[0] for k, v in {'same': ('Ви говорите однією мовою стихії — легко, тепло й зрозуміло 💜', 'Вы говорите на одном языке стихии — легко, тепло и понятно 💜'), 'good': ('Ви чудово доповнюєте одне одного: де одному бракує — інший має з надлишком ✨', 'Вы отлично дополняете друг друга: где одному не хватает — у другого с избытком ✨'), 'mid': ('Цікава пара: будуть і іскри, і суперечки — нудно точно не буде 😉', 'Интересная пара: будут и искры, и споры — скучно точно не будет 😉'), 'hard': ('Різні стихії — складніше, але якщо вдасться, це буде дуже сильна пара 🔥', 'Разные стихии — сложнее, но если получится, это будет очень сильная пара 🔥')}.items()}
+HOROSCOPE_CHANNEL = os.getenv("HOROSCOPE_CHANNEL", "")  # напр. @ANONimchyk_goroskop — з'явиться кнопка
+NEWS_CHANNEL = os.getenv("NEWS_CHANNEL", "")  # напр. @ANONimchyk_news
+
+
+def _seed(*parts) -> int:
+    return int(hashlib.md5(":".join(map(str, parts)).encode()).hexdigest(), 16)
+
+
+def fun_menu_kb():
+    rows = [
+        [InlineKeyboardButton(text="🔮 Гороскоп на сьогодні", callback_data="fun_horo")],
+        [InlineKeyboardButton(text="🃏 Карта дня", callback_data="fun_tarot"),
+         InlineKeyboardButton(text="💞 Сумісність знаків", callback_data="fun_compat")],
+        [InlineKeyboardButton(text="📰 Що нового", callback_data="fun_news"),
+         InlineKeyboardButton(text="🤫 Канал зізнань", url=confess_channel_link())],
+    ]
+    if HOROSCOPE_CHANNEL:
+        rows.append([InlineKeyboardButton(text="🌙 Канал «ANONimchyk Гороскоп»", url=f"https://t.me/{HOROSCOPE_CHANNEL.lstrip('@')}")])
+    if NEWS_CHANNEL:
+        rows.append([InlineKeyboardButton(text="📣 Канал «ANONimchyk News»", url=f"https://t.me/{NEWS_CHANNEL.lstrip('@')}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+FUN_MENU_TEXT = "✨ <b>Розваги</b>\nЧим зайнятись, поки шукаєш співрозмовника 👇\n<i>Гороскоп і карти — для настрою й розваги 😉</i>"
+
+
+@dp.message(F.text == BTN_FUN)
+@dp.message(Command("fun"))
+async def fun_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await send_banner(message.from_user.id, "fun")
+    await message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
+
+
+@dp.callback_query(F.data == "fun_menu")
+async def fun_menu_cb(call: types.CallbackQuery):
+    await call.message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
+    await call.answer()
+
+
+def zodiac_kb(prefix: str):
+    keys = list(ZODIAC)
+    rows = [[InlineKeyboardButton(text=ZODIAC[k][0], callback_data=f"{prefix}{k}") for k in keys[i:i + 3]]
+            for i in range(0, 12, 3)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def horoscope_text(sign: str, day) -> str:
+    s = _seed("horo", sign, day.isoformat())
+    return (
+        f"🔮 <b>{ZODIAC[sign][0]} · {day.strftime('%d.%m')}</b>\n\n"
+        f"{H_DAY[s % len(H_DAY)]}\n\n"
+        f"💜 {H_LOVE[(s // 7) % len(H_LOVE)]}\n\n"
+        f"✨ {H_TIP[(s // 49) % len(H_TIP)]}\n\n"
+        f"🍀 Щасливе число: <b>{(s // 343) % 33 + 1}</b> · колір: <b>{H_COLORS[(s // 11) % len(H_COLORS)]}</b>"
+    )
+
+
+def horo_after_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Змінити знак", callback_data="fun_horo_pick"),
+         InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")],
+    ])
+
+
+@dp.callback_query(F.data == "fun_horo")
+async def fun_horo(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    sign = u.get("zodiac")
+    await call.answer()
+    if sign in ZODIAC:
+        await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
+        stat_add("horoscope")
+        return
+    await call.message.answer("🔮 Обери свій знак — я запам'ятаю, і далі гороскоп буде в один дотик:", reply_markup=zodiac_kb("fun_z:"))
+
+
+@dp.callback_query(F.data == "fun_horo_pick")
+async def fun_horo_pick(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer("🔮 Обери свій знак:", reply_markup=zodiac_kb("fun_z:"))
+
+
+@dp.callback_query(F.data.startswith("fun_z:"))
+async def fun_zodiac_set(call: types.CallbackQuery):
+    sign = call.data.split(":", 1)[1]
+    if sign not in ZODIAC:
+        await call.answer()
+        return
+    u = init_user(call.from_user.id)
+    u["zodiac"] = sign
+    request_save()
+    await call.answer(f"Запам'ятав: {ZODIAC[sign][0]}")
+    await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
+    stat_add("horoscope")
+
+
+@dp.callback_query(F.data == "fun_tarot")
+async def fun_tarot(call: types.CallbackQuery):
+    i = _seed("tarot", call.from_user.id, kyiv_today().isoformat()) % len(TAROT)
+    name, meaning = TAROT[i]
+    await call.answer()
+    await call.message.answer(
+        f"🃏 <b>Твоя карта дня</b>\n\n<b>{name}</b>\n{meaning}\n\n<i>Завтра — нова карта 🌙</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")]]),
+    )
+    stat_add("tarot")
+
+
+def compat_kind(a: str, b: str) -> str:
+    ea, eb = ZODIAC[a][1], ZODIAC[b][1]
+    if ea == eb:
+        return "same"
+    pair = {ea, eb}
+    if pair in ({"fire", "air"}, {"earth", "water"}):
+        return "good"
+    if pair in ({"fire", "water"}, {"earth", "air"}):
+        return "hard"
+    return "mid"
+
+
+def compat_percent(a: str, b: str) -> int:
+    base = {"same": 88, "good": 80, "mid": 64, "hard": 50}[compat_kind(a, b)]
+    return min(99, base + _seed("zc", *sorted((a, b))) % 10)
+
+
+@dp.callback_query(F.data == "fun_compat")
+async def fun_compat(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    await call.answer()
+    if u.get("zodiac") in ZODIAC:
+        await call.message.answer(f"💞 Твій знак: {ZODIAC[u['zodiac']][0]}. А який знак у нього / неї?", reply_markup=zodiac_kb("fun_c2:"))
+    else:
+        await call.message.answer("💞 Спершу обери свій знак:", reply_markup=zodiac_kb("fun_c1:"))
+
+
+@dp.callback_query(F.data.startswith("fun_c1:"))
+async def fun_compat_mine(call: types.CallbackQuery):
+    sign = call.data.split(":", 1)[1]
+    if sign not in ZODIAC:
+        await call.answer()
+        return
+    u = init_user(call.from_user.id)
+    u["zodiac"] = sign
+    request_save()
+    await call.answer()
+    await call.message.answer(f"💞 Твій знак: {ZODIAC[sign][0]}. А який знак у нього / неї?", reply_markup=zodiac_kb("fun_c2:"))
+
+
+@dp.callback_query(F.data.startswith("fun_c2:"))
+async def fun_compat_result(call: types.CallbackQuery):
+    other = call.data.split(":", 1)[1]
+    u = init_user(call.from_user.id)
+    mine = u.get("zodiac")
+    if other not in ZODIAC or mine not in ZODIAC:
+        await call.answer()
+        return
+    p = compat_percent(mine, other)
+    bar = "💜" * round(p / 20) + "🤍" * (5 - round(p / 20))
+    await call.answer()
+    await call.message.answer(
+        f"💞 <b>{ZODIAC[mine][0]} + {ZODIAC[other][0]}</b>\n\n<b>{p}%</b>  {bar}\n{COMPAT_TEXT[compat_kind(mine, other)]}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔁 Інший знак", callback_data="fun_compat"),
+             InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")],
+        ]),
+    )
+    stat_add("zodiac_compat")
+
+
+NEWS_TEXT = (
+    "📰 <b>Що нового в ANONimchyk</b>\n\n"
+    "🎭 <b>Зняти маску</b> — за взаємною згодою покажіть одне одному нік, вік і фото\n"
+    "🎙 <b>Маска голосу</b> — 12 голосів у голосових: робот, привид, демон… (/voice)\n"
+    "🎙 <b>Голосовий чат</b> — спілкування лише голосом, і голос завжди змінений\n"
+    "🎲 <b>Ігри в чаті</b> — «Правда чи дія», «Що обереш?», «2 правди і 1 брехня»\n"
+    "💌 <b>Нічний лист</b> — напиши незнайомцю, а вранці отримай чийсь\n"
+    "🤫 <b>Анонімні зізнання</b> — і канал, де їх публікують\n"
+    "💯 <b>Сумісність</b> після кожної розмови\n"
+    "✨ <b>Розваги</b> — гороскоп, карта дня, сумісність знаків\n"
+    "👑 <b>Пак засновника</b> — стікери для перших учасників"
+)
+
+
+@dp.callback_query(F.data == "fun_news")
+async def fun_news(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer(NEWS_TEXT, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")]]))
+
+
+# ---------------------------------------------------------------------------
+# 🎙 Голосовий чат: окремий пошук, де спілкуються лише голосовими з маскою
+# ---------------------------------------------------------------------------
+def voice_chat_note(u: dict) -> str:
+    return (
+        "🎙 <b>Голосовий чат</b>\n"
+        "Тут спілкуються лише голосовими — затисни 🎤 і говори.\n"
+        f"Твій голос змінює маска: <b>{voice_mask_label(u, for_voice_chat=True)}</b> — співрозмовник не почує справжнього. "
+        "Змінити: /voice"
+    )
+
+
+@dp.message(F.text == BTN_VOICE_SEARCH)
+@dp.message(Command("voicechat"))
+async def voice_search_start(message: types.Message, state: FSMContext):
+    if message.from_user.id not in active_chats and message.from_user.id not in queue:
+        await send_banner(message.from_user.id, "voicechat")
+    await run_search(message, state, "voice")
+
+
+# ---------------------------------------------------------------------------
+# 🎲 Ігри в чаті: Правда чи дія · Що обереш? · 2 правди і 1 брехня
+# ---------------------------------------------------------------------------
+TRUTHS = [
+    "Яка пісня зараз найчастіше грає в тебе в навушниках?",
+    "Що тебе найбільше смішить у собі?",
+    "Яку дурну звичку ти ніяк не можеш кинути?",
+    "Про що ти мрієш, але ще нікому не казав(-ла)?",
+    "Який найсміливіший вчинок ти колись робив(-ла)?",
+    "Що б ти змінив(-ла) у своєму дні, якби міг(-ла)?",
+    "Чого ти боїшся, хоча розумієш, що це смішно?",
+    "Яке твоє найдивніше хобі або захоплення?",
+    "Яку книгу, фільм чи серіал ти можеш переглядати безкінечно?",
+    "Коли ти востаннє плакав(-ла) від сміху і чому?",
+    "Яку суперсилу ти б обрав(-ла)?",
+    "Що тебе може миттєво підняти настрій?",
+    "Що ти вмієш, чого не вміють інші?",
+    "Яка найкраща порада, яку тобі давали?",
+    "Яке місце в Україні ти хочеш побачити найбільше?",
+    "Що б ти зробив(-ла), якби виграв(-ла) мільйон?",
+    "Яка твоя перша думка зранку?",
+    "За чим ти найбільше сумуєш із дитинства?",
+    "Що в людях тебе чіпляє найбільше?",
+    "Про що ти міг(-ла) би говорити годинами?",
+]
+DARES = [
+    "Опиши свій настрій трьома емоджі 🙂",
+    "Напиши вірш із двох рядків про цей чат.",
+    "Надішли голосове з маскою голосу 🎙 і скажи «привіт» найсмішнішим тоном.",
+    "Надішли стікер, який найкраще тебе описує.",
+    "Розкажи анекдот — навіть якщо він поганий 😄",
+    "Придумай співрозмовнику смішне прізвисько.",
+    "Опиши свій ідеальний вечір одним реченням.",
+    "Напиши комплімент співрозмовнику — щиро 💜",
+    "Напиши назву фільму емоджі — хай співрозмовник вгадає.",
+    "Склади речення, де всі слова починаються на одну літеру.",
+    "Розкажи, що зараз бачиш за вікном, як диктор новин.",
+    "Признайся, що ти їв(-ла) сьогодні — і оціни це від 1 до 10.",
+    "Напиши, яку пісню ти б заспівав(-ла) в караоке прямо зараз.",
+    "Наступні 3 повідомлення пиши лише з великої літери КОЖНЕ СЛОВО.",
+    "Вигадай назву для вашої анонімної розмови, як для серіалу 🎬",
+]
+WOULD_RATHER = [
+    ("🌊 Море", "⛰ Гори"),
+    ("🌅 Світанок", "🌙 Ніч"),
+    ("☕ Кава", "🍵 Чай"),
+    ("🐶 Собака", "🐱 Кіт"),
+    ("📚 Книга", "🎬 Фільм"),
+    ("🍕 Піца", "🍣 Суші"),
+    ("❄️ Зима", "☀️ Літо"),
+    ("🏙 Місто", "🌾 Село"),
+    ("🎧 Навушники", "🔊 Колонка"),
+    ("✈️ Подорож", "🏠 Затишок вдома"),
+    ("🎤 Співати", "💃 Танцювати"),
+    ("🧭 Минуле", "🚀 Майбутнє"),
+    ("📞 Подзвонити", "💬 Написати"),
+    ("🎢 Атракціони", "🧩 Настолки"),
+    ("🍫 Солодке", "🧂 Солоне"),
+]
+
+
+def game_menu_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔥 Правда чи дія", callback_data="gm_td")],
+            [InlineKeyboardButton(text="🤔 Що обереш?", callback_data="gm_wyr")],
+            [InlineKeyboardButton(text="🕵️ 2 правди і 1 брехня", callback_data="gm_2t1l")],
+        ]
+    )
+
+
+def _game_pair(user_id: int) -> tuple[int, frozenset] | None:
+    partner = active_chats.get(user_id)
+    if partner is None:
+        return None
+    return partner, frozenset((user_id, partner))
+
+
+@dp.message(F.text == BTN_GAME)
+@dp.message(Command("game"))
+async def game_open(message: types.Message, state: FSMContext):
+    await state.clear()
+    if _game_pair(message.from_user.id) is None:
+        await message.answer("🎲 Ігри доступні під час анонімного чату — знайди співрозмовника 🙂", reply_markup=get_main_keyboard())
+        return
+    await send_banner(message.from_user.id, "games")
+    await message.answer("🎲 <b>Зіграємо?</b> Обери гру — вона з'явиться в обох:", reply_markup=game_menu_kb())
+
+
+async def _both(user_id: int, partner: int, text: str, kb=None):
+    await safe_send(user_id, text, reply_markup=kb)
+    await safe_send(partner, text, reply_markup=kb)
+
+
+def td_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="😇 Правда", callback_data="td_t"),
+            InlineKeyboardButton(text="😈 Дія", callback_data="td_d"),
+        ]]
+    )
+
+
+@dp.callback_query(F.data == "gm_td")
+async def game_td(call: types.CallbackQuery):
+    pair = _game_pair(call.from_user.id)
+    if pair is None:
+        await call.answer("Чат уже завершено.", show_alert=True)
+        return
+    partner, _ = pair
+    await call.answer()
+    await _both(call.from_user.id, partner,
+                "🔥 <b>Правда чи дія</b>\nХто першим натисне — той і відповідає. Потім по черзі 😉", td_kb())
+    stat_add("games")
+
+
+@dp.callback_query(F.data.in_({"td_t", "td_d"}))
+async def game_td_pick(call: types.CallbackQuery):
+    pair = _game_pair(call.from_user.id)
+    if pair is None:
+        await call.answer("Чат уже завершено.", show_alert=True)
+        return
+    partner, key = pair
+    st = game_state.setdefault(key, {})
+    used = st.setdefault("td_used", set())
+    truth = call.data == "td_t"
+    pool = TRUTHS if truth else DARES
+    choices = [i for i in range(len(pool)) if (truth, i) not in used] or list(range(len(pool)))
+    i = random.choice(choices)
+    used.add((truth, i))
+    await call.answer()
+    head = "😇 <b>Правда</b>" if truth else "😈 <b>Дія</b>"
+    await safe_send(call.from_user.id, f"{head} — твоє завдання:\n\n{pool[i]}", reply_markup=td_kb())
+    tok = GENDER_FOR.set(gender_of(call.from_user.id) or "?")
+    try:
+        await safe_send(partner, f"{head} — завдання для співрозмовника:\n\n{pool[i]}\n\n<i>Тепер твоя черга 👇</i>", reply_markup=td_kb())
+    finally:
+        GENDER_FOR.reset(tok)
+
+
+def wyr_kb(i: int):
+    a, b = WOULD_RATHER[i]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=a, callback_data=f"wyr:{i}:0"),
+            InlineKeyboardButton(text=b, callback_data=f"wyr:{i}:1"),
+        ]]
+    )
+
+
+async def _wyr_new(user_id: int, partner: int, key: frozenset):
+    st = game_state.setdefault(key, {})
+    used = st.setdefault("wyr_used", set())
+    choices = [i for i in range(len(WOULD_RATHER)) if i not in used] or list(range(len(WOULD_RATHER)))
+    i = random.choice(choices)
+    used.add(i)
+    st["wyr"] = {"i": i, "votes": {}}
+    await _both(user_id, partner, "🤔 <b>Що обереш?</b>\nОбирайте — відповіді відкриються, коли проголосуєте обоє 🤫", wyr_kb(i))
+
+
+@dp.callback_query(F.data == "gm_wyr")
+async def game_wyr(call: types.CallbackQuery):
+    pair = _game_pair(call.from_user.id)
+    if pair is None:
+        await call.answer("Чат уже завершено.", show_alert=True)
+        return
+    await call.answer()
+    await _wyr_new(call.from_user.id, pair[0], pair[1])
+    stat_add("games")
+
+
+@dp.callback_query(F.data.startswith("wyr:"))
+async def game_wyr_vote(call: types.CallbackQuery):
+    pair = _game_pair(call.from_user.id)
+    if pair is None:
+        await call.answer("Чат уже завершено.", show_alert=True)
+        return
+    partner, key = pair
+    try:
+        _, si, sc = call.data.split(":")
+        i, c = int(si), int(sc)
+    except ValueError:
+        await call.answer()
+        return
+    cur = (game_state.get(key) or {}).get("wyr")
+    if not cur or cur["i"] != i:
+        await call.answer("Це питання вже закрите 🙂")
+        return
+    if call.from_user.id in cur["votes"]:
+        await call.answer("Ти вже обрав(-ла) — чекаємо співрозмовника ⏳")
+        return
+    cur["votes"][call.from_user.id] = c
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if len(cur["votes"]) < 2:
+        await call.answer(f"Ти обрав(-ла): {WOULD_RATHER[i][c]} — чекаємо співрозмовника ⏳")
+        return
+    await call.answer()
+    mine, theirs = cur["votes"][call.from_user.id], cur["votes"].get(partner, -1)
+    same = mine == theirs
+    verdict = "💜 <b>Ви обрали однаково!</b>" if same else "🙃 <b>Ви обрали різне</b> — є про що посперечатися 😄"
+    more = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➡️ Ще питання", callback_data="gm_wyr")]])
+    for me, other in ((call.from_user.id, partner), (partner, call.from_user.id)):
+        await safe_send(
+            me,
+            f"{verdict}\nТи: {WOULD_RATHER[i][cur['votes'].get(me, 0)]} · Співрозмовник: {WOULD_RATHER[i][cur['votes'].get(other, 0)]}",
+            reply_markup=more,
+        )
+
+
+@dp.callback_query(F.data == "gm_2t1l")
+async def game_2t1l(call: types.CallbackQuery):
+    pair = _game_pair(call.from_user.id)
+    if pair is None:
+        await call.answer("Чат уже завершено.", show_alert=True)
+        return
+    await call.answer()
+    await safe_send(
+        call.from_user.id,
+        "🕵️ <b>2 правди і 1 брехня</b>\nТи починаєш: напиши 3 факти про себе — два правдиві, один вигаданий. "
+        "Співрозмовник має вгадати брехню. Потім мінятесь 😉\n<i>Без імен, адрес і контактів 🙂</i>",
+    )
+    await safe_send(
+        pair[0],
+        "🕵️ <b>2 правди і 1 брехня</b>\nСпіврозмовник зараз напише 3 факти про себе — один із них брехня. "
+        "Вгадай, який! Потім твоя черга 😉",
+    )
+    stat_add("games")
+
+
+# ---------------------------------------------------------------------------
+# 💯 Сумісність після чату
+# ---------------------------------------------------------------------------
+def compat_text(u: dict, p: dict, duration: float, min_msgs: int) -> str:
+    score = 35
+    reasons = []
+    common = sorted((u.get("interests") or set()) & (p.get("interests") or set()))
+    if common:
+        score += min(30, 15 * len(common))
+        labels = ", ".join(INTEREST_LABELS.get(k, k) for k in common[:3])
+        reasons.append(f"🧩 спільне: {labels}")
+    mu, mp = current_mood(u), current_mood(p)
+    if mu and mu == mp:
+        score += 12
+        reasons.append(f"🎭 однаковий настрій: {MOODS[mu]}")
+    a, b = get_age_int(u), get_age_int(p)
+    if a is not None and b is not None and abs(a - b) <= 3:
+        score += 8
+        reasons.append("🎂 майже однолітки")
+    if duration >= 600 or min_msgs >= 15:
+        score += 14
+        reasons.append("💬 довга розмова — вам було цікаво")
+    elif duration >= 180 or min_msgs >= 6:
+        score += 7
+        reasons.append("💬 жива розмова")
+    score += random.randint(0, 4)
+    score = max(40, min(99, score))
+    bar = "💜" * round(score / 20) + "🤍" * (5 - round(score / 20))
+    lines = [f"💯 <b>Ваша сумісність: {score}%</b>  {bar}"]
+    lines += [f"• {r}" for r in reasons]
+    if score >= 80:
+        lines.append("\nСхоже, ви на одній хвилі ✨ Додай у друзі, щоб не загубитись 🤝")
+    return "\n".join(lines)
 
 
 
