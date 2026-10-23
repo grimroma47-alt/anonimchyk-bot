@@ -63,6 +63,7 @@ async def track_last_seen(handler, event, data):
         user = data.get("event_from_user")
         if user is not None:
             CUR_LANG.set((users_db.get(user.id) or {}).get("lang", "uk") if LANG_RU_ENABLED else "uk")
+            CUR_UID.set(user.id)
             last_seen[user.id] = time.time()
             stats_day()["active"].add(user.id)
             known = users_db.get(user.id)
@@ -84,6 +85,9 @@ import contextvars
 LANG_RU_ENABLED = os.getenv("LANG_RU", "0") == "1"
 LANG_LABELS = {"uk": "🇺🇦 Українська", "ru": "🌐 Русский"}
 CUR_LANG: contextvars.ContextVar = contextvars.ContextVar("cur_lang", default="uk")
+CUR_UID: contextvars.ContextVar = contextvars.ContextVar("cur_uid", default=None)
+# Чия стать визначає закінчення (напр. завдання в грі адресоване співрозмовнику, а не отримувачу)
+GENDER_FOR: contextvars.ContextVar = contextvars.ContextVar("gender_for", default=None)
 _P0, _P1 = "⁣", "⁤"  # невидимі межі «не перекладати» (текст людей)
 
 if "RU_PAIRS" not in globals():
@@ -95,7 +99,7 @@ if "RU_PAIRS" not in globals():
             logging.warning("🌐 LANG_RU=1, але файл lang_ru.py не знайдено поруч із ботом — переклад вимкнено")
 
 _CYR = "а-яіїєґёА-ЯІЇЄҐЁ'ʼ"
-_GRN_RX = re.compile(f"(?<![{_CYR}])грн(?![{_CYR}])")
+_GRN_RX = re.compile(f"(?<![{_CYR}\u2060])грн(?![{_CYR}])")  # «200\u2060грн» — гривні для виводу, лишаються гривнями
 _tr_rx = None
 _tr_map: dict = {}
 _tr_back: dict = {}
@@ -137,18 +141,57 @@ def tr_ru(text: str) -> str:
     return _GRN_RX.sub("⭐", out)
 
 
-def translate_out(text, lang: str):
+# ⚧ Закінчення за статтю: «поїхав(-ла)» → «поїхав» / «поїхала». Стать не вказана — лишаємо як є.
+_G_UK = re.compile(f"([{_CYR}]+)\\((-ла|-лася|-ою)\\)")
+_G_RU = re.compile(f"([{_CYR}]+)\\((а|ла|на)\\)")
+
+
+def _g_uk(m, fem: bool) -> str:
+    w, suf = m.group(1), m.group(2)
+    if not fem:
+        return w
+    if suf == "-ла":
+        if w.endswith("міг"):
+            return w[:-3] + "могла"
+        return (w[:-1] if w.endswith("в") else w) + "ла"
+    if suf == "-лася":
+        return (w[:-3] if w.endswith("вся") else w) + "лася"
+    return (w[:-2] if w.endswith(("им", "ий")) else w) + "ою"
+
+
+def _g_ru(m, fem: bool) -> str:
+    w, suf = m.group(1), m.group(2)
+    if not fem:
+        return w
+    if suf == "на":
+        return (w[:-2] if w.endswith("ен") else w) + "на"
+    return w + suf
+
+
+def apply_gender(text: str, gender) -> str:
+    if gender not in ("Хлопець", "Дівчина") or not isinstance(text, str) or "(" not in text:
+        return text
+    fem = gender == "Дівчина"
+    text = _G_UK.sub(lambda m: _g_uk(m, fem), text)
+    return _G_RU.sub(lambda m: _g_ru(m, fem), text)
+
+
+def gender_of(uid) -> str | None:
+    return (users_db.get(uid) or {}).get("gender") if isinstance(uid, int) else None
+
+
+def translate_out(text, lang: str, gender=None):
     """Переклад вихідного тексту; шматки між _P0/_P1 лишаються як є. Для "uk" лише прибирає позначки."""
     if not isinstance(text, str):
         return text
     if _P0 not in text:
-        return tr_ru(text) if lang == "ru" else text
+        return apply_gender(tr_ru(text) if lang == "ru" else text, gender)
     out = []
     for i, chunk in enumerate(re.split(f"({_P0}.*?{_P1})", text, flags=re.S)):
         if chunk.startswith(_P0) and chunk.endswith(_P1):
             out.append(chunk[1:-1])
         else:
-            out.append(tr_ru(chunk) if lang == "ru" else chunk)
+            out.append(apply_gender(tr_ru(chunk) if lang == "ru" else chunk, gender))
     return "".join(out)
 
 
@@ -189,6 +232,23 @@ def _tr_markup(markup, lang):
     return markup
 
 
+QUIET_FROM, QUIET_TO = 23, 8
+
+
+def quiet_hours_now(u: dict | None) -> bool:
+    if not u or not u.get("quiet"):
+        return False
+    h = datetime.now(KYIV_TZ).hour
+    return h >= QUIET_FROM or h < QUIET_TO
+
+
+def is_quiet_for(chat_id: int) -> bool:
+    """Без звуку — лише якщо людина ввімкнула тихі години, зараз ніч і вона не сидить у боті / в чаті."""
+    if chat_id in active_chats or time.time() - last_seen.get(chat_id, 0) < 120:
+        return False
+    return quiet_hours_now(users_db.get(chat_id))
+
+
 def status_markup(chat_id: int, markup):
     """Якщо людина в чаті / пошуку / кімнаті — над головним меню з'являється мітка, як туди повернутися."""
     try:
@@ -213,11 +273,14 @@ async def i18n_request_middleware(make_request, bot_, method):
     try:
         chat_id = getattr(method, "chat_id", None)
         lang = user_lang(chat_id) if isinstance(chat_id, int) else (CUR_LANG.get() if LANG_RU_ENABLED else "uk")
+        gender = GENDER_FOR.get() or gender_of(chat_id if isinstance(chat_id, int) else CUR_UID.get())
         upd = {}
         for name in ("text", "caption", "title", "description"):
             val = getattr(method, name, None)
-            if isinstance(val, str) and (lang == "ru" or _P0 in val):
-                upd[name] = translate_out(val, lang)
+            if isinstance(val, str) and (lang == "ru" or _P0 in val or (gender and "(" in val)):
+                upd[name] = translate_out(val, lang, gender)
+        if isinstance(chat_id, int) and hasattr(method, "disable_notification") and is_quiet_for(chat_id):
+            upd["disable_notification"] = True  # 🌙 тихі години: приходить без звуку
         markup = getattr(method, "reply_markup", None)
         if isinstance(chat_id, int) and markup is not None:
             marked = status_markup(chat_id, markup)
@@ -292,6 +355,8 @@ ref_contest: dict = {"week": None, "counts": {}, "awarded": [], "history": []}
 top_week: dict = {"week": None, "votes": {}, "pairs": set(), "published": [], "history": []}
 letters_db: dict = {"items": [], "delivered_day": None}  # 💌 нічні листи
 confess_db: dict = {"next_id": 1, "pub_no": 0, "items": {}, "last_by": {}}  # 🤫 анонімні зізнання
+# 💸 Заявки на вивід: номер карти НЕ зберігаємо (лише останні 4 цифри) — повний номер бачить тільки адмін у повідомленні
+withdraw_db: dict = {"next": 1, "items": {}}
 launch_state: dict = {"done": False, "sent": 0}  # 🎭 розсилка про запуск «Зняти маску»
 meet_hour: dict = {"reminded": None, "summary": None, "chats_start": None, "peak": 0, "sent": 0}
 last_chat_seconds: dict[int, float] = {}  # тривалість щойно завершеного чату (для права оцінки в топі)
@@ -412,6 +477,9 @@ GIFT_CATALOG = {
 }
 # Частка від ціни подарунка, яка йде отримувачу (решта — дохід адміна)
 GIFT_RECIPIENT_SHARE = float(os.getenv("GIFT_RECIPIENT_SHARE", "0.25"))  # 0.25 = 25%
+# 💸 Вивід зароблених грошей на карту: мінімум і скільки днів «відлежуються» гроші з подарунків
+WITHDRAW_MIN = float(os.getenv("WITHDRAW_MIN", "200"))
+EARN_HOLD_DAYS = int(os.getenv("EARN_HOLD_DAYS", "7"))
 
 gift_revenue_total = 0.0  # сумарний дохід адміна з подарунків (для статистики)
 lottery_revenue_total = 0.0  # дохід адміна з рулетки (ставки мінус виплати)
@@ -645,6 +713,8 @@ BTN_GAME = "🎲 Гра"
 BTN_FUN = "✨ Розваги"
 BTN_BACK_CHAT = "💬 Ти в чаті — повернутися"
 BTN_SEARCHING = "⏳ Йде пошук · зупинити"
+BTN_MORE = "☰ Ще"
+BTN_MENU_BACK = "⬅️ Головне меню"
 BTN_BACK_ROOM = "👥 Ти в кімнаті — повернутися"
 BTN_FRIENDS = "👫 Друзі"
 BTN_TOPUP = "💳 Поповнити баланс"
@@ -707,6 +777,11 @@ class ConfessStates(StatesGroup):
     text = State()
 
 
+class WithdrawStates(StatesGroup):
+    amount = State()
+    card = State()
+
+
 # ---------------------------------------------------------------------------
 # Клавіатури
 # ---------------------------------------------------------------------------
@@ -718,14 +793,23 @@ def get_main_keyboard():
             [K(text=BTN_SEARCH)],
             [K(text=BTN_VOICE_SEARCH)],
             [K(text=BTN_FLIRT), K(text=BTN_INTERESTS)],
-            [K(text=BTN_PREMIUM), K(text=BTN_SHOP), K(text=BTN_WALLET)],
-            [K(text=BTN_TOPUP), K(text=BTN_DAILY)],
-            [K(text=BTN_TASKS), K(text=BTN_LOTTERY), K(text=BTN_FRIENDS)],
-            [K(text=BTN_PROFILE), K(text=BTN_SETTINGS)],
-            [K(text=BTN_ROOMS), K(text=BTN_FILTERS)],
+            [K(text=BTN_PREMIUM), K(text=BTN_TOPUP), K(text=BTN_DAILY)],
+            [K(text=BTN_PROFILE), K(text=BTN_WALLET), K(text=BTN_MORE)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_more_keyboard():
+    """☰ Ще: усі інші розділи — щоб головне меню було коротким."""
+    K = KeyboardButton
+    return ReplyKeyboardMarkup(
+        keyboard=[
             [K(text=BTN_FUN), K(text=BTN_CONFESS), K(text=BTN_LETTER)],
-            [K(text=BTN_ONLINE), K(text=BTN_TOP)],
-            [K(text=BTN_HELP)],
+            [K(text=BTN_SHOP), K(text=BTN_TASKS), K(text=BTN_LOTTERY)],
+            [K(text=BTN_FRIENDS), K(text=BTN_ROOMS), K(text=BTN_FILTERS)],
+            [K(text=BTN_ONLINE), K(text=BTN_TOP), K(text=BTN_SETTINGS)],
+            [K(text=BTN_HELP), K(text=BTN_MENU_BACK)],
         ],
         resize_keyboard=True,
     )
@@ -843,6 +927,7 @@ def get_wallet_keyboard():
             [InlineKeyboardButton(text="💳 Поповнити баланс", callback_data="topup_open")],
             [InlineKeyboardButton(text=f"✏️ Змінити нік ({NICK_PRICE} грн)", callback_data="buy_nick")],
             [InlineKeyboardButton(text="🎒 Інвентар подарунків", callback_data="inv_open")],
+            [InlineKeyboardButton(text=f"💸 Вивести на карту (від {uah(WITHDRAW_MIN, 0)})", callback_data="wd_open")],
         ]
     )
 
@@ -986,6 +1071,11 @@ def get_admin_keyboard():
             [InlineKeyboardButton(text="📣 Реклама в пошуку", callback_data="adm_ads")],
             [InlineKeyboardButton(text="🏦 Оплати на перевірці", callback_data="adm_payments")],
             [InlineKeyboardButton(text="🖼 Банери", callback_data="adm_banners")],
+            [
+                InlineKeyboardButton(text="💸 Виводи", callback_data="adm_wd"),
+                InlineKeyboardButton(text="💰 Топ балансів", callback_data="adm_topbal"),
+            ],
+            [InlineKeyboardButton(text="🎰 Обнулити рулетку", callback_data="adm_roul_reset")],
         ]
     )
 
@@ -1258,6 +1348,8 @@ def calc_topup_bonus(total_before: float, amount: float) -> float:
 def apply_topup_bonus(u: dict, amount: float) -> float:
     """Враховує реальне поповнення (Stars/крипта) і нараховує бонус. Повертає суму бонусу."""
     total_before = float(u.get("topup_total") or 0.0)
+    paid_pool(u)  # старим користувачам — з усіх попередніх поповнень
+    u["paid_pool"] = round(u["paid_pool"] + amount, 2)
     bonus = calc_topup_bonus(total_before, amount)
     u["topup_total"] = total_before + amount
     if bonus:
@@ -1415,453 +1507,6 @@ async def crypto_poll_loop():
                     info["user_id"],
                     f"✅ Оплату {info['amount']} USDT отримано! Баланс поповнено на {info['credit']:.2f} грн.",
                 )
-
-
-# ---------------------------------------------------------------------------
-# База даних (Postgres): збереження балансів, профілів, друзів тощо між перезапусками.
-# Весь важливий стан зберігається одним "знімком". Якщо DATABASE_URL не задано —
-# бот працює як раніше, лише в пам'яті.
-# ---------------------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-SAVE_INTERVAL = int(os.getenv("SAVE_INTERVAL", "60"))  # секунд між автозбереженнями
-
-_db_ready = False  # True лише після успішного завантаження — щоб не затерти базу порожнім станом
-_last_saved_blob: bytes | None = None
-_save_event = asyncio.Event()
-
-# "Естафета" між копіями бота під час деплою: працює і пише в базу лише власник.
-# Нова копія чекає, поки стара збереже дані й віддасть естафету, — тоді нічого не губиться.
-INSTANCE_ID = os.urandom(6).hex()
-LEASE_HEARTBEAT_SECONDS = 10  # як часто власник відмічається в базі
-LEASE_STALE_SECONDS = 45  # без відмітки стільки секунд — копія вважається мертвою
-LEASE_MAX_WAIT = int(os.getenv("LEASE_MAX_WAIT", "180"))  # макс. очікування старої копії, сек
-_lease_held = False
-_background_tasks: set = set()
-
-
-def request_save():
-    """Попросити зберегти стан якнайшвидше (напр. одразу після оплати)."""
-    _save_event.set()
-
-
-def _db_connect():
-    import ssl
-    from urllib.parse import parse_qs, unquote, urlparse
-
-    import pg8000.native
-
-    url = urlparse(DATABASE_URL)
-    sslmode = (parse_qs(url.query).get("sslmode") or ["require"])[0]
-    host = url.hostname or "localhost"
-    port = url.port or 5432
-    if sslmode == "disable":
-        ssl_context = None
-    elif sslmode in ("verify-ca", "verify-full"):
-        ssl_context = ssl.create_default_context()
-    else:
-        # як sslmode=require: з'єднання шифроване, сертифікат не перевіряється
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-
-    if sslmode not in ("verify-ca", "verify-full"):
-        # Перетворюємо назву сервера на IP-адресу (спершу IPv4): бібліотека на Render
-        # падала з "... does not appear to be an IPv4 or IPv6 address" на назві сервера.
-        import socket
-
-        try:
-            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-        except socket.gaierror:
-            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-        if not infos:
-            raise ConnectionError(f"Не вдалося знайти IP-адресу сервера бази {host}")
-        host = infos[0][4][0]
-
-    return pg8000.native.Connection(
-        user=unquote(url.username or ""),
-        password=unquote(url.password or ""),
-        host=host,
-        port=port,
-        database=(url.path or "/postgres").lstrip("/") or "postgres",
-        ssl_context=ssl_context,
-        timeout=30,
-    )
-
-
-def _db_init_tables():
-    con = _db_connect()
-    try:
-        con.run(
-            "CREATE TABLE IF NOT EXISTS bot_state ("
-            " id INTEGER PRIMARY KEY,"
-            " data BYTEA NOT NULL,"
-            " prev_data BYTEA,"
-            " updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-        )
-        con.run(
-            "CREATE TABLE IF NOT EXISTS bot_lease ("
-            " id INTEGER PRIMARY KEY,"
-            " owner TEXT,"
-            " heartbeat TIMESTAMPTZ NOT NULL DEFAULT now())"
-        )
-    finally:
-        con.close()
-
-
-def _db_try_acquire(force: bool = False) -> bool:
-    """Забрати естафету: якщо вона вільна, наша, прострочена — або примусово."""
-    con = _db_connect()
-    try:
-        rows = con.run(
-            "INSERT INTO bot_lease (id, owner, heartbeat) VALUES (1, :me, now()) "
-            "ON CONFLICT (id) DO UPDATE SET owner = EXCLUDED.owner, heartbeat = now() "
-            "WHERE bot_lease.owner IS NULL OR bot_lease.owner = EXCLUDED.owner "
-            f"OR bot_lease.heartbeat < now() - interval '{LEASE_STALE_SECONDS} seconds' OR :force "
-            "RETURNING owner",
-            me=INSTANCE_ID,
-            force=bool(force),
-        )
-        return bool(rows)
-    finally:
-        con.close()
-
-
-def _db_heartbeat() -> bool:
-    """Відмітка "я живий". False — естафету в нас забрали."""
-    con = _db_connect()
-    try:
-        rows = con.run(
-            "UPDATE bot_lease SET heartbeat = now() WHERE id = 1 AND owner = :me RETURNING id",
-            me=INSTANCE_ID,
-        )
-        return bool(rows)
-    finally:
-        con.close()
-
-
-def _db_release():
-    con = _db_connect()
-    try:
-        con.run("UPDATE bot_lease SET owner = NULL WHERE id = 1 AND owner = :me", me=INSTANCE_ID)
-    finally:
-        con.close()
-
-
-def _db_load_blob() -> bytes | None:
-    con = _db_connect()
-    try:
-        rows = con.run("SELECT data FROM bot_state WHERE id = 1")
-        return bytes(rows[0][0]) if rows else None
-    finally:
-        con.close()
-
-
-def _db_load_prev_blob() -> bytes | None:
-    con = _db_connect()
-    try:
-        rows = con.run("SELECT prev_data FROM bot_state WHERE id = 1")
-        return bytes(rows[0][0]) if rows and rows[0][0] is not None else None
-    finally:
-        con.close()
-
-
-def _db_save_blob(blob: bytes) -> bool:
-    """Записує дані, ЛИШЕ якщо естафета наша (одним запитом, з блокуванням). False — не наша."""
-    con = _db_connect()
-    try:
-        # попередню версію зберігаємо в prev_data — запасна копія
-        rows = con.run(
-            "WITH lease AS (SELECT 1 FROM bot_lease WHERE id = 1 AND owner = :me FOR UPDATE) "
-            "INSERT INTO bot_state (id, data) SELECT 1, :d FROM lease "
-            "ON CONFLICT (id) DO UPDATE SET prev_data = bot_state.data, data = EXCLUDED.data, updated_at = now() "
-            "RETURNING id",
-            d=blob,
-            me=INSTANCE_ID,
-        )
-        return bool(rows)
-    finally:
-        con.close()
-
-
-def _make_snapshot() -> bytes:
-    import pickle
-
-    return pickle.dumps(
-        {
-            "version": 1,
-            "users_db": users_db,
-            "user_counter": user_counter,
-            "banned_users": banned_users,
-            "reports": reports,
-            "report_counter": report_counter,
-            "pending_crypto_invoices": pending_crypto_invoices,
-            "manual_payments": manual_payments,
-            "mono_seen_ids": mono_seen_ids,
-            "gift_revenue_total": gift_revenue_total,
-            "lottery_revenue_total": lottery_revenue_total,
-            "ads": ads,
-            "ad_counter": ad_counter,
-            "stats_days": stats_days,
-            "banners": banners,
-            "ref_contest": ref_contest,
-            "top_week": top_week,
-            "meet_hour": meet_hour,
-            "launch_state": launch_state,
-            "confess_db": confess_db,
-            "letters_db": letters_db,
-        },
-        protocol=4,
-    )
-
-
-def _apply_snapshot(blob: bytes):
-    import copy
-    import pickle
-
-    global user_counter, report_counter, gift_revenue_total, lottery_revenue_total, ad_counter
-    data = pickle.loads(blob)
-
-    users_db.clear()
-    users_db.update(data.get("users_db", {}))
-    banned_users.clear()
-    banned_users.update(data.get("banned_users", set()))
-    reports.clear()
-    reports.extend(data.get("reports", []))
-    pending_crypto_invoices.clear()
-    pending_crypto_invoices.update(data.get("pending_crypto_invoices", {}))
-    manual_payments.clear()
-    manual_payments.update(data.get("manual_payments", {}))
-    mono_seen_ids.clear()
-    mono_seen_ids.extend(data.get("mono_seen_ids", []))
-    user_counter = data.get("user_counter", user_counter)
-    report_counter = data.get("report_counter", report_counter)
-    gift_revenue_total = data.get("gift_revenue_total", gift_revenue_total)
-    lottery_revenue_total = data.get("lottery_revenue_total", lottery_revenue_total)
-    ads.clear()
-    ads.extend(data.get("ads", []))
-    ad_counter = data.get("ad_counter", ad_counter)
-    stats_days.clear()
-    stats_days.update(data.get("stats_days", {}))
-    banners.clear()
-    banners.update(data.get("banners", {}))
-    ref_contest.clear()
-    ref_contest.update(data.get("ref_contest") or {"week": None, "counts": {}, "awarded": [], "history": []})
-    top_week.clear()
-    top_week.update(data.get("top_week") or {"week": None, "votes": {}, "pairs": set(), "published": [], "history": []})
-    meet_hour.clear()
-    meet_hour.update(data.get("meet_hour") or {"reminded": None, "summary": None, "chats_start": None, "peak": 0, "sent": 0})
-    launch_state.clear()
-    launch_state.update(data.get("launch_state") or {"done": False, "sent": 0})
-    confess_db.clear()
-    confess_db.update(data.get("confess_db") or {"next_id": 1, "pub_no": 0, "items": {}, "last_by": {}})
-    letters_db.clear()
-    letters_db.update(data.get("letters_db") or {"items": [], "delivered_day": None})
-
-    # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
-    saved_counter = user_counter
-    template = init_user(-1)
-    users_db.pop(-1, None)
-    user_counter = saved_counter
-    old_chatters = sorted(
-        (uid for uid, u in users_db.items() if "founder_no" not in u and u.get("total_chats") and uid != ADMIN_ID),
-        key=lambda uid: int(re.sub(r"\D", "", str(users_db[uid].get("custom_id", ""))) or 0),
-    )
-    for u in users_db.values():
-        if "ref_qualified" not in u:
-            # ті, хто вже спілкувався до запуску конкурсу, не зараховуються в нього заднім числом
-            u["ref_qualified"] = bool(u.get("total_chats"))
-        for key, value in template.items():
-            if key not in u:
-                u[key] = copy.deepcopy(value)
-        refresh_default_nick(u)  # «Користувач_N» → «Незнайомець_N» / «Незнайомка_N»
-    # 👑 ті, хто спілкувався ще до появи значка, стають першими засновниками (за порядком приходу)
-    next_no = max((u.get("founder_no") or 0 for u in users_db.values()), default=0) + 1
-    for uid in old_chatters:
-        if next_no > FOUNDERS_LIMIT:
-            break
-        if uid not in banned_users and not users_db[uid].get("founder_no"):
-            users_db[uid]["founder_no"] = next_no
-            next_no += 1
-
-
-async def load_state_from_db():
-    """Завантажує стан з бази при старті. Без успішного завантаження збереження вимкнене."""
-    global _db_ready, _last_saved_blob, _lease_held
-    if not DATABASE_URL:
-        logging.warning("DATABASE_URL не задано — дані зберігаються лише в пам'яті і зникнуть після перезапуску.")
-        return
-
-    last_error = None
-    for attempt in range(1, 6):
-        try:
-            await asyncio.to_thread(_db_init_tables)
-            break
-        except Exception as e:  # noqa: BLE001
-            last_error = e
-            logging.warning("База даних недоступна (спроба %s/5): %s", attempt, e)
-            await asyncio.sleep(3 * attempt)
-    else:
-        # Краще не запускатись, ніж запуститись з порожніми даними і затерти ними базу.
-        raise SystemExit(f"❌ Не вдалося підключитися до бази даних: {last_error}")
-
-    # Чекаємо, поки попередня копія бота (під час деплою) збереже дані й віддасть естафету.
-    waited = 0.0
-    announced = False
-    while True:
-        force = waited >= LEASE_MAX_WAIT
-        if force:
-            logging.warning("Стара копія бота не віддає естафету %s с — перебираю її примусово.", LEASE_MAX_WAIT)
-        try:
-            if await asyncio.to_thread(_db_try_acquire, force):
-                break
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Помилка при отриманні естафети: %s", e)
-        if not announced:
-            logging.info("Чекаю, поки попередня копія бота збереже дані і вимкнеться...")
-            announced = True
-        await asyncio.sleep(3)
-        waited += 3
-    _lease_held = True
-    logging.info("Естафету отримано (копія %s).", INSTANCE_ID)
-
-    last_error = None
-    for attempt in range(1, 6):
-        try:
-            blob = await asyncio.to_thread(_db_load_blob)
-            break
-        except Exception as e:  # noqa: BLE001
-            last_error = e
-            logging.warning("Не вдалося прочитати дані (спроба %s/5): %s", attempt, e)
-            await asyncio.sleep(3 * attempt)
-    else:
-        raise SystemExit(f"❌ Не вдалося прочитати дані з бази: {last_error}")
-
-    if blob is None:
-        logging.info("База даних порожня — починаємо з нуля.")
-    else:
-        try:
-            _apply_snapshot(blob)
-        except Exception as e:  # noqa: BLE001
-            logging.error("Основна копія даних пошкоджена (%s) — пробую запасну.", e)
-            prev = await asyncio.to_thread(_db_load_prev_blob)
-            if prev is None:
-                raise SystemExit("❌ Дані в базі пошкоджені, а запасної копії немає.")
-            _apply_snapshot(prev)
-        logging.info("Дані завантажено з бази: %s користувачів.", len(users_db))
-        _last_saved_blob = blob
-
-    _db_ready = True
-
-
-async def save_state_to_db():
-    global _last_saved_blob
-    if not _db_ready:
-        return
-    try:
-        blob = _make_snapshot()  # знімок робимо в основному потоці — дані не змінюються посередині
-        if blob == _last_saved_blob:
-            return  # нічого не змінилось
-        if await asyncio.to_thread(_db_save_blob, blob):
-            _last_saved_blob = blob
-        else:
-            _on_lease_lost()
-    except Exception as e:  # noqa: BLE001
-        logging.error("Не вдалося зберегти дані в базу: %s", e)
-
-
-def _on_lease_lost():
-    """Естафету забрала інша (новіша) копія бота — ця копія більше не пише в базу і зупиняється."""
-    global _db_ready, _lease_held
-    if not _lease_held and not _db_ready:
-        return
-    _db_ready = False
-    _lease_held = False
-    logging.error("Естафету забрала інша копія бота — ця копія зупиняється, щоб не зіпсувати дані.")
-    try:
-        # тримаємо посилання на задачу, щоб її не прибрав збирач сміття до виконання
-        _background_tasks.add(asyncio.get_running_loop().create_task(dp.stop_polling()))
-    except Exception as e:  # noqa: BLE001
-        logging.warning("Не вдалося зупинити polling: %s", e)
-
-
-async def lease_heartbeat_loop():
-    while True:
-        await asyncio.sleep(LEASE_HEARTBEAT_SECONDS)
-        if not _lease_held:
-            continue
-        try:
-            still_mine = await asyncio.to_thread(_db_heartbeat)
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Не вдалося відмітитись у базі: %s", e)
-            continue
-        if not still_mine:
-            _on_lease_lost()
-
-
-async def release_lease():
-    """При зупинці (вже після фінального збереження) віддаємо естафету новій копії."""
-    global _lease_held
-    if not _lease_held:
-        return
-    try:
-        await asyncio.to_thread(_db_release)
-        logging.info("Естафету віддано.")
-    except Exception as e:  # noqa: BLE001
-        logging.warning("Не вдалося віддати естафету (нова копія перебере її за %s с): %s", LEASE_STALE_SECONDS, e)
-    _lease_held = False
-
-
-async def persistence_loop():
-    while True:
-        try:
-            await asyncio.wait_for(_save_event.wait(), timeout=SAVE_INTERVAL)
-        except asyncio.TimeoutError:
-            pass
-        _save_event.clear()
-        await save_state_to_db()
-
-
-# ---------------------------------------------------------------------------
-# Мітки джерел: t.me/<бот>?start=tt — щоб бачити, звідки приходять люди
-# ---------------------------------------------------------------------------
-SOURCE_LABELS = {
-    "tt": "🎵 TikTok",
-    "yt": "▶️ YouTube",
-    "ig": "📸 Instagram",
-    "tgads": "📣 Telegram Ads",
-    "ref": "🤝 Запрошення друзів",
-    "direct": "🔎 Напряму / пошук",
-}
-
-
-def source_from_start(arg: str) -> str:
-    arg = (arg or "").strip()
-    if not arg:
-        return "direct"
-    if arg.startswith("ref_"):
-        return "ref"
-    code = re.sub(r"[^a-z0-9_]", "", arg.lower())[:32]
-    return code or "direct"
-
-
-def source_label(code: str | None) -> str:
-    if not code:
-        return "❔ невідомо (до міток)"
-    return SOURCE_LABELS.get(code, f"💬 {code}")
-
-
-def source_breakdown(ids: list[int]) -> list[tuple[str, int, int]]:
-    """[(джерело, скільки прийшло, скільки з них уже спілкувались)] — найбільші зверху."""
-    agg: dict[str, list[int]] = {}
-    for uid in ids:
-        u = users_db.get(uid)
-        if not u:
-            continue
-        row = agg.setdefault(u.get("source") or "", [0, 0])
-        row[0] += 1
-        if u.get("total_chats", 0) > 0:
-            row[1] += 1
-    return sorted(((k, v[0], v[1]) for k, v in agg.items()), key=lambda x: -x[1])
 
 
 
