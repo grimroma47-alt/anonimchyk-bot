@@ -1,586 +1,4 @@
 # ---------------------------------------------------------------------------
-# 📍 Де я зараз: статус чату/пошуку/кімнати і швидке повернення
-# ---------------------------------------------------------------------------
-def chat_mode_label(mode: str) -> str:
-    if mode == "flirt":
-        return "❤️ Флірт-чат"
-    if mode == "voice":
-        return "🎙 Голосовий чат"
-    if mode.startswith("int:"):
-        return f"🧩 Чат за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}"
-    return "🔍 Анонімний чат"
-
-
-def where_text(user_id: int) -> str:
-    now = time.time()
-    if user_id in active_chats:
-        meta = chat_meta.get(user_id) or {}
-        p = users_db.get(active_chats[user_id]) or {}
-        mins = int((now - meta.get("start", now)) // 60)
-        return (
-            f"💬 <b>Ти зараз у чаті</b>: {chat_mode_label(meta.get('mode', 'normal'))}\n"
-            f"👤 Співрозмовник: {short_info(p)}\n"
-            f"⏱ {mins} хв · твоїх повідомлень: {meta.get('msgs', 0)}\n\n"
-            "Просто пиши — повідомлення йдуть співрозмовнику. Завершити: «❌ Завершити чат»."
-        )
-    if user_id in queue:
-        mode = search_mode.get(user_id, "normal")
-        mins = int((now - queue_since.get(user_id, now)) // 60)
-        return f"⏳ <b>Йде пошук</b>: {chat_mode_label(mode)} · {mins} хв\nЩойно когось знайду — одразу з'єдную."
-    if user_id in user_room:
-        room = rooms.get(user_room[user_id]) or {}
-        title = ROOM_TOPICS.get(room.get("topic"), "кімната")
-        return f"👥 <b>Ти в кімнаті</b>: {title} · учасників: {len(room.get('members') or ())}"
-    return "🙂 Ти зараз не в чаті й не в пошуку. Натисни «🔍 Шукати співрозмовника» 👇"
-
-
-@dp.message(F.text == BTN_BACK_CHAT)
-@dp.message(F.text == BTN_BACK_ROOM)
-@dp.message(Command("where", "chat"))
-async def where_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    uid = message.from_user.id
-    if uid in active_chats:
-        kb = get_chat_keyboard()
-    elif uid in user_room:
-        kb = get_room_keyboard()
-    else:
-        kb = get_main_keyboard()
-    await message.answer(where_text(uid), reply_markup=kb)
-
-# ---------------------------------------------------------------------------
-# ✨ Розваги: гороскоп, карта дня, сумісність знаків, що нового, канал зізнань
-# ---------------------------------------------------------------------------
-import hashlib
-
-ZODIAC = {k: (uk, el) for k, uk, el in [('aries', '♈ Овен', 'fire'), ('taurus', '♉ Телець', 'earth'), ('gemini', '♊ Близнюки', 'air'), ('cancer', '♋ Рак', 'water'), ('leo', '♌ Лев', 'fire'), ('virgo', '♍ Діва', 'earth'), ('libra', '♎ Терези', 'air'), ('scorpio', '♏ Скорпіон', 'water'), ('sagittarius', '♐ Стрілець', 'fire'), ('capricorn', '♑ Козоріг', 'earth'), ('aquarius', '♒ Водолій', 'air'), ('pisces', '♓ Риби', 'water')]}
-H_DAY = [
-    'Сьогодні вдалий день, щоб почати те, що давно відкладав(-ла).',
-    'Енергії багато — направ її на одну справу, а не на десять.',
-    'День спокійний: ідеальний час навести лад у думках.',
-    'Хтось чекає від тебе першого кроку. Можливо, варто його зробити.',
-    'Невелика несподіванка підніме настрій ближче до вечора.',
-    'Не поспішай із висновками — до вечора все проясниться.',
-    'Сьогодні твоя сила — у словах. Говори щиро.',
-    'Гарний день для нових знайомств і цікавих розмов.',
-    'Дай собі відпочити — продуктивність повернеться завтра.',
-    'Маленька перемога сьогодні важливіша, ніж здається.',
-]
-H_LOVE = [
-    'У коханні: щирий комплімент зробить більше, ніж ти думаєш.',
-    'У коханні: хтось думає про тебе частіше, ніж показує.',
-    'У коханні: відкрийся трохи більше — і отримаєш у відповідь тепло.',
-    'У коханні: не шукай ідеального — шукай свого.',
-    'У коханні: ввечері можлива розмова, яка багато змінить.',
-    'У коханні: зірки радять бути сміливішим(-ою).',
-    'У коханні: тиша теж буває відповіддю — дай людині час.',
-    'У коханні: несподіване знайомство може стати чимось більшим.',
-]
-H_TIP = [
-    'Порада дня: випий води й посміхнись незнайомцю 🙂',
-    'Порада дня: напиши тому, за ким сумуєш.',
-    'Порада дня: зроби одну справу до кінця.',
-    'Порада дня: прогулянка вирішить більше, ніж ти думаєш.',
-    'Порада дня: скажи «ні» тому, що забирає твою енергію.',
-    'Порада дня: увімкни улюблену пісню на повну.',
-    'Порада дня: похвали себе — ти багато робиш.',
-]
-H_COLORS = ['фіолетовий', 'золотий', 'бірюзовий', 'рожевий', 'смарагдовий', 'сріблястий', 'синій', 'бордовий']
-TAROT = [
-    ('🃏 Блазень', 'Новий початок і легкість. Не бійся зробити крок у невідоме.'),
-    ('🪄 Маг', 'Усе потрібне вже в тебе є. Дій — і вийде.'),
-    ('🌙 Верховна Жриця', 'Довірся інтуїції — вона сьогодні не підведе.'),
-    ('🌸 Імператриця', 'День турботи, краси й тепла. Подаруй його собі й іншим.'),
-    ('👑 Імператор', 'Час взяти ситуацію під контроль і поставити межі.'),
-    ('📜 Ієрофант', 'Мудра порада прийде від того, кого ти поважаєш.'),
-    ('💞 Закохані', 'Важливий вибір серцем. Слухай, що відчуваєш.'),
-    ('🏇 Колісниця', 'Рух уперед і перемога, якщо тримаєш курс.'),
-    ('🦁 Сила', "Твоя м'якість — це теж сила. Спокій переможе."),
-    ('🏮 Відлюдник', 'Побудь трохи наодинці — відповідь прийде зсередини.'),
-    ('🎡 Колесо Фортуни', 'Удача повертається до тебе обличчям. Лови момент.'),
-    ('⚖️ Справедливість', 'Чесність повернеться до тебе сторицею.'),
-    ('🙃 Повішений', 'Подивись на ситуацію під іншим кутом — і все зміниться.'),
-    ('🦋 Зміни', 'Щось старе завершується, щоб звільнити місце новому.'),
-    ('🍯 Помірність', 'Баланс і терпіння — сьогодні твої найкращі друзі.'),
-    ('😈 Спокуса', 'Помітиш спокусу — запитай себе, чи справді воно тобі треба.'),
-    ('⚡ Вежа', 'Несподіванка струсне рутину — і це на краще.'),
-    ('⭐ Зірка', 'Надія й натхнення. Мрій сміливо — сьогодні можна.'),
-    ('🌕 Місяць', 'Не все таке, яким здається. Не поспішай з висновками.'),
-    ('☀️ Сонце', 'Радість, тепло й успіх. Найкраща карта дня ✨'),
-    ('📯 Суд', 'Час підбити підсумки й пробачити — собі теж.'),
-    ('🌍 Світ', 'Завершення й гармонія. Ти саме там, де маєш бути.'),
-]
-COMPAT_TEXT = {k: v[0] for k, v in {'same': ('Ви говорите однією мовою стихії — легко, тепло й зрозуміло 💜', 'Вы говорите на одном языке стихии — легко, тепло и понятно 💜'), 'good': ('Ви чудово доповнюєте одне одного: де одному бракує — інший має з надлишком ✨', 'Вы отлично дополняете друг друга: где одному не хватает — у другого с избытком ✨'), 'mid': ('Цікава пара: будуть і іскри, і суперечки — нудно точно не буде 😉', 'Интересная пара: будут и искры, и споры — скучно точно не будет 😉'), 'hard': ('Різні стихії — складніше, але якщо вдасться, це буде дуже сильна пара 🔥', 'Разные стихии — сложнее, но если получится, это будет очень сильная пара 🔥')}.items()}
-HOROSCOPE_CHANNEL = os.getenv("HOROSCOPE_CHANNEL", "")  # напр. @ANONimchyk_goroskop — з'явиться кнопка
-NEWS_CHANNEL = os.getenv("NEWS_CHANNEL", "")  # напр. @ANONimchyk_news
-
-
-def _seed(*parts) -> int:
-    return int(hashlib.md5(":".join(map(str, parts)).encode()).hexdigest(), 16)
-
-
-def fun_menu_kb():
-    rows = [
-        [InlineKeyboardButton(text="🔮 Гороскоп на сьогодні", callback_data="fun_horo")],
-        [InlineKeyboardButton(text="🃏 Карта дня", callback_data="fun_tarot"),
-         InlineKeyboardButton(text="💞 Сумісність знаків", callback_data="fun_compat")],
-        [InlineKeyboardButton(text="📰 Що нового", callback_data="fun_news"),
-         InlineKeyboardButton(text="🤫 Канал зізнань", url=confess_channel_link())],
-    ]
-    if HOROSCOPE_CHANNEL:
-        rows.append([InlineKeyboardButton(text="🌙 Канал «ANONimchyk Гороскоп»", url=f"https://t.me/{HOROSCOPE_CHANNEL.lstrip('@')}")])
-    if NEWS_CHANNEL:
-        rows.append([InlineKeyboardButton(text="📣 Канал «ANONimchyk News»", url=f"https://t.me/{NEWS_CHANNEL.lstrip('@')}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-FUN_MENU_TEXT = "✨ <b>Розваги</b>\nЧим зайнятись, поки шукаєш співрозмовника 👇\n<i>Гороскоп і карти — для настрою й розваги 😉</i>"
-
-
-@dp.message(F.text == BTN_FUN)
-@dp.message(Command("fun"))
-async def fun_menu(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
-
-
-@dp.callback_query(F.data == "fun_menu")
-async def fun_menu_cb(call: types.CallbackQuery):
-    await call.message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
-    await call.answer()
-
-
-def zodiac_kb(prefix: str):
-    keys = list(ZODIAC)
-    rows = [[InlineKeyboardButton(text=ZODIAC[k][0], callback_data=f"{prefix}{k}") for k in keys[i:i + 3]]
-            for i in range(0, 12, 3)]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def horoscope_text(sign: str, day) -> str:
-    s = _seed("horo", sign, day.isoformat())
-    return (
-        f"🔮 <b>{ZODIAC[sign][0]} · {day.strftime('%d.%m')}</b>\n\n"
-        f"{H_DAY[s % len(H_DAY)]}\n\n"
-        f"💜 {H_LOVE[(s // 7) % len(H_LOVE)]}\n\n"
-        f"✨ {H_TIP[(s // 49) % len(H_TIP)]}\n\n"
-        f"🍀 Щасливе число: <b>{(s // 343) % 33 + 1}</b> · колір: <b>{H_COLORS[(s // 11) % len(H_COLORS)]}</b>"
-    )
-
-
-def horo_after_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔁 Змінити знак", callback_data="fun_horo_pick"),
-         InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")],
-    ])
-
-
-@dp.callback_query(F.data == "fun_horo")
-async def fun_horo(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    sign = u.get("zodiac")
-    await call.answer()
-    if sign in ZODIAC:
-        await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
-        stat_add("horoscope")
-        return
-    await call.message.answer("🔮 Обери свій знак — я запам'ятаю, і далі гороскоп буде в один дотик:", reply_markup=zodiac_kb("fun_z:"))
-
-
-@dp.callback_query(F.data == "fun_horo_pick")
-async def fun_horo_pick(call: types.CallbackQuery):
-    await call.answer()
-    await call.message.answer("🔮 Обери свій знак:", reply_markup=zodiac_kb("fun_z:"))
-
-
-@dp.callback_query(F.data.startswith("fun_z:"))
-async def fun_zodiac_set(call: types.CallbackQuery):
-    sign = call.data.split(":", 1)[1]
-    if sign not in ZODIAC:
-        await call.answer()
-        return
-    u = init_user(call.from_user.id)
-    u["zodiac"] = sign
-    request_save()
-    await call.answer(f"Запам'ятав: {ZODIAC[sign][0]}")
-    await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
-    stat_add("horoscope")
-
-
-@dp.callback_query(F.data == "fun_tarot")
-async def fun_tarot(call: types.CallbackQuery):
-    i = _seed("tarot", call.from_user.id, kyiv_today().isoformat()) % len(TAROT)
-    name, meaning = TAROT[i]
-    await call.answer()
-    await call.message.answer(
-        f"🃏 <b>Твоя карта дня</b>\n\n<b>{name}</b>\n{meaning}\n\n<i>Завтра — нова карта 🌙</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")]]),
-    )
-    stat_add("tarot")
-
-
-def compat_kind(a: str, b: str) -> str:
-    ea, eb = ZODIAC[a][1], ZODIAC[b][1]
-    if ea == eb:
-        return "same"
-    pair = {ea, eb}
-    if pair in ({"fire", "air"}, {"earth", "water"}):
-        return "good"
-    if pair in ({"fire", "water"}, {"earth", "air"}):
-        return "hard"
-    return "mid"
-
-
-def compat_percent(a: str, b: str) -> int:
-    base = {"same": 88, "good": 80, "mid": 64, "hard": 50}[compat_kind(a, b)]
-    return min(99, base + _seed("zc", *sorted((a, b))) % 10)
-
-
-@dp.callback_query(F.data == "fun_compat")
-async def fun_compat(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    await call.answer()
-    if u.get("zodiac") in ZODIAC:
-        await call.message.answer(f"💞 Твій знак: {ZODIAC[u['zodiac']][0]}. А який знак у нього / неї?", reply_markup=zodiac_kb("fun_c2:"))
-    else:
-        await call.message.answer("💞 Спершу обери свій знак:", reply_markup=zodiac_kb("fun_c1:"))
-
-
-@dp.callback_query(F.data.startswith("fun_c1:"))
-async def fun_compat_mine(call: types.CallbackQuery):
-    sign = call.data.split(":", 1)[1]
-    if sign not in ZODIAC:
-        await call.answer()
-        return
-    u = init_user(call.from_user.id)
-    u["zodiac"] = sign
-    request_save()
-    await call.answer()
-    await call.message.answer(f"💞 Твій знак: {ZODIAC[sign][0]}. А який знак у нього / неї?", reply_markup=zodiac_kb("fun_c2:"))
-
-
-@dp.callback_query(F.data.startswith("fun_c2:"))
-async def fun_compat_result(call: types.CallbackQuery):
-    other = call.data.split(":", 1)[1]
-    u = init_user(call.from_user.id)
-    mine = u.get("zodiac")
-    if other not in ZODIAC or mine not in ZODIAC:
-        await call.answer()
-        return
-    p = compat_percent(mine, other)
-    bar = "💜" * round(p / 20) + "🤍" * (5 - round(p / 20))
-    await call.answer()
-    await call.message.answer(
-        f"💞 <b>{ZODIAC[mine][0]} + {ZODIAC[other][0]}</b>\n\n<b>{p}%</b>  {bar}\n{COMPAT_TEXT[compat_kind(mine, other)]}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔁 Інший знак", callback_data="fun_compat"),
-             InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")],
-        ]),
-    )
-    stat_add("zodiac_compat")
-
-
-NEWS_TEXT = (
-    "📰 <b>Що нового в ANONimchyk</b>\n\n"
-    "🎭 <b>Зняти маску</b> — за взаємною згодою покажіть одне одному нік, вік і фото\n"
-    "🎙 <b>Маска голосу</b> — 12 голосів у голосових: робот, привид, демон… (/voice)\n"
-    "🎙 <b>Голосовий чат</b> — спілкування лише голосом, і голос завжди змінений\n"
-    "🎲 <b>Ігри в чаті</b> — «Правда чи дія», «Що обереш?», «2 правди і 1 брехня»\n"
-    "💌 <b>Нічний лист</b> — напиши незнайомцю, а вранці отримай чийсь\n"
-    "🤫 <b>Анонімні зізнання</b> — і канал, де їх публікують\n"
-    "💯 <b>Сумісність</b> після кожної розмови\n"
-    "✨ <b>Розваги</b> — гороскоп, карта дня, сумісність знаків\n"
-    "👑 <b>Пак засновника</b> — стікери для перших учасників"
-)
-
-
-@dp.callback_query(F.data == "fun_news")
-async def fun_news(call: types.CallbackQuery):
-    await call.answer()
-    await call.message.answer(NEWS_TEXT, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")]]))
-
-
-# ---------------------------------------------------------------------------
-# 🎙 Голосовий чат: окремий пошук, де спілкуються лише голосовими з маскою
-# ---------------------------------------------------------------------------
-def voice_chat_note(u: dict) -> str:
-    return (
-        "🎙 <b>Голосовий чат</b>\n"
-        "Тут спілкуються лише голосовими — затисни 🎤 і говори.\n"
-        f"Твій голос змінює маска: <b>{voice_mask_label(u, for_voice_chat=True)}</b> — співрозмовник не почує справжнього. "
-        "Змінити: /voice"
-    )
-
-
-@dp.message(F.text == BTN_VOICE_SEARCH)
-@dp.message(Command("voicechat"))
-async def voice_search_start(message: types.Message, state: FSMContext):
-    await run_search(message, state, "voice")
-
-
-# ---------------------------------------------------------------------------
-# 🎲 Ігри в чаті: Правда чи дія · Що обереш? · 2 правди і 1 брехня
-# ---------------------------------------------------------------------------
-TRUTHS = [
-    "Яка пісня зараз найчастіше грає в тебе в навушниках?",
-    "Що тебе найбільше смішить у собі?",
-    "Яку дурну звичку ти ніяк не можеш кинути?",
-    "Про що ти мрієш, але ще нікому не казав(-ла)?",
-    "Який найсміливіший вчинок ти колись робив(-ла)?",
-    "Що б ти змінив(-ла) у своєму дні, якби міг(-ла)?",
-    "Чого ти боїшся, хоча розумієш, що це смішно?",
-    "Яке твоє найдивніше хобі або захоплення?",
-    "Яку книгу, фільм чи серіал ти можеш переглядати безкінечно?",
-    "Коли ти востаннє плакав(-ла) від сміху і чому?",
-    "Яку суперсилу ти б обрав(-ла)?",
-    "Що тебе може миттєво підняти настрій?",
-    "Що ти вмієш, чого не вміють інші?",
-    "Яка найкраща порада, яку тобі давали?",
-    "Яке місце в Україні ти хочеш побачити найбільше?",
-    "Що б ти зробив(-ла), якби виграв(-ла) мільйон?",
-    "Яка твоя перша думка зранку?",
-    "За чим ти найбільше сумуєш із дитинства?",
-    "Що в людях тебе чіпляє найбільше?",
-    "Про що ти міг(-ла) би говорити годинами?",
-]
-DARES = [
-    "Опиши свій настрій трьома емоджі 🙂",
-    "Напиши вірш із двох рядків про цей чат.",
-    "Надішли голосове з маскою голосу 🎙 і скажи «привіт» найсмішнішим тоном.",
-    "Надішли стікер, який найкраще тебе описує.",
-    "Розкажи анекдот — навіть якщо він поганий 😄",
-    "Придумай співрозмовнику смішне прізвисько.",
-    "Опиши свій ідеальний вечір одним реченням.",
-    "Напиши комплімент співрозмовнику — щиро 💜",
-    "Напиши назву фільму емоджі — хай співрозмовник вгадає.",
-    "Склади речення, де всі слова починаються на одну літеру.",
-    "Розкажи, що зараз бачиш за вікном, як диктор новин.",
-    "Признайся, що ти їв(-ла) сьогодні — і оціни це від 1 до 10.",
-    "Напиши, яку пісню ти б заспівав(-ла) в караоке прямо зараз.",
-    "Наступні 3 повідомлення пиши лише з великої літери КОЖНЕ СЛОВО.",
-    "Вигадай назву для вашої анонімної розмови, як для серіалу 🎬",
-]
-WOULD_RATHER = [
-    ("🌊 Море", "⛰ Гори"),
-    ("🌅 Світанок", "🌙 Ніч"),
-    ("☕ Кава", "🍵 Чай"),
-    ("🐶 Собака", "🐱 Кіт"),
-    ("📚 Книга", "🎬 Фільм"),
-    ("🍕 Піца", "🍣 Суші"),
-    ("❄️ Зима", "☀️ Літо"),
-    ("🏙 Місто", "🌾 Село"),
-    ("🎧 Навушники", "🔊 Колонка"),
-    ("✈️ Подорож", "🏠 Затишок вдома"),
-    ("🎤 Співати", "💃 Танцювати"),
-    ("🧭 Минуле", "🚀 Майбутнє"),
-    ("📞 Подзвонити", "💬 Написати"),
-    ("🎢 Атракціони", "🧩 Настолки"),
-    ("🍫 Солодке", "🧂 Солоне"),
-]
-
-
-def game_menu_kb():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔥 Правда чи дія", callback_data="gm_td")],
-            [InlineKeyboardButton(text="🤔 Що обереш?", callback_data="gm_wyr")],
-            [InlineKeyboardButton(text="🕵️ 2 правди і 1 брехня", callback_data="gm_2t1l")],
-        ]
-    )
-
-
-def _game_pair(user_id: int) -> tuple[int, frozenset] | None:
-    partner = active_chats.get(user_id)
-    if partner is None:
-        return None
-    return partner, frozenset((user_id, partner))
-
-
-@dp.message(F.text == BTN_GAME)
-@dp.message(Command("game"))
-async def game_open(message: types.Message, state: FSMContext):
-    await state.clear()
-    if _game_pair(message.from_user.id) is None:
-        await message.answer("🎲 Ігри доступні під час анонімного чату — знайди співрозмовника 🙂", reply_markup=get_main_keyboard())
-        return
-    await message.answer("🎲 <b>Зіграємо?</b> Обери гру — вона з'явиться в обох:", reply_markup=game_menu_kb())
-
-
-async def _both(user_id: int, partner: int, text: str, kb=None):
-    await safe_send(user_id, text, reply_markup=kb)
-    await safe_send(partner, text, reply_markup=kb)
-
-
-def td_kb():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="😇 Правда", callback_data="td_t"),
-            InlineKeyboardButton(text="😈 Дія", callback_data="td_d"),
-        ]]
-    )
-
-
-@dp.callback_query(F.data == "gm_td")
-async def game_td(call: types.CallbackQuery):
-    pair = _game_pair(call.from_user.id)
-    if pair is None:
-        await call.answer("Чат уже завершено.", show_alert=True)
-        return
-    partner, _ = pair
-    await call.answer()
-    await _both(call.from_user.id, partner,
-                "🔥 <b>Правда чи дія</b>\nХто першим натисне — той і відповідає. Потім по черзі 😉", td_kb())
-    stat_add("games")
-
-
-@dp.callback_query(F.data.in_({"td_t", "td_d"}))
-async def game_td_pick(call: types.CallbackQuery):
-    pair = _game_pair(call.from_user.id)
-    if pair is None:
-        await call.answer("Чат уже завершено.", show_alert=True)
-        return
-    partner, key = pair
-    st = game_state.setdefault(key, {})
-    used = st.setdefault("td_used", set())
-    truth = call.data == "td_t"
-    pool = TRUTHS if truth else DARES
-    choices = [i for i in range(len(pool)) if (truth, i) not in used] or list(range(len(pool)))
-    i = random.choice(choices)
-    used.add((truth, i))
-    await call.answer()
-    head = "😇 <b>Правда</b>" if truth else "😈 <b>Дія</b>"
-    await safe_send(call.from_user.id, f"{head} — твоє завдання:\n\n{pool[i]}", reply_markup=td_kb())
-    await safe_send(partner, f"{head} — завдання для співрозмовника:\n\n{pool[i]}\n\n<i>Тепер твоя черга 👇</i>", reply_markup=td_kb())
-
-
-def wyr_kb(i: int):
-    a, b = WOULD_RATHER[i]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text=a, callback_data=f"wyr:{i}:0"),
-            InlineKeyboardButton(text=b, callback_data=f"wyr:{i}:1"),
-        ]]
-    )
-
-
-async def _wyr_new(user_id: int, partner: int, key: frozenset):
-    st = game_state.setdefault(key, {})
-    used = st.setdefault("wyr_used", set())
-    choices = [i for i in range(len(WOULD_RATHER)) if i not in used] or list(range(len(WOULD_RATHER)))
-    i = random.choice(choices)
-    used.add(i)
-    st["wyr"] = {"i": i, "votes": {}}
-    await _both(user_id, partner, "🤔 <b>Що обереш?</b>\nОбирайте — відповіді відкриються, коли проголосуєте обоє 🤫", wyr_kb(i))
-
-
-@dp.callback_query(F.data == "gm_wyr")
-async def game_wyr(call: types.CallbackQuery):
-    pair = _game_pair(call.from_user.id)
-    if pair is None:
-        await call.answer("Чат уже завершено.", show_alert=True)
-        return
-    await call.answer()
-    await _wyr_new(call.from_user.id, pair[0], pair[1])
-    stat_add("games")
-
-
-@dp.callback_query(F.data.startswith("wyr:"))
-async def game_wyr_vote(call: types.CallbackQuery):
-    pair = _game_pair(call.from_user.id)
-    if pair is None:
-        await call.answer("Чат уже завершено.", show_alert=True)
-        return
-    partner, key = pair
-    try:
-        _, si, sc = call.data.split(":")
-        i, c = int(si), int(sc)
-    except ValueError:
-        await call.answer()
-        return
-    cur = (game_state.get(key) or {}).get("wyr")
-    if not cur or cur["i"] != i:
-        await call.answer("Це питання вже закрите 🙂")
-        return
-    if call.from_user.id in cur["votes"]:
-        await call.answer("Ти вже обрав(-ла) — чекаємо співрозмовника ⏳")
-        return
-    cur["votes"][call.from_user.id] = c
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    if len(cur["votes"]) < 2:
-        await call.answer(f"Ти обрав(-ла): {WOULD_RATHER[i][c]} — чекаємо співрозмовника ⏳")
-        return
-    await call.answer()
-    mine, theirs = cur["votes"][call.from_user.id], cur["votes"].get(partner, -1)
-    same = mine == theirs
-    verdict = "💜 <b>Ви обрали однаково!</b>" if same else "🙃 <b>Ви обрали різне</b> — є про що посперечатися 😄"
-    more = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➡️ Ще питання", callback_data="gm_wyr")]])
-    for me, other in ((call.from_user.id, partner), (partner, call.from_user.id)):
-        await safe_send(
-            me,
-            f"{verdict}\nТи: {WOULD_RATHER[i][cur['votes'].get(me, 0)]} · Співрозмовник: {WOULD_RATHER[i][cur['votes'].get(other, 0)]}",
-            reply_markup=more,
-        )
-
-
-@dp.callback_query(F.data == "gm_2t1l")
-async def game_2t1l(call: types.CallbackQuery):
-    pair = _game_pair(call.from_user.id)
-    if pair is None:
-        await call.answer("Чат уже завершено.", show_alert=True)
-        return
-    await call.answer()
-    await safe_send(
-        call.from_user.id,
-        "🕵️ <b>2 правди і 1 брехня</b>\nТи починаєш: напиши 3 факти про себе — два правдиві, один вигаданий. "
-        "Співрозмовник має вгадати брехню. Потім мінятесь 😉\n<i>Без імен, адрес і контактів 🙂</i>",
-    )
-    await safe_send(
-        pair[0],
-        "🕵️ <b>2 правди і 1 брехня</b>\nСпіврозмовник зараз напише 3 факти про себе — один із них брехня. "
-        "Вгадай, який! Потім твоя черга 😉",
-    )
-    stat_add("games")
-
-
-# ---------------------------------------------------------------------------
-# 💯 Сумісність після чату
-# ---------------------------------------------------------------------------
-def compat_text(u: dict, p: dict, duration: float, min_msgs: int) -> str:
-    score = 35
-    reasons = []
-    common = sorted((u.get("interests") or set()) & (p.get("interests") or set()))
-    if common:
-        score += min(30, 15 * len(common))
-        labels = ", ".join(INTEREST_LABELS.get(k, k) for k in common[:3])
-        reasons.append(f"🧩 спільне: {labels}")
-    mu, mp = current_mood(u), current_mood(p)
-    if mu and mu == mp:
-        score += 12
-        reasons.append(f"🎭 однаковий настрій: {MOODS[mu]}")
-    a, b = get_age_int(u), get_age_int(p)
-    if a is not None and b is not None and abs(a - b) <= 3:
-        score += 8
-        reasons.append("🎂 майже однолітки")
-    if duration >= 600 or min_msgs >= 15:
-        score += 14
-        reasons.append("💬 довга розмова — вам було цікаво")
-    elif duration >= 180 or min_msgs >= 6:
-        score += 7
-        reasons.append("💬 жива розмова")
-    score += random.randint(0, 4)
-    score = max(40, min(99, score))
-    bar = "💜" * round(score / 20) + "🤍" * (5 - round(score / 20))
-    lines = [f"💯 <b>Ваша сумісність: {score}%</b>  {bar}"]
-    lines += [f"• {r}" for r in reasons]
-    if score >= 80:
-        lines.append("\nСхоже, ви на одній хвилі ✨ Додай у друзі, щоб не загубитись 🤝")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
 # 💌 Нічний лист: пишеш анонімного листа — вранці він прилітає іншому автору листа
 # ---------------------------------------------------------------------------
 LETTER_MIN, LETTER_MAX = 20, 1000
@@ -613,6 +31,7 @@ async def letter_start(message: types.Message, state: FSMContext):
         await message.answer("💌 Сьогодні ти вже написав(-ла) лист. Завтра вранці він знайде свого читача ✨")
         return
     await state.set_state(LetterStates.text)
+    await send_banner(user_id, "letter")
     await message.answer(
         "💌 <b>Нічний лист</b>\n\n"
         "Напиши лист незнайомцю — про що завгодно: що на душі, порада, побажання, історія дня.\n"
@@ -906,12 +325,14 @@ async def relay_masked_voice(message: types.Message, user_id: int, partner_id: i
         )
         return
     try:
-        await bot.send_voice(
+        sent = await bot.send_voice(
             partner_id,
             BufferedInputFile(masked, filename="voice.ogg"),
             caption="🎙 <i>голос змінено маскою</i>",
             protect_content=should_protect(u),
+            **reply_kwargs(message, partner_id),
         )
+        remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         on_chat_message(user_id)
         stat_add("voice_mask")
     except TelegramAPIError:
@@ -966,6 +387,7 @@ def voice_mask_text() -> str:
 @dp.message(Command("voice"))
 async def voice_mask_cmd(message: types.Message, state: FSMContext):
     await state.clear()
+    await send_banner(message.from_user.id, "voice")
     u = init_user(message.from_user.id)
     await message.answer(voice_mask_text(), reply_markup=voice_mask_kb(u))
 
@@ -1050,11 +472,13 @@ async def confess_start(message: types.Message, state: FSMContext):
         await message.answer(f"🤫 Наступне зізнання можна надіслати через {wait // 3600} год {wait % 3600 // 60} хв 💜")
         return
     await state.set_state(ConfessStates.text)
+    await send_banner(user_id, "confess")
     await message.answer(
         "🤫 <b>Анонімне зізнання</b>\n\n"
         "Напиши те, що не можеш сказати нікому. Ми опублікуємо це в каналі "
         f"<a href=\"{confess_channel_link()}\">Анонімні зізнання</a> — без імені, ніку й будь-яких даних про тебе.\n\n"
-        "• не вказуй імена, адреси, телефони й @ніки — ні свої, ні чужі;\n"
+        "• без імен і деталей, за якими можна впізнати людей, — ні тебе, ні інших "
+        "(адреси, телефони, @ніки, школа чи робота);\n"
         f"• від {CONFESS_MIN} до {CONFESS_MAX} символів;\n"
         "• перед публікацією зізнання перевіряє модератор.\n\n"
         "Напиши своє зізнання одним повідомленням 👇",
@@ -1380,6 +804,8 @@ async def unmask_reveal(a: int, b: int):
         return
     unmask_done.add(frozenset((a, b)))
     stat_add("unmask")
+    await send_banner(a, "unmask")
+    await send_banner(b, "unmask")
     await _send_unmask_card(a, b)
     await _send_unmask_card(b, a)
     note = (
@@ -1454,6 +880,12 @@ def launch_text() -> str:
         "🤫 І канал анонімних зізнань: @ANONimchyk_zizn",
         "✨ А ще «Розваги»: гороскоп, карта дня і сумісність знаків — /fun",
         "",
+        "💸 Тепер подарунки — це не тільки приємно: частина вартості кожного подарунка, "
+        "який тобі дарують, стає твоїми грошима. Вивід на карту від 200 \u2060грн 💜",
+        "",
+        "💬 А ще в чатах: відповідь свайпом, виправлення повідомлень і кнопка «🎲 Інша тема». "
+        "Додай пару слів «Про себе» в профілі — співрозмовник побачить їх на старті.",
+        "",
         "⏰ А о 21:00 — Година знайомств: найбільше людей онлайн. Саме час 💜",
     ]
     return "\n".join(lines)
@@ -1514,6 +946,450 @@ async def launch_test(message: types.Message):
     else:
         await message.answer("⚠️ FOUNDER_PACK_URL не задано в Render — Пак засновника не надішлеться.")
     await message.answer(f"Запуск: {UNMASK_AT.strftime('%d.%m %H:%M')} · розсилка вже була: {launch_state.get('done')}")
+
+# ---------------------------------------------------------------------------
+# 💸 Вивід грошей на карту: частина вартості подарунків, які тобі дарують, від WITHDRAW_MIN грн.
+# Зараховуються лише подарунки після запуску оновлення і лише в межах реальних поповнень дарувальника
+# (безкоштовні бонуси не перетворюються на гроші). Гроші «відлежуються» EARN_HOLD_DAYS днів,
+# виплату робить адмін вручну. Номер карти не зберігається в базі — лише останні 4 цифри.
+# ---------------------------------------------------------------------------
+WITHDRAW_MIN_AGE = 18
+
+
+def uah(x: float, digits: int = 2) -> str:
+    """Сума виводу завжди в гривнях (не в ⭐) — позначка \u2060 вимикає заміну на зірки."""
+    return f"{x:.{digits}f} \u2060грн"
+
+
+def paid_pool(u: dict) -> float:
+    """Скільки реальних поповнень людини ще може «перетворитись» на заробіток отримувачів подарунків."""
+    if "paid_pool" not in u:
+        u["paid_pool"] = float(u.get("topup_total") or 0.0)
+    return u["paid_pool"]
+
+
+def earn_from_gift(sender: dict, recipient: dict, price: float) -> float:
+    if time.time() < UNMASK_AT.timestamp():
+        return 0.0  # рахуємо лише з моменту запуску оновлення
+    base = min(float(price), paid_pool(sender))
+    if base <= 0:
+        return 0.0
+    sender["paid_pool"] = round(sender["paid_pool"] - base, 2)
+    amt = round(base * GIFT_RECIPIENT_SHARE, 2)
+    if amt <= 0:
+        return 0.0
+    recipient.setdefault("earn_pending", []).append([time.time(), amt])
+    recipient["earned_total"] = round(recipient.get("earned_total", 0.0) + amt, 2)
+    return amt
+
+
+def earn_mature(u: dict) -> None:
+    """Переносить гроші, що вже «відлежались», у доступні до виводу."""
+    pend = u.get("earn_pending") or []
+    if not pend:
+        return
+    edge = time.time() - EARN_HOLD_DAYS * 86400
+    ready = sum(a for t, a in pend if t <= edge)
+    if ready:
+        u["earn_pending"] = [[t, a] for t, a in pend if t > edge]
+        u["earn_ready"] = round(u.get("earn_ready", 0.0) + ready, 2)
+
+
+def earn_on_hold(u: dict) -> float:
+    return round(sum(a for _t, a in (u.get("earn_pending") or [])), 2)
+
+
+def withdrawable(u: dict) -> float:
+    earn_mature(u)
+    return max(0.0, round(min(u.get("earn_ready", 0.0), u.get("balance", 0.0)), 2))
+
+
+def earn_wallet_line(u: dict) -> str:
+    if not u.get("earned_total"):
+        return ""
+    line = f"• <b>💸 Зароблено:</b> {uah(u['earned_total'])} · до виводу: <b>{uah(withdrawable(u))}</b>\n"
+    hold = earn_on_hold(u)
+    if hold:
+        line += f"  <i>ще {uah(hold)} стануть доступні протягом {EARN_HOLD_DAYS} днів</i>\n"
+    return line
+
+
+def wd_pending_of(user_id: int):
+    for no, w in withdraw_db.get("items", {}).items():
+        if w["user_id"] == user_id and w["status"] == "pending":
+            return no, w
+    return None, None
+
+
+def luhn_ok(num: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(num)):
+        d = int(ch)
+        if i % 2:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def wd_cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Скасувати", callback_data="wd_cancel")]])
+
+
+@dp.callback_query(F.data == "wd_open")
+async def wd_open(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    u = init_user(user_id)
+    await call.answer()
+    if user_id in banned_users:
+        return
+    if user_id in active_chats:
+        await call.message.answer("💬 Спершу заверши чат — а тоді оформимо вивід 🙂")
+        return
+    age = get_age_int(u)
+    if age is None or age < WITHDRAW_MIN_AGE:
+        await call.message.answer(
+            f"💸 Вивід на карту доступний з {WITHDRAW_MIN_AGE} років.\n"
+            "Гроші з подарунків лишаються на балансі — їх можна витрачати в боті 💜"
+        )
+        return
+    no, w = wd_pending_of(user_id)
+    if w:
+        await call.message.answer(f"⏳ Заявка №{no} на {uah(w['amount'])} уже в обробці. Щойно виплатимо — бот напише.")
+        return
+    avail = withdrawable(u)
+    hold = earn_on_hold(u)
+    if avail < WITHDRAW_MIN:
+        text = (
+            "💸 <b>Вивід на карту</b>\n\n"
+            "Коли тобі дарують подарунки в чаті, частина їхньої вартості стає твоїми грошима. "
+            f"Вони стають доступні через {EARN_HOLD_DAYS} днів, а вивести можна від <b>{uah(WITHDRAW_MIN, 0)}</b>.\n\n"
+            f"Доступно зараз: <b>{uah(avail)}</b>"
+        )
+        if hold:
+            text += f"\nНезабаром стане доступно: {uah(hold)}"
+        await call.message.answer(text)
+        return
+    await state.set_state(WithdrawStates.amount)
+    await state.update_data(wd_avail=avail)
+    await call.message.answer(
+        f"💸 Доступно до виводу: <b>{uah(avail)}</b>\n\n"
+        f"Напиши суму від {WITHDRAW_MIN:.0f} до {uah(avail)} або натисни кнопку 👇",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"Вивести все — {uah(avail)}", callback_data="wd_all")],
+            [InlineKeyboardButton(text="✖️ Скасувати", callback_data="wd_cancel")],
+        ]),
+    )
+
+
+async def _wd_ask_card(target: types.Message, state: FSMContext, amount: float):
+    await state.update_data(wd_amount=amount)
+    await state.set_state(WithdrawStates.card)
+    await target.answer(
+        f"💳 Сума: <b>{uah(amount)}</b>\n\n"
+        "Надішли номер картки українського банку (16 цифр).\n"
+        "<i>Бот одразу видалить повідомлення з номером із чату, а в базі збереже лише останні 4 цифри.</i>",
+        reply_markup=wd_cancel_kb(),
+    )
+
+
+@dp.callback_query(F.data == "wd_all")
+async def wd_all(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if await state.get_state() != WithdrawStates.amount.state:
+        return
+    avail = withdrawable(init_user(call.from_user.id))
+    if avail < WITHDRAW_MIN:
+        await state.clear()
+        await call.message.answer(f"Доступно лише {uah(avail)} — мінімум для виводу {uah(WITHDRAW_MIN, 0)}.")
+        return
+    await _wd_ask_card(call.message, state, avail)
+
+
+@dp.callback_query(F.data == "wd_cancel")
+async def wd_cancel(call: types.CallbackQuery, state: FSMContext):
+    if (await state.get_state() or "").startswith("WithdrawStates"):
+        await state.clear()
+    await call.answer("Скасовано")
+    await call.message.answer("Вивід скасовано.", reply_markup=get_main_keyboard())
+
+
+@dp.message(WithdrawStates.amount)
+async def wd_amount(message: types.Message, state: FSMContext):
+    avail = withdrawable(init_user(message.from_user.id))
+    try:
+        amount = round(float((message.text or "").strip().replace(",", ".").replace("грн", "")), 2)
+    except ValueError:
+        await message.answer(f"Напиши лише число — наприклад, {WITHDRAW_MIN:.0f}.", reply_markup=wd_cancel_kb())
+        return
+    if amount < WITHDRAW_MIN or amount > avail:
+        await message.answer(
+            f"Сума має бути від {WITHDRAW_MIN:.0f} до {uah(avail)}.", reply_markup=wd_cancel_kb()
+        )
+        return
+    await _wd_ask_card(message, state, amount)
+
+
+@dp.message(WithdrawStates.card)
+async def wd_card(message: types.Message, state: FSMContext):
+    digits = re.sub(r"[\s-]", "", message.text or "")
+    try:
+        await message.delete()  # номер карти не лишаємо в чаті
+    except TelegramAPIError:
+        pass
+    if not (digits.isdigit() and len(digits) == 16 and luhn_ok(digits)):
+        await message.answer("⚠️ Схоже, номер з помилкою. Перевір 16 цифр і надішли ще раз.", reply_markup=wd_cancel_kb())
+        return
+    data = await state.get_data()
+    amount = float(data.get("wd_amount") or 0)
+    await state.update_data(wd_card=digits)
+    await message.answer(
+        f"Перевір, будь ласка:\n\n💸 Сума: <b>{uah(amount)}</b>\n💳 Картка: <b>•••• {digits[-4:]}</b>\n\n"
+        "Виплата зазвичай надходить протягом 1–3 робочих днів.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Підтвердити", callback_data="wd_confirm")],
+            [InlineKeyboardButton(text="✖️ Скасувати", callback_data="wd_cancel")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "wd_confirm")
+async def wd_confirm(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    data = await state.get_data()
+    card, amount = data.get("wd_card"), float(data.get("wd_amount") or 0)
+    await state.clear()
+    if not card or amount <= 0:
+        await call.answer("Заявка застаріла — почни ще раз з гаманця.", show_alert=True)
+        return
+    u = init_user(user_id)
+    if wd_pending_of(user_id)[1] or amount < WITHDRAW_MIN or amount > withdrawable(u):
+        await call.answer("Сума вже недоступна — відкрий гаманець ще раз.", show_alert=True)
+        return
+    await call.answer()
+    u["balance"] = round(u["balance"] - amount, 2)
+    u["earn_ready"] = round(u.get("earn_ready", 0.0) - amount, 2)
+    no = str(withdraw_db.get("next", 1))
+    withdraw_db["next"] = int(no) + 1
+    w = {"user_id": user_id, "amount": amount, "last4": card[-4:], "created": time.time(), "status": "pending"}
+    withdraw_db.setdefault("items", {})[no] = w
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.message.answer(
+        f"✅ Заявку №{no} на <b>{uah(amount)}</b> прийнято. Щойно гроші надійдуть на картку •••• {card[-4:]}, бот напише 💜",
+        reply_markup=get_main_keyboard(),
+    )
+    if ADMIN_ID:
+        try:
+            sent = await bot.send_message(
+                ADMIN_ID,
+                f"💸 <b>Заявка на виплату №{no}</b>\n\n"
+                f"👤 {admin_label(user_id)}\n"
+                f"🎂 Вік: {esc(u.get('age'))} · зароблено всього: {uah(u.get('earned_total', 0))}\n"
+                f"💰 Сума: <b>{uah(amount)}</b>\n"
+                f"💳 Картка: <code>{card}</code>\n\n"
+                "<i>Після переказу натисни «Виплачено» — номер картки зникне з цього повідомлення.</i>",
+                protect_content=True,
+                reply_markup=wd_admin_kb(no),
+            )
+            w["admin_msg"] = sent.message_id
+        except TelegramAPIError as e:
+            logging.warning("Заявка на виплату: не вдалося повідомити адміна: %s", e)
+
+
+def wd_admin_kb(no: str):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Виплачено", callback_data=f"wd_paid:{no}"),
+        InlineKeyboardButton(text="❌ Відхилити", callback_data=f"wd_rej:{no}"),
+    ]])
+
+
+@dp.callback_query(F.data.startswith("wd_paid:") | F.data.startswith("wd_rej:"))
+async def wd_admin_decide(call: types.CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await call.answer("Доступ заборонено", show_alert=True)
+        return
+    action, no = call.data.split(":", 1)
+    w = withdraw_db.get("items", {}).get(no)
+    if w is None or w["status"] != "pending":
+        await call.answer("Заявку вже оброблено.", show_alert=True)
+        return
+    paid = action == "wd_paid"
+    w["status"] = "paid" if paid else "rejected"
+    w["done"] = time.time()
+    u = init_user(w["user_id"])
+    if paid:
+        u["withdrawn_total"] = round(u.get("withdrawn_total", 0.0) + w["amount"], 2)
+        stat_add("withdrawn", w["amount"])
+        await safe_send(w["user_id"], f"✅ Виплату <b>{uah(w['amount'])}</b> надіслано на картку •••• {w['last4']}. Дякуємо, що ти з нами 💜")
+    else:
+        u["balance"] = round(u["balance"] + w["amount"], 2)
+        u["earn_ready"] = round(u.get("earn_ready", 0.0) + w["amount"], 2)
+        await safe_send(
+            w["user_id"],
+            f"❌ Заявку №{no} на виплату відхилено — {uah(w['amount'])} повернуто на баланс.\n"
+            "Якщо є питання — напиши в 🆘 Допомога.",
+        )
+    request_save()
+    try:
+        await call.message.edit_text(
+            f"💸 Заявка №{no}: {uah(w['amount'])} · картка •••• {w['last4']}\n"
+            f"👤 {admin_label(w['user_id'])}\n\n" + ("✅ Виплачено" if paid else "❌ Відхилено, гроші повернуто"),
+            reply_markup=None,
+        )
+    except TelegramAPIError:
+        pass
+    await call.answer("Готово")
+
+
+@dp.callback_query(F.data == "adm_wd")
+@admin_only
+async def adm_withdrawals(call: types.CallbackQuery):
+    items = withdraw_db.get("items", {})
+    pending = [(no, w) for no, w in items.items() if w["status"] == "pending"]
+    paid_sum = sum(w["amount"] for w in items.values() if w["status"] == "paid")
+    lines = [f"💸 <b>Виводи</b>\n\nВиплачено всього: {uah(paid_sum)}", f"На перевірці: {len(pending)}\n"]
+    for no, w in pending[:20]:
+        lines.append(
+            f"№{no} · {uah(w['amount'])} · •••• {w['last4']} · {admin_label(w['user_id'])}"
+            + ("" if w.get("admin_msg") else " · ⚠️ повідомлення з карткою не дійшло")
+        )
+    if pending:
+        lines.append("\n<i>Повний номер картки — у повідомленні заявки вище в чаті.</i>")
+    await call.message.answer("\n".join(lines))
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Адмін: топ балансів і обнулення лічильника рулетки
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data == "adm_topbal")
+@admin_only
+async def adm_top_balances(call: types.CallbackQuery):
+    people = [(uid, u) for uid, u in users_db.items() if uid != ADMIN_ID]
+    top = sorted(people, key=lambda x: -x[1].get("balance", 0))[:15]
+    total = sum(u.get("balance", 0) for _uid, u in people)
+    ready = sum(withdrawable(u) for _uid, u in people)
+    lines = [
+        "💰 <b>Топ балансів</b>\n",
+        f"На балансах усього: <b>{total:.2f} грн</b>",
+        f"З них можна вивести на карту: <b>{ready:.2f} грн</b>\n",
+    ]
+    for i, (uid, u) in enumerate(top, 1):
+        if u.get("balance", 0) <= 0:
+            break
+        extra = f" · зароблено {u['earned_total']:.0f}" if u.get("earned_total") else ""
+        lines.append(f"{i}. {admin_label(uid)} — <b>{u['balance']:.2f} грн</b>{extra}")
+    await call.message.answer("\n".join(lines))
+    await call.answer()
+
+
+def roul_reset_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Так, обнулити", callback_data="adm_roul_reset_yes"),
+        InlineKeyboardButton(text="✖️ Ні", callback_data="adm_roul_reset_no"),
+    ]])
+
+
+@dp.callback_query(F.data == "adm_roul_reset")
+@admin_only
+async def adm_roulette_reset(call: types.CallbackQuery):
+    await call.message.answer(
+        f"🎰 Дохід з рулетки зараз: {lottery_revenue_total:.0f} грн.\nОбнулити лічильник (напр. після тестів)?",
+        reply_markup=roul_reset_kb(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.in_({"adm_roul_reset_yes", "adm_roul_reset_no"}))
+@admin_only
+async def adm_roulette_reset_do(call: types.CallbackQuery):
+    global lottery_revenue_total
+    if call.data.endswith("_yes"):
+        lottery_revenue_total = 0.0
+        request_save()
+        text = "✅ Лічильник рулетки обнулено."
+    else:
+        text = "Залишено як є."
+    try:
+        await call.message.edit_text(text, reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+@dp.message(Command("resetroulette"))
+async def reset_roulette_cmd(message: types.Message):
+    if not _is_admin(message.from_user.id):
+        return
+    await message.answer(
+        f"🎰 Дохід з рулетки зараз: {lottery_revenue_total:.0f} грн.\nОбнулити лічильник (напр. після тестів)?",
+        reply_markup=roul_reset_kb(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ↩️ Відповіді й ✏️ редагування в анонімному чаті: свайп-відповідь приходить співрозмовнику
+# як відповідь на те саме повідомлення, а виправлене повідомлення виправляється і в нього.
+# Пам'ятаємо пари (мій чат, id) ↔ (чат співрозмовника, id) — лише в пам'яті, з обмеженням розміру.
+# ---------------------------------------------------------------------------
+PAIR_MSG_LIMIT = 40000
+pair_msgs: dict[tuple[int, int], tuple[int, int]] = {}
+
+
+def remember_pair_msg(user_id: int, my_id, partner_id: int, their_id) -> None:
+    if not my_id or not their_id:
+        return
+    while len(pair_msgs) >= PAIR_MSG_LIMIT:
+        pair_msgs.pop(next(iter(pair_msgs)), None)
+    pair_msgs[(user_id, my_id)] = (partner_id, their_id)
+    pair_msgs[(partner_id, their_id)] = (user_id, my_id)
+
+
+def reply_kwargs(message, partner_id: int) -> dict:
+    """Якщо людина відповідає свайпом — співрозмовник побачить відповідь на те саме повідомлення."""
+    r = getattr(message, "reply_to_message", None)
+    if r is None:
+        return {}
+    hit = pair_msgs.get((message.from_user.id, getattr(r, "message_id", None)))
+    if not hit or hit[0] != partner_id:  # повідомлення з попереднього чату — без цитати
+        return {}
+    return {"reply_parameters": types.ReplyParameters(message_id=hit[1], allow_sending_without_reply=True)}
+
+
+@dp.edited_message()
+async def relay_edit(message: types.Message):
+    if message.chat.type != "private":
+        return
+    user_id = message.from_user.id
+    partner_id = active_chats.get(user_id)
+    hit = pair_msgs.get((user_id, message.message_id))
+    if partner_id is None or not hit or hit[0] != partner_id:
+        return
+    new_text = message.text if message.text is not None else message.caption
+    if new_text is None:
+        return
+    if LINK_REGEX.search(new_text):
+        await message.answer("🚫 Виправлення з посиланням або контактом не надіслано співрозмовнику.")
+        return
+    try:
+        if message.text is not None:
+            await bot.edit_message_text(
+                chat_id=partner_id, message_id=hit[1], text=protect_text(new_text),
+                entities=message.entities, parse_mode=None,
+            )
+        else:
+            await bot.edit_message_caption(
+                chat_id=partner_id, message_id=hit[1], caption=protect_text(new_text),
+                caption_entities=message.caption_entities, parse_mode=None,
+            )
+    except TelegramAPIError as e:
+        logging.info("Редагування не передано: %s", e)
+
 
 # ---------------------------------------------------------------------------
 # Пересилання повідомлень (завжди останнім!)
@@ -1579,7 +1455,10 @@ async def relay_messages(message: types.Message):
         return
 
     try:
-        await message.copy_to(chat_id=partner_id, protect_content=should_protect(users_db.get(user_id)))
+        sent = await message.copy_to(
+            chat_id=partner_id, protect_content=should_protect(users_db.get(user_id)), **reply_kwargs(message, partner_id)
+        )
+        remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         on_chat_message(user_id)
     except TelegramAPIError:
         end_chat(user_id)
