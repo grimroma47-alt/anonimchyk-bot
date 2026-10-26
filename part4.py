@@ -510,6 +510,7 @@ def task_event(user_id: int, event: str, n: int = 1):
 
 
 def on_chat_started(a: int, b: int, mode: str):
+    hw_mark_badge(a, b)
     now = time.time()
     for x in (a, b):
         chat_meta[x] = {"start": now, "mode": mode, "msgs": 0}
@@ -917,6 +918,8 @@ def vibe_note_for(me: dict, other: dict) -> str:
     if other.get("bio"):
         lines.append("📝 Про співрозмовника: «" + protect_text(esc(other["bio"])) + "»")
     lines.append(f"💬 Тема дня: <b>{topic_of_day()}</b>")
+    if hw_night_live():
+        lines.append("🌙 <b>Зараз Ніч страшилок</b> — розкажіть одне одному найстрашнішу історію 👻")
     return "\n".join(lines)
 
 
@@ -1219,6 +1222,8 @@ WAIT_PING_DELAY = int(os.getenv("WAIT_PING_DELAY", "30"))  # секунд очі
 WAIT_PING_USER_COOLDOWN = int(os.getenv("WAIT_PING_USER_COOLDOWN", str(3 * 3600)))  # одну людину кличемо не частіше
 WAIT_PING_SEEKER_COOLDOWN = 10 * 60  # за одного й того самого шукача кличемо не частіше
 WAIT_PING_MAX = int(os.getenv("WAIT_PING_MAX", "40"))  # скільки людей кличемо за раз
+WAIT_PING_DAILY_MAX = int(os.getenv("WAIT_PING_DAILY_MAX", "2"))  # одну людину кличемо не більше N разів на день
+WAIT_PING_NIGHT_END = 8  # з 00:00 до 08:00 (Київ) «хтось шукає» не надсилаємо
 wait_ping_seeker_last: dict[int, float] = {}
 
 
@@ -1239,6 +1244,8 @@ def wait_ping_recipients(seeker_id: int, mode: str) -> list[int]:
     s = init_user(seeker_id)
     now = time.time()
     result = []
+    if datetime.now(KYIV_TZ).hour < WAIT_PING_NIGHT_END:
+        return result  # уночі нікого не будимо
     for uid, u in users_db.items():
         if uid <= 0 or uid == seeker_id or uid in banned_users:
             continue
@@ -1248,6 +1255,8 @@ def wait_ping_recipients(seeker_id: int, mode: str) -> list[int]:
             continue  # вимкнув сповіщення або ще не пройшов знайомство з ботом
         if quiet_hours_now(u):
             continue  # 🌙 тихі години — не кличемо
+        if u.get("wait_ping_day") == today_str() and u.get("wait_ping_n", 0) >= WAIT_PING_DAILY_MAX:
+            continue  # не більше WAIT_PING_DAILY_MAX разів на день
         if now - u.get("wait_ping_at", 0) < WAIT_PING_USER_COOLDOWN:
             continue
         if is_blacklisted(s, seeker_id, u, uid):
@@ -1294,7 +1303,11 @@ async def wait_ping_after_wait(user_id: int, mode: str):
         for uid in recipients:
             if user_id not in queue:
                 break  # шукач уже знайшов пару — більше нікого не кличемо
-            users_db[uid]["wait_ping_at"] = time.time()
+            pu = users_db[uid]
+            pu["wait_ping_at"] = time.time()
+            if pu.get("wait_ping_day") != today_str():
+                pu["wait_ping_day"], pu["wait_ping_n"] = today_str(), 0
+            pu["wait_ping_n"] = pu.get("wait_ping_n", 0) + 1
             if await safe_send(uid, text, reply_markup=kb):
                 sent += 1
             await asyncio.sleep(0.05)  # не впираємось у ліміти Telegram
@@ -1468,7 +1481,29 @@ ONBOARD_COUNTRIES = [
     ("pl", "🇵🇱 Польща", "Польща"),
     ("de", "🇩🇪 Німеччина", "Німеччина"),
     ("cz", "🇨🇿 Чехія", "Чехія"),
+    ("gb", "🇬🇧 Велика Британія", "Велика Британія"),
+    ("it", "🇮🇹 Італія", "Італія"),
+    ("es", "🇪🇸 Іспанія", "Іспанія"),
+    ("nl", "🇳🇱 Нідерланди", "Нідерланди"),
 ]
+# Якщо замість країни написали українське місто/область — записуємо «Україна» (щоб фільтр за країною працював)
+UA_PLACES = (
+    "київ", "львів", "харків", "одес", "дніпр", "запоріж", "вінниц", "полтав", "чернігів", "черкас", "житомир",
+    "суми", "сум", "рівн", "луцьк", "тернопіль", "хмельниц", "івано", "франківськ", "ужгород", "чернівц",
+    "кропивницьк", "миколаїв", "херсон", "кривий", "біла церква", "краматорськ", "кременчук", "бровар", "ірпін",
+    "буча", "обл", "україн", "украин", "ukraine", "киев", "львов", "харьков", "одесс", "днепр",
+)
+
+
+def normalize_country(text: str) -> str:
+    t = (text or "").strip()[:50]
+    low = t.lower()
+    for _k, _label, name in ONBOARD_COUNTRIES:
+        if low == name.lower():
+            return name
+    if any(p in low for p in UA_PLACES):
+        return "Україна"
+    return t
 ONBOARD_AGE_REGEX = re.compile(r"^\s*(\d{1,3})\s*$")
 
 
@@ -1576,7 +1611,7 @@ async def onboard_country(call: types.CallbackQuery, state: FSMContext):
     if key == "other":
         await state.set_state(OnboardStates.country)
         await call.message.answer(
-            "Напиши свою країну або місто:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[_skip_row()])
+            "Напиши свою країну (наприклад: Франція, США, Канада):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[_skip_row()])
         )
         await call.answer()
         return
@@ -1592,7 +1627,7 @@ async def onboard_country_text(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text.startswith("/"):
         return
-    init_user(message.from_user.id)["country"] = text[:50]
+    init_user(message.from_user.id)["country"] = normalize_country(text)
     await _finish_onboarding(message.chat.id, message.from_user.id, state)
 
 
