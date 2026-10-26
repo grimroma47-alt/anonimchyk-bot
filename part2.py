@@ -258,6 +258,8 @@ def _apply_snapshot(blob: bytes):
             if key not in u:
                 u[key] = copy.deepcopy(value)
         refresh_default_nick(u)  # «Користувач_N» → «Незнайомець_N» / «Незнайомка_N»
+        if u.get("country") not in (None, "", "Не вказано"):
+            u["country"] = normalize_country(u["country"])  # «Львів» → «Україна»
     # 👑 ті, хто спілкувався ще до появи значка, стають першими засновниками (за порядком приходу)
     next_no = max((u.get("founder_no") or 0 for u in users_db.values()), default=0) + 1
     for uid in old_chatters:
@@ -1030,7 +1032,7 @@ async def daily_checkin(message: types.Message, state: FSMContext):
     task_event(message.from_user.id, "daily")
 
     if streak % DAILY_GIFT_EVERY == 0:
-        cheap_keys = [k for k, (_, p) in GIFT_CATALOG.items() if p <= DAILY_GIFT_MAX_PRICE]
+        cheap_keys = [k for k, (_, p) in GIFT_CATALOG.items() if p <= DAILY_GIFT_MAX_PRICE and k not in LIMITED_GIFTS]
         key = random.choice(cheap_keys)
         title, _price = GIFT_CATALOG[key]
         u.setdefault("gifts", {})
@@ -1300,6 +1302,9 @@ async def buy_gift_item(call: types.CallbackQuery):
     item = GIFT_CATALOG.get(key)
     if item is None:
         await call.answer("Невідомий подарунок", show_alert=True)
+        return
+    if key in LIMITED_GIFTS and not halloween_active():
+        await call.answer("🎃 Цей подарунок був лімітованим — продаж завершено", show_alert=True)
         return
 
     title, price = item
@@ -1771,7 +1776,8 @@ async def premium_free(call: types.CallbackQuery):
         f"Запроси {REFERRAL_PREMIUM_EVERY} друзів за своїм посиланням — отримаєш "
         f"<b>{REFERRAL_PREMIUM_DAYS} днів Premium</b>. А за кожного друга ще й +{REFERRAL_BONUS:.0f} грн на баланс.\n\n"
         f"Твоє посилання:\n<code>{esc(link)}</code>\n\n"
-        f"Запрошено: {done}. До наступного Premium: {left}."
+        f"Запрошено: {done}. До наступного Premium: {left}.",
+        reply_markup=contest_keyboard(call.from_user.id),
     )
     await call.answer()
 
