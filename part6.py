@@ -584,7 +584,9 @@ async def confess_send(call: types.CallbackQuery, state: FSMContext):
 
 
 def confess_post_text(no: int, text: str) -> str:
-    return f"🤫 <b>Зізнання #{no}</b>\n\n{esc(text)}\n\n<i>Розкажи своє — анонімно 👇</i>"
+    # Посилання в тексті, а не кнопкою: під постами з кнопками Telegram не показує «Коментувати»
+    link = f"https://t.me/{BOT_USERNAME or 'ANONimchykbot'}?start=zizn"
+    return f"🤫 <b>Зізнання #{no}</b>\n\n{esc(text)}\n\n<i>Розкажи своє — анонімно 👉</i> <a href=\"{link}\">@{BOT_USERNAME or 'ANONimchykbot'}</a>"
 
 
 def confess_post_kb():
@@ -605,7 +607,7 @@ async def confess_approve(call: types.CallbackQuery):
         return
     no = confess_db.get("pub_no", 0) + 1
     try:
-        msg = await bot.send_message(CONFESS_CHANNEL, confess_post_text(no, item["text"]), reply_markup=confess_post_kb())
+        msg = await bot.send_message(CONFESS_CHANNEL, confess_post_text(no, item["text"]), disable_web_page_preview=True)
     except TelegramAPIError as e:
         await call.answer(f"Не вдалося опублікувати: {e}"[:190], show_alert=True)
         return
