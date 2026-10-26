@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # Групові кімнати за інтересами
 # ---------------------------------------------------------------------------
-@dp.message(F.text == BTN_ROOMS)
+@dp.message(F.text.startswith(BTN_ROOMS))
 @dp.message(Command("rooms"))
 async def rooms_menu(message: types.Message, state: FSMContext):
     await state.clear()
@@ -18,12 +18,8 @@ async def rooms_menu(message: types.Message, state: FSMContext):
         await message.answer("Спочатку заверши приватний чат.", reply_markup=get_chat_keyboard())
         return
 
-    await message.answer(
-        "👥 <b>Кімнати за інтересами</b>\n\n"
-        f"Обери тему — потрапиш у групу до {ROOM_CAPACITY} людей, які говорять про те саме. "
-        "У кімнатах поки підтримується лише текст — це для безпеки спілкування в групі.",
-        reply_markup=get_room_topics_keyboard(),
-    )
+    await send_banner(user_id, "rooms")
+    await message.answer(rooms_intro_text(user_id), reply_markup=get_room_topics_keyboard())
 
 
 @dp.callback_query(F.data.startswith("room_join_"))
@@ -36,8 +32,8 @@ async def room_join(call: types.CallbackQuery):
     if user_id in user_room:
         await call.answer("Ти вже в кімнаті. Спочатку вийди з неї.", show_alert=True)
         return
-    if user_id in active_chats or user_id in queue:
-        await call.answer("Спочатку заверши приватний чат або пошук.", show_alert=True)
+    if user_id in active_chats:
+        await call.answer("Спочатку заверши приватний чат.", show_alert=True)
         return
 
     topic_key = call.data[len("room_join_"):]
@@ -66,10 +62,13 @@ async def room_join(call: types.CallbackQuery):
     room["members"].add(user_id)
     user_room[user_id] = target_room_id
 
+    room.setdefault("last_msg", time.time())
+    searching = user_id in queue
     await call.message.answer(
         f"✅ Ти приєднався до кімнати: <b>{esc(ROOM_TOPICS[topic_key])}</b> "
         f"({len(room['members'])}/{ROOM_CAPACITY} 👥)\n\n"
-        "Просто пиши текстом — повідомлення побачать усі учасники кімнати.",
+        "Просто пиши текстом — повідомлення побачать усі учасники кімнати."
+        + ("\n\n🔔 Пошук співрозмовника триває — щойно когось знайду, покличу тебе в приватний чат." if searching else ""),
         reply_markup=get_room_keyboard(),
     )
     await call.answer()
@@ -257,8 +256,8 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             continue  # у флірті з'єднуємо лише хлопця з дівчиною
         if not passes_filters(u, p_candidate) or not passes_filters(p_candidate, u):
             continue
-        if now_ts - queue_since.get(candidate_id, now_ts) > QUEUE_STALE_AFTER:
-            stale.append(candidate_id)
+        if now_ts - queue_since.get(candidate_id, now_ts) > QUEUE_STALE_AFTER and candidate_id not in user_room:
+            stale.append(candidate_id)  # хто в кімнаті — точно поруч, його не перепитуємо
             continue
         score = match_score(u, p_candidate, mode)
         if best is None or score > best[0]:
@@ -269,6 +268,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
 
     if match_index is not None:
         partner_id = queue.pop(match_index)
+        await pull_from_room(partner_id)
         active_chats[user_id] = partner_id
         active_chats[partner_id] = user_id
         p = init_user(partner_id)
@@ -314,6 +314,7 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             queue.append(user_id)
         queue_since[user_id] = time.time()
         search_mode[user_id] = mode
+        bg_notified.pop(user_id, None)
         for sid in stale:
             await ask_still_here(sid)
         if mode == "flirt":
@@ -334,7 +335,9 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             schedule_filter_nudge(user_id)
         if not current_mood(u) and mode != "flirt":
             wait_text += "\n\n🎭 Поки чекаєш — вкажи свій настрій: /mood. Бот спершу шукатиме когось на одній хвилі."
+        wait_text += "\n\n🔔 Можеш закрити бот — щойно хтось знайдеться, я напишу."
         await message.answer(wait_text, reply_markup=get_main_keyboard())
+        await offer_rooms_while_waiting(user_id, mode)
         await maybe_show_ad(user_id)
         schedule_stuck_offer(user_id, mode)
         schedule_wait_ping(user_id, mode)
