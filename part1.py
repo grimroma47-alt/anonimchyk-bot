@@ -68,6 +68,7 @@ async def track_last_seen(handler, event, data):
             stats_day()["active"].add(user.id)
             known = users_db.get(user.id)
             if known is not None:
+                known["last_active_day"] = today_str()
                 known["tg_username"] = user.username
                 known["tg_name"] = " ".join(x for x in (user.first_name, user.last_name) if x) or None
     except Exception:  # noqa: BLE001 — облік онлайну ніколи не має ламати обробку повідомлень
@@ -312,6 +313,9 @@ async def i18n_incoming(handler, event, data):
             if _tr_rx is None:
                 _tr_build()
             back = _tr_back.get(text.strip())
+            if not back and " · " in text:  # кнопки з лічильником: «👥 Комнаты по интересам · сейчас 5»
+                head = _tr_back.get(text.split(" · ")[0].strip())
+                back = head and head + " · " + text.split(" · ", 1)[1]
             in_talk = uid in active_chats or uid in user_room
             # у чаті перекладаємо лише кнопки (починаються з емодзі), а не слова, які людина пише співрозмовнику
             if back and (not in_talk or not re.match(f"[{_CYR}A-Za-z0-9]", text.strip()[0])):
@@ -474,7 +478,12 @@ GIFT_CATALOG = {
     "crown": ("👑 Корона", 300),
     "rocket": ("🚀 Ракета", 500),
     "castle": ("🏰 Замок", 1000),
+    # 🎃 лімітовані — у продажу лише на Хелловін (хто купив — лишаються назавжди)
+    "pumpkin": ("🎃 Гарбуз", 20),
+    "bat": ("🦇 Кажан", 30),
+    "ghost": ("👻 Привид", 50),
 }
+LIMITED_GIFTS = {"pumpkin", "bat", "ghost"}
 # Частка від ціни подарунка, яка йде отримувачу (решта — дохід адміна)
 GIFT_RECIPIENT_SHARE = float(os.getenv("GIFT_RECIPIENT_SHARE", "0.25"))  # 0.25 = 25%
 # 💸 Вивід зароблених грошей на карту: мінімум і скільки днів «відлежуються» гроші з подарунків
@@ -552,7 +561,7 @@ def lottery_days_word(days: int) -> str:
 
 
 def lottery_random_gift(lo: float, hi: float) -> str:
-    keys = [k for k, (_t, p) in GIFT_CATALOG.items() if lo <= p <= hi]
+    keys = [k for k, (_t, p) in GIFT_CATALOG.items() if lo <= p <= hi and k not in LIMITED_GIFTS]
     return random.choice(keys or list(GIFT_CATALOG.keys()))
 
 
@@ -792,6 +801,7 @@ def get_main_keyboard():
         keyboard=[
             [K(text=BTN_SEARCH)],
             [K(text=BTN_VOICE_SEARCH)],
+            [K(text=rooms_button_label())],
             [K(text=BTN_FLIRT), K(text=BTN_INTERESTS)],
             [K(text=BTN_PREMIUM), K(text=BTN_TOPUP), K(text=BTN_DAILY)],
             [K(text=BTN_PROFILE), K(text=BTN_WALLET), K(text=BTN_MORE)],
@@ -807,7 +817,7 @@ def get_more_keyboard():
         keyboard=[
             [K(text=BTN_FUN), K(text=BTN_CONFESS), K(text=BTN_LETTER)],
             [K(text=BTN_SHOP), K(text=BTN_TASKS), K(text=BTN_LOTTERY)],
-            [K(text=BTN_FRIENDS), K(text=BTN_ROOMS), K(text=BTN_FILTERS)],
+            [K(text=BTN_FRIENDS), K(text=BTN_FILTERS)],
             [K(text=BTN_ONLINE), K(text=BTN_TOP), K(text=BTN_SETTINGS)],
             [K(text=BTN_HELP), K(text=BTN_MENU_BACK)],
         ],
@@ -883,9 +893,15 @@ def get_gift_menu_keyboard():
 
 def get_gift_catalog_keyboard():
     """Магазин подарунків: купити подарунок про запас (в інвентар)."""
+    hw = halloween_active()
+    order = [k for k in GIFT_CATALOG if k in LIMITED_GIFTS] + [k for k in GIFT_CATALOG if k not in LIMITED_GIFTS]
     buttons = [
-        InlineKeyboardButton(text=f"{title} — {price} грн", callback_data=f"buygift_{key}")
-        for key, (title, price) in GIFT_CATALOG.items()
+        InlineKeyboardButton(
+            text=("⏳ " if key in LIMITED_GIFTS else "") + f"{GIFT_CATALOG[key][0]} — {GIFT_CATALOG[key][1]} грн",
+            callback_data=f"buygift_{key}",
+        )
+        for key in order
+        if key not in LIMITED_GIFTS or hw
     ]
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1247,6 +1263,7 @@ def short_info(u: dict, public: bool = True) -> str:
     badge = " 💎" if is_premium(u) else ""
     vip = " ⭐VIP" if has_perk(u, "vip_badge") else ""
     vip += " 👑" if u.get("founder_no") else ""
+    vip += " 🎃" if u.get("hw2026") else ""
     pct = rating_percent(u)
     rating = f" · 👍 {pct}%" if pct is not None and u.get("rating_up", 0) + u.get("rating_down", 0) >= RATING_MIN_VOTES else ""
     age = "🙈 вік приховано" if public and u.get("hide_age") else esc(u["age"])
