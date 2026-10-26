@@ -230,6 +230,8 @@ def voice_locked(u: dict, key: str) -> bool:
     """Чи закритий голос для цієї людини (Premium-голоси вмикаються з PREMIUM_VOICES_AT)."""
     if key in VOICE_FREE or key not in VOICE_PRESETS:
         return False
+    if key in HALLOWEEN_VOICES and halloween_active():
+        return False  # 🎃 на Хелловін — безкоштовно
     return datetime.now(KYIV_TZ) >= PREMIUM_VOICES_AT and not is_premium(u)
 
 
@@ -359,7 +361,7 @@ async def voice_preview(message: types.Message, u: dict):
 def voice_mask_kb(u: dict):
     cur = u.get("voice_mask") or "off"
     def b(key, label):
-        lock = "💎" if voice_locked(u, key) else ""
+        lock = "💎" if voice_locked(u, key) else ("🎃" if key in HALLOWEEN_VOICES and halloween_active() else "")
         return InlineKeyboardButton(text=("✅ " if cur == key else "") + label + lock, callback_data=f"vm_set:{key}")
     keys = list(VOICE_PRESETS)
     rows = [[b("off", "🎙 Мій голос")]]
@@ -1333,6 +1335,373 @@ async def reset_roulette_cmd(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
+# 👥 Живі кімнати: велика кнопка з лічильником, «поки шукаємо — зазирни в кімнату»,
+# пошук у фоні (до 2 год) і теми від бота, коли в кімнаті тихо
+# ---------------------------------------------------------------------------
+BG_SEARCH_MAX = int(os.getenv("BG_SEARCH_MAX", str(2 * 3600)))  # скільки триває пошук у фоні від старту
+ROOM_QUIET_TOPIC = int(os.getenv("ROOM_QUIET_TOPIC", "300"))  # через скільки секунд тиші бот підкидає тему
+bg_notified: dict[int, float] = {}  # кому вже сказали, що пошук іде у фоні
+
+ROOM_QUESTIONS = [
+    "Яка найдивніша річ сталася з вами цього тижня?",
+    "Що вас точно підбадьорить, коли все йде не так?",
+    "Яку пісню ви б поставили на повтор прямо зараз?",
+    "Яке місце в Україні (чи у світі) варто побачити кожному?",
+    "Що ви вмієте, чого ніхто не очікує?",
+    "Яка ваша найкраща порада тому, кому зараз важко?",
+    "Котики, собаки чи ні те ні інше? Аргументуйте 😄",
+    "Який фільм ви переглянули б удруге просто зараз?",
+    "Що б ви зробили з вільним днем без телефона?",
+    "Яка ваша суперсила в компанії друзів?",
+    "Чай чи кава — і в який час доби?",
+    "Яку звичку ви хочете позбутися, а яку завести?",
+]
+
+
+def rooms_online() -> int:
+    return sum(len(r["members"]) for r in rooms.values())
+
+
+def rooms_button_label() -> str:
+    n = rooms_online()
+    return f"{BTN_ROOMS} · зараз {n}" if n >= 2 else BTN_ROOMS
+
+
+def rooms_intro_text(user_id: int) -> str:
+    text = (
+        "👥 <b>Кімнати за інтересами</b>\n\n"
+        f"Обери тему — потрапиш у групу до {ROOM_CAPACITY} людей, які говорять про те саме. "
+        "У кімнатах поки підтримується лише текст — це для безпеки спілкування в групі."
+    )
+    if user_id in queue:
+        text += "\n\n🔔 Пошук співрозмовника не зупиниться — щойно когось знайду, покличу тебе."
+    return text
+
+
+def rooms_open_kb():
+    n = rooms_online()
+    label = f"👥 Зайти в кімнату · там {n}" if n else "👥 Зайти в кімнату"
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, callback_data="rooms_open")]])
+
+
+async def offer_rooms_while_waiting(user_id: int, mode: str):
+    """Поки черга порожня — пропонуємо кімнату, де вже хтось є (пошук триває)."""
+    if mode == "voice" or user_id in user_room or rooms_online() < 1:
+        return
+    await safe_send(
+        user_id,
+        f"👥 Поки шукаємо — зазирни в кімнату: там зараз <b>{rooms_online()}</b>. Пошук при цьому не зупиниться 🔔",
+        reply_markup=rooms_open_kb(),
+    )
+
+
+@dp.callback_query(F.data == "rooms_open")
+async def rooms_open_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    await call.answer()
+    if user_id in banned_users:
+        return
+    if user_id in active_chats:
+        await call.message.answer("Спочатку заверши приватний чат.", reply_markup=get_chat_keyboard())
+        return
+    if user_id in user_room:
+        await call.message.answer("Ти вже в кімнаті 🙂", reply_markup=get_room_keyboard())
+        return
+    await call.message.answer(rooms_intro_text(user_id), reply_markup=get_room_topics_keyboard())
+
+
+async def pull_from_room(user_id: int, quiet: bool = False):
+    """Знайшовся співрозмовник — людина виходить з кімнати в приватний чат (інших попереджаємо)."""
+    room_id = user_room.get(user_id)
+    if room_id is None:
+        return
+    room = rooms.get(room_id)
+    remove_from_room(user_id)
+    if quiet or not room:
+        return
+    nick = esc((users_db.get(user_id) or {}).get("nickname", "Хтось"))
+    for member_id in list(room["members"]):
+        await safe_send(member_id, f"🚪 <b>{nick}</b> пішов у приватний чат.")
+
+
+def bg_search_text() -> str:
+    return (
+        "🔔 Поки нікого немає — я шукаю <b>у фоні</b> ще до двох годин.\n\n"
+        "Займайся своїми справами: щойно хтось з'явиться, я напишу, і ви одразу почнете чат."
+        + (f"\n\n👥 А поки можна поговорити в кімнаті — там зараз {rooms_online()}." if rooms_online() else "")
+    )
+
+
+def bg_search_kb():
+    rows = []
+    if rooms_online():
+        rows.append([InlineKeyboardButton(text="👥 Зайти в кімнату", callback_data="rooms_open")])
+    rows.append([InlineKeyboardButton(text="⏹ Зупинити пошук", callback_data="bg_stop")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "bg_stop")
+async def bg_stop(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if user_id in queue:
+        queue.remove(user_id)
+        bg_notified.pop(user_id, None)
+        await call.answer("Пошук зупинено")
+        await call.message.answer("Пошук зупинено.", reply_markup=get_main_keyboard() if user_id not in user_room else get_room_keyboard())
+    else:
+        await call.answer("Пошук уже не активний")
+
+
+async def rooms_tick():
+    """Раз на хвилину: якщо в кімнаті з 2+ людьми 5 хв тиша — бот підкидає питання для всіх."""
+    now = time.time()
+    for room in list(rooms.values()):
+        members = list(room["members"])
+        if len(members) < 2:
+            continue
+        last = max(room.get("last_msg", now), room.get("last_topic", 0))
+        if now - last < ROOM_QUIET_TOPIC:
+            continue
+        room["last_topic"] = now
+        q = random.choice([x for x in ROOM_QUESTIONS if x != room.get("last_q")])
+        room["last_q"] = q
+        for member_id in members:
+            await safe_send(member_id, f"🎲 <b>Питання для всіх:</b> {q}")
+
+
+# ---------------------------------------------------------------------------
+# 💡 «А ти знав?» і 🎁 рефералка — разом із вечірнім нагадуванням о 20:55 (щоб не слати зайвого):
+# підказка через день, у неділю — запрошення друзів за Premium. Новачкам — окремий рядок.
+# ---------------------------------------------------------------------------
+NEWBIE_MEET_LINE = "\n\n💜 Ти ще ні з ким не поговорив(-ла) — о 21:00 найкращий шанс знайти співрозмовника за секунди!"
+TIPS = [
+    ("🎙 Голосове можна надіслати з маскою — співрозмовник почує робота, привида чи демона, а не тебе.", "🎙 Спробувати маску голосу", "vm_menu"),
+    ("🎭 Якщо розмова зайшла, можна разом зняти маски й побачити одне одного — тільки якщо захочете обоє.", "🔍 Знайти співрозмовника", "wp_go:normal"),
+    ("🎲 У чаті є «Правда чи дія» і «Що обереш?» — ідеально, коли не знаєш, про що говорити.", "🔍 Знайти співрозмовника", "wp_go:normal"),
+    ("💌 Напиши нічний лист — а вранці він прилетить незнайомцю, і тобі — чийсь.", "💌 Написати лист", "tip_cmd:letter"),
+    ("🔮 Щодня новий гороскоп і карта дня Таро.", "✨ Відкрити Розваги", "fun_menu"),
+    ("🤫 Можна анонімно розповісти те, що не скажеш нікому, — у каналі зізнань.", "🤫 Написати зізнання", "tip_cmd:confess"),
+    ("👥 Є кімнати за інтересами — групові чати, де завжди хтось є.", "👥 Відкрити кімнати", "rooms_open"),
+    ("💸 Частину вартості подарунків, які тобі дарують, можна вивести на карту (18+).", "🔍 Знайти співрозмовника", "wp_go:normal"),
+]
+
+
+def evening_extra() -> tuple[str, str, str] | None:
+    """Що додати до вечірнього нагадування сьогодні: (текст, кнопка, callback) або None."""
+    today = kyiv_today()
+    if halloween_active():
+        return (
+            "🎃 <b>Тиждень Хелловіну</b>: маски голосу «Привид» і «Демон» безкоштовно, лімітовані подарунки "
+            f"🎃🦇👻 і «Страшна правда чи дія». А {HW_NIGHT.day}.{HW_NIGHT.month:02d} · {HW_NIGHT.hour}:00 — Ніч страшилок!",
+            "🎃 Що на Хелловін?",
+            "hw_open",
+        )
+    if today.weekday() == 6:  # неділя — рефералка
+        return (
+            f"🎁 <b>Premium безкоштовно</b>: запроси {REFERRAL_PREMIUM_EVERY} друзів — отримаєш "
+            f"{REFERRAL_PREMIUM_DAYS} днів Premium (фільтр за статтю й віком, усі маски голосу, без реклами). "
+            "А топ-3 тижня отримують Premium за конкурсом запрошень!",
+            "🎁 Моє посилання для друзів",
+            "prem_free",
+        )
+    if today.toordinal() % 2:
+        return None
+    text, btn, cb = TIPS[(today.toordinal() // 2) % len(TIPS)]
+    return (f"💡 <b>А ти знав?</b> {text}", btn, cb)
+
+
+def evening_extra_text() -> str:
+    x = evening_extra()
+    return f"\n\n{x[0]}" if x else ""
+
+
+def evening_extra_button():
+    x = evening_extra()
+    return InlineKeyboardButton(text=x[1], callback_data=x[2]) if x else None
+
+
+@dp.callback_query(F.data.startswith("tip_cmd:"))
+async def tip_cmd(call: types.CallbackQuery):
+    what = call.data.split(":", 1)[1]
+    await call.answer()
+    if what == "letter":
+        await call.message.answer("💌 Щоб написати нічний лист, натисни /letter")
+    elif what == "confess":
+        await call.message.answer("🤫 Щоб написати анонімне зізнання, натисни /confess")
+
+
+def is_fresh_newbie(u: dict) -> bool:
+    joined = u.get("joined_at") or 0
+    return not u.get("total_chats") and joined and time.time() - joined < 14 * 86400
+
+
+# ---------------------------------------------------------------------------
+# 👋 «Ми скучили»: одне повідомлення тим, хто не заходив 4+ дні (не частіше ніж раз на 2 тижні)
+# ---------------------------------------------------------------------------
+COMEBACK_AFTER_DAYS = int(os.getenv("COMEBACK_AFTER_DAYS", "4"))
+COMEBACK_EVERY_DAYS = 14
+COMEBACK_HOUR = 19  # о 19:xx за Києвом — до вечірнього піку
+comeback_state: dict = {"day": None}
+
+
+def comeback_text() -> str:
+    lines = [
+        "👋 <b>Давно не бачились!</b>",
+        "",
+        "За цей час у ANONimchyk:",
+        "🎭 у чаті можна разом зняти маски — тільки якщо захочете обоє",
+        "🎙 голосові з маскою — твій голос ніхто не впізнає",
+        "👥 кімнати, де завжди хтось є",
+    ]
+    if halloween_active():
+        lines.append("🎃 <b>Тиждень Хелловіну</b>: страшні маски голосу безкоштовно й лімітовані подарунки")
+    lines += ["", f"⏰ Найбільше людей онлайн щодня о {MEET_HOUR}:00. Заходь 💜"]
+    return "\n".join(lines)
+
+
+async def comeback_tick():
+    now = datetime.now(KYIV_TZ)
+    today = now.date()
+    if now.hour != COMEBACK_HOUR or comeback_state.get("day") == today.isoformat() or not _contest_can_write():
+        return
+    comeback_state["day"] = today.isoformat()
+    edge = (today - timedelta(days=COMEBACK_AFTER_DAYS)).isoformat()
+    again = (today - timedelta(days=COMEBACK_EVERY_DAYS)).isoformat()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")]])
+    sent = 0
+    for uid, u in list(users_db.items()):
+        if uid <= 0 or uid in banned_users or uid in active_chats or uid in queue or uid in user_room:
+            continue
+        if not u.get("notify_tips", True):
+            continue
+        last = u.get("last_active_day")
+        if not last:
+            u["last_active_day"] = today.isoformat()  # старі користувачі: відлік з сьогодні, без розсилки
+            continue
+        if last > edge or (u.get("comeback_day") or "0") > again:
+            continue
+        u["comeback_day"] = today.isoformat()
+        if await safe_send(uid, comeback_text(), reply_markup=kb):
+            sent += 1
+        await asyncio.sleep(0.05)
+    if sent:
+        stat_add("comeback", sent)
+    request_save()
+
+
+# ---------------------------------------------------------------------------
+# 🎃 Хелловін: тиждень масок (27.10–01.11) — страшні маски голосу безкоштовно, лімітовані подарунки,
+# «Страшна правда чи дія», Ніч страшилок 31.10 о 23:00 і значок 🎃 за чат 31 жовтня
+# ---------------------------------------------------------------------------
+HW_FROM = _parse_dt_env("HALLOWEEN_FROM", "2026-10-27T00:00")
+HW_TO = _parse_dt_env("HALLOWEEN_TO", "2026-11-02T00:00")
+HW_NIGHT = _parse_dt_env("HALLOWEEN_NIGHT", "2026-10-31T23:00")  # Ніч страшилок триває годину
+HW_BADGE_DAY = HW_NIGHT.date().isoformat()  # хто поспілкувався цього дня — отримує значок 🎃
+HW_NIGHT_REMIND_MIN = 5
+HALLOWEEN_VOICES = {"ghost", "demon"}
+
+SPOOKY_TRUTHS = [
+    "Чого ти боявся(-лася) в дитинстві найбільше?",
+    "Розкажи найстрашніший сон, який пам'ятаєш.",
+    "Ти віриш у привидів? Чому?",
+    "Що найдивніше траплялося з тобою вночі?",
+    "У який фільм жахів ти ніколи не подивишся вдруге?",
+    "Чи був у тебе момент, коли здавалося, що вдома хтось є?",
+    "Який звук уночі лякає тебе найбільше?",
+    "Куди б ти ніколи не пішов (не пішла) сам(а) вночі?",
+]
+SPOOKY_DARES = [
+    "Напиши страшну історію рівно в три речення 👻",
+    "Надішли голосове моторошним шепотом (маска «Привид» безкоштовна до 1.11) 🎙",
+    "Опиши свій ідеальний хелловінський костюм одним реченням 🎃",
+    "Вигадай назву для фільму жахів про ваш чат 🎬",
+    "Надішли найстрашніший стікер, який у тебе є 😱",
+    "Розкажи міську легенду зі свого міста (або вигадай її) 🏚",
+]
+
+
+def halloween_active(now: datetime | None = None) -> bool:
+    now = now or datetime.now(KYIV_TZ)
+    return HW_FROM <= now < HW_TO
+
+
+def hw_night_live(now: datetime | None = None) -> bool:
+    now = now or datetime.now(KYIV_TZ)
+    return HW_NIGHT <= now < HW_NIGHT + timedelta(hours=1)
+
+
+def hw_text() -> str:
+    return (
+        "🎃 <b>Тиждень Хелловіну в ANONimchyk</b> · до 1 листопада\n\n"
+        "👻 Маски голосу <b>«Привид»</b> і <b>«Демон»</b> — безкоштовно для всіх: /voice\n"
+        "🎁 Лімітовані подарунки 🎃 Гарбуз · 🦇 Кажан · 👻 Привид — тільки цього тижня\n"
+        "🎲 «Страшна правда чи дія» — у грі під час чату\n\n"
+        f"🌙 <b>{HW_NIGHT.day}.{HW_NIGHT.month:02d} · {HW_NIGHT.hour}:00 — Ніч страшилок!</b> "
+        "Заходь, розкажи страшну історію анонімно. Усі, хто поспілкується "
+        f"{HW_NIGHT.day} жовтня, отримають значок 🎃 у профілі назавжди."
+    )
+
+
+def hw_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")],
+        [InlineKeyboardButton(text="👻 Маска голосу", callback_data="vm_menu")],
+    ])
+
+
+@dp.message(Command("halloween"))
+async def hw_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    init_user(message.from_user.id)
+    await send_banner(message.from_user.id, "halloween")
+    if not halloween_active():
+        await message.answer("🎃 Хелловінський тиждень уже завершився — до наступного року! 👻")
+        return
+    await message.answer(hw_text(), reply_markup=hw_kb())
+
+
+@dp.callback_query(F.data == "hw_open")
+async def hw_open(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer(hw_text() if halloween_active() else "🎃 Хелловін уже минув 👻", reply_markup=hw_kb())
+
+
+def hw_mark_badge(*uids: int):
+    if datetime.now(KYIV_TZ).date().isoformat() != HW_BADGE_DAY:
+        return
+    for x in uids:
+        u = users_db.get(x)
+        if u is not None and not u.get("hw2026"):
+            u["hw2026"] = True
+
+
+async def hw_night_tick():
+    """31.10 о 22:55 — запрошення на Ніч страшилок (тим, хто отримує нагадування про Годину знайомств)."""
+    now = datetime.now(KYIV_TZ)
+    start = HW_NIGHT - timedelta(minutes=HW_NIGHT_REMIND_MIN)
+    if not (start <= now < HW_NIGHT) or launch_state.get("hw_night") or not _contest_can_write():
+        return
+    launch_state["hw_night"] = True
+    request_save()
+    text = (
+        f"🌙 <b>Ніч страшилок — о {HW_NIGHT.hour}:00!</b> 👻\n\n"
+        "Заходь, знайди співрозмовника й розкажіть одне одному найстрашнішу історію — анонімно.\n"
+        "Маска голосу «Привид» безкоштовна — розкажи моторошним голосом 🎙\n\n"
+        "🎃 Усі, хто поспілкується сьогодні, отримають значок у профілі назавжди!"
+    )
+    kb = hw_kb()
+    for uid in meet_recipients():
+        if uid in active_chats or uid in queue:
+            continue
+        await safe_send(uid, text, reply_markup=kb)
+        await asyncio.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
 # ↩️ Відповіді й ✏️ редагування в анонімному чаті: свайп-відповідь приходить співрозмовнику
 # як відповідь на те саме повідомлення, а виправлене повідомлення виправляється і в нього.
 # Пам'ятаємо пари (мій чат, id) ↔ (чат співрозмовника, id) — лише в пам'яті, з обмеженням розміру.
@@ -1415,6 +1784,7 @@ async def relay_messages(message: types.Message):
                 )
                 return
             u = init_user(user_id)
+            room["last_msg"] = time.time()
             task_event(user_id, "room_msg")
             broadcast_text = f"<b>{esc(u['nickname'])}:</b> {protect_text(esc(message.text))}"
             for member_id in list(room["members"]):
