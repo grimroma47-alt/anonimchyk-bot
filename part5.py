@@ -185,7 +185,7 @@ async def pe_country_set(call: types.CallbackQuery, state: FSMContext):
     key = call.data[len("pe_c_"):]
     if key == "other":
         await state.set_state(ProfileEditStates.country)
-        await call.message.answer("🌍 Напиши свою країну або місто. Скасувати: /cancel")
+        await call.message.answer("🌍 Напиши свою країну (наприклад: Франція, США, Канада). Скасувати: /cancel")
         await call.answer()
         return
     country = next((name for k, _label, name in ONBOARD_COUNTRIES if k == key), None)
@@ -203,9 +203,9 @@ async def pe_country_set(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(ProfileEditStates.country, F.text)
 async def pe_country_text(message: types.Message, state: FSMContext):
-    country = (message.text or "").strip()[:50]
+    country = normalize_country(message.text or "")
     if len(country) < 2 or LINK_REGEX.search(country):
-        await message.answer("Напиши назву країни або міста. Скасувати: /cancel")
+        await message.answer("Напиши назву країни. Скасувати: /cancel")
         return
     u = init_user(message.from_user.id)
     _set_country(u, country)
@@ -233,6 +233,8 @@ BANNER_PLACES = {
     "letter": "💌 Нічний лист",
     "unmask": "🎭 Маски знято",
     "friends": "👫 Друзі",
+    "rooms": "👥 Кімнати",
+    "halloween": "🎃 Хелловін",
 }
 BANNER_COOLDOWN = 10 * 60  # той самий банер одній людині — не частіше ніж раз на 10 хв
 banner_last_shown: dict[tuple[int, str], float] = {}
@@ -605,6 +607,18 @@ async def contest_loop():
             await letters_tick()
         except Exception as e:  # noqa: BLE001
             logging.warning("Нічні листи: %s", e)
+        try:
+            await rooms_tick()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Живі кімнати: %s", e)
+        try:
+            await comeback_tick()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("«Ми скучили»: %s", e)
+        try:
+            await hw_night_tick()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Ніч страшилок: %s", e)
         await asyncio.sleep(60)
 
 
@@ -640,6 +654,7 @@ async def here_ok(call: types.CallbackQuery, state: FSMContext):
     if user_id in queue:
         queue.remove(user_id)
     await call.answer()
+    await pull_from_room(user_id)
     await run_search(call.message, state, mode, user_id=user_id)
 
 
@@ -653,13 +668,20 @@ async def queue_cleanup_tick():
             continue
         if now - since < QUEUE_MAX_WAIT:
             continue
+        if now - since < BG_SEARCH_MAX:
+            if not bg_notified.get(uid):
+                bg_notified[uid] = now
+                await safe_send(uid, bg_search_text(), reply_markup=bg_search_kb())
+            continue
+        bg_notified.pop(uid, None)
         if uid in queue:
             queue.remove(uid)
+        await pull_from_room(uid, quiet=True)
         mode = search_mode.pop(uid, "normal")
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Шукати знову", callback_data=f"wp_go:{mode}")]])
         await safe_send(
             uid,
-            f"😔 Поки ніхто не знайшовся — пошук зупинено, щоб ти не чекав(-ла) даремно.\n\n"
+            f"😔 За дві години ніхто не знайшовся — пошук зупинено.\n\n"
             f"Натисни, щоб шукати знову. А о {MEET_HOUR}:00 — ⏰ Година знайомств, тоді онлайн найбільше людей.",
             reply_markup=kb,
         )
@@ -705,12 +727,14 @@ def meet_reminder_text() -> str:
 
 
 def meet_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")],
-            [InlineKeyboardButton(text="❤️ Флірт-пошук", callback_data="wp_go:flirt")],
-        ]
-    )
+    rows = [
+        [InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")],
+        [InlineKeyboardButton(text="❤️ Флірт-пошук", callback_data="wp_go:flirt")],
+    ]
+    extra = evening_extra_button()
+    if extra:
+        rows.append([extra])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def meet_recipients() -> list[int]:
@@ -720,20 +744,24 @@ def meet_recipients() -> list[int]:
             continue
         if uid in active_chats or uid in queue or uid in user_room:
             continue  # і так уже спілкується або шукає
-        if not u.get("notify_meet", True) or u.get("gender", "Не вказано") == "Не вказано":
-            continue  # вимкнув нагадування або ще не пройшов знайомство з ботом
+        if not u.get("notify_meet", True):
+            continue  # вимкнув нагадування
+        if u.get("gender", "Не вказано") == "Не вказано" and not is_fresh_newbie(u):
+            continue  # ще не пройшов знайомство з ботом (крім новачків — їх кличемо на першу розмову)
         result.append(uid)
     result.sort(key=lambda x: last_seen.get(x, 0), reverse=True)
     return result
 
 
 async def _meet_broadcast(recipients: list[int]):
-    text, kb = meet_reminder_text(), meet_keyboard()
+    text, kb = meet_reminder_text() + evening_extra_text(), meet_keyboard()
     sent = 0
     for uid in recipients:
         if uid in active_chats or uid in queue:
             continue
-        if await safe_send(uid, text, reply_markup=kb):
+        u = users_db.get(uid) or {}
+        t = text + (NEWBIE_MEET_LINE if not u.get("total_chats") else "")
+        if await safe_send(uid, t, reply_markup=kb):
             sent += 1
         await asyncio.sleep(0.05)  # ~20 повідомлень за секунду — в межах лімітів Telegram
     meet_hour["sent"] = sent
@@ -1593,10 +1621,12 @@ async def game_td_pick(call: types.CallbackQuery):
     st = game_state.setdefault(key, {})
     used = st.setdefault("td_used", set())
     truth = call.data == "td_t"
-    pool = TRUTHS if truth else DARES
-    choices = [i for i in range(len(pool)) if (truth, i) not in used] or list(range(len(pool)))
+    spooky = halloween_active() and random.random() < 0.5  # 🎃 на Хелловін — половина завдань страшні
+    pool = (SPOOKY_TRUTHS if truth else SPOOKY_DARES) if spooky else (TRUTHS if truth else DARES)
+    kind = ("s" if spooky else "") + ("t" if truth else "d")
+    choices = [i for i in range(len(pool)) if (kind, i) not in used] or list(range(len(pool)))
     i = random.choice(choices)
-    used.add((truth, i))
+    used.add((kind, i))
     await call.answer()
     head = "😇 <b>Правда</b>" if truth else "😈 <b>Дія</b>"
     await safe_send(call.from_user.id, f"{head} — твоє завдання:\n\n{pool[i]}", reply_markup=td_kb())
