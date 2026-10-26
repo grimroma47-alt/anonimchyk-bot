@@ -510,6 +510,7 @@ def task_event(user_id: int, event: str, n: int = 1):
 
 
 def on_chat_started(a: int, b: int, mode: str):
+    asyncio.create_task(chat_log.start_chat(a, b, mode))
     hw_mark_badge(a, b)
     now = time.time()
     for x in (a, b):
@@ -597,6 +598,7 @@ async def founders_cmd(message: types.Message):
 
 
 def on_chat_ended(a: int, b: int):
+    asyncio.create_task(chat_log.end_chat(a, b))
     try:
         ma, mb = chat_meta.pop(a, None), chat_meta.pop(b, None)
         if ma is None or mb is None:
