@@ -1641,7 +1641,9 @@ def hw_text() -> str:
         "🎃 <b>Тиждень Хелловіну в ANONimchyk</b> · до 1 листопада\n\n"
         "👻 Маски голосу <b>«Привид»</b> і <b>«Демон»</b> — безкоштовно для всіх: /voice\n"
         "🎁 Лімітовані подарунки 🎃 Гарбуз · 🦇 Кажан · 👻 Привид — тільки цього тижня\n"
-        "🎲 «Страшна правда чи дія» — у грі під час чату\n\n"
+        "🎲 «Страшна правда чи дія» — у грі під час чату\n"
+        f"🎃 <b>Полювання на гарбузи</b>: після кожного справжнього чату є шанс знайти гарбуз. "
+        f"Збери {HW_PUMPKINS_NEED} — отримаєш Premium на добу!\n\n"
         f"🌙 <b>{HW_NIGHT.day}.{HW_NIGHT.month:02d} · {HW_NIGHT.hour}:00 — Ніч страшилок!</b> "
         "Заходь, розкажи страшну історію анонімно. Усі, хто поспілкується "
         f"{HW_NIGHT.day} жовтня, отримають значок 🎃 у профілі назавжди."
@@ -1679,6 +1681,34 @@ def hw_mark_badge(*uids: int):
         u = users_db.get(x)
         if u is not None and not u.get("hw2026"):
             u["hw2026"] = True
+
+
+HW_PUMPKINS_NEED = 3
+HW_PUMPKIN_CHANCE = float(os.getenv("HW_PUMPKIN_CHANCE", "0.35"))
+HW_PUMPKIN_PREMIUM_MAX = 2  # скільки разів за Хелловін можна виграти Premium гарбузами
+
+
+async def hw_pumpkin_roll(user_id: int):
+    u = users_db.get(user_id)
+    if u is None or u.get("hw_prem_got", 0) >= HW_PUMPKIN_PREMIUM_MAX or random.random() > HW_PUMPKIN_CHANCE:
+        return
+    n = u.get("hw_pumpkins", 0) + 1
+    if n >= HW_PUMPKINS_NEED:
+        u["hw_pumpkins"] = 0
+        u["hw_prem_got"] = u.get("hw_prem_got", 0) + 1
+        current = u["perks"].get("premium", 0)
+        if current != float("inf"):
+            u["perks"]["premium"] = max(time.time(), current) + DAY
+        request_save()
+        await safe_send(user_id, "🎃🎃🎃 <b>Три гарбузи!</b> Premium на добу вже активовано — фільтри й усі маски голосу твої 💜")
+        return
+    u["hw_pumpkins"] = n
+    request_save()
+    await safe_send(
+        user_id,
+        f"🎃 Ти знайшов(-ла) гарбуз! <b>{n}/{HW_PUMPKINS_NEED}</b>\n"
+        f"Збери {HW_PUMPKINS_NEED} — і отримаєш Premium на добу. Гарбузи ховаються в справжніх розмовах 😉",
+    )
 
 
 async def hw_night_tick():
@@ -1767,7 +1797,6 @@ async def relay_edit(message: types.Message):
 # ---------------------------------------------------------------------------
 @dp.message()
 async def relay_messages(message: types.Message):
-    await chat_log.log_message(message, user_id, partner_id)
     user_id = message.from_user.id
 
     room_id = user_room.get(user_id)
@@ -1925,7 +1954,6 @@ async def main():
     runner = await start_web_server()
     # Дані з бази завантажуємо ДО того, як бот почне приймати повідомлення.
     await load_state_from_db()
-    await chat_log.start()
     poll_task = asyncio.create_task(crypto_poll_loop())
     save_task = asyncio.create_task(persistence_loop())
     lease_task = asyncio.create_task(lease_heartbeat_loop())
