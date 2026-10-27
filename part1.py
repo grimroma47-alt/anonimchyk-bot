@@ -12,7 +12,7 @@ from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
 
 import aiohttp
-from aiogram import Bot, Dispatcher,from chat_logger import InMemoryChatLogger, build_admin_router, F, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
@@ -47,8 +47,6 @@ USD_UAH_RATE = float(os.getenv("USD_UAH_RATE", "41"))
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
-    chat_log = InMemoryChatLogger(ADMIN_ID)
-dp.include_router(build_admin_router(chat_log, ADMIN_ID))
 # Бот працює лише в особистих чатах: у групах і каналах, куди його додали адміном, він мовчить
 dp.message.filter(F.chat.type == "private")
 dp.callback_query.filter(F.message.chat.type == "private")
@@ -1094,8 +1092,7 @@ def get_admin_keyboard():
                 InlineKeyboardButton(text="💰 Топ балансів", callback_data="adm_topbal"),
             ],
             [InlineKeyboardButton(text="🎰 Обнулити рулетку", callback_data="adm_roul_reset")],
-        [InlineKeyboardButton(text="💬 Чати",callback_data="adm_chats"]),
-        
+        ]
     )
 
 
@@ -1435,6 +1432,8 @@ async def send_post_chat_menu(chat_id: int, partner_id: int):
     """Пропонує оцінити співрозмовника й за бажанням надіслати запит на реконект."""
     pending_rating[chat_id] = partner_id  # оцінити можна лише останнього співрозмовника і лише раз
     pending_top[chat_id] = last_chat_seconds.pop(chat_id, 0.0) >= TOP_MIN_CHAT_SECONDS
+    if pending_top[chat_id] and halloween_active():
+        await hw_pumpkin_roll(chat_id)  # 🎃 полювання на гарбузи — лише за справжні чати
     compat = compat_last.pop(chat_id, None)
     if compat:
         await safe_send(chat_id, compat)
