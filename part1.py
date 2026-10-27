@@ -10,6 +10,7 @@ import re
 import time
 from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, types
@@ -1089,6 +1090,7 @@ def get_admin_keyboard():
             [InlineKeyboardButton(text="📣 Реклама в пошуку", callback_data="adm_ads")],
             [InlineKeyboardButton(text="🏦 Оплати на перевірці", callback_data="adm_payments")],
             [InlineKeyboardButton(text="🖼 Банери", callback_data="adm_banners")],
+            [InlineKeyboardButton(text="💬 Чати", callback_data="chatlog:list:0")],
             [
                 InlineKeyboardButton(text="💸 Виводи", callback_data="adm_wd"),
                 InlineKeyboardButton(text="💰 Топ балансів", callback_data="adm_topbal"),

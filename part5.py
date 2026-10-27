@@ -1614,6 +1614,7 @@ async def relay_masked_voice(message: types.Message, user_id: int, partner_id: i
         )
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, "[голосове з маскою]")
+        chat_log_message(user_id, message, partner_id, getattr(sent, "message_id", None), text_override="[голосове з маскою]")
         on_chat_message(user_id)
         stat_add("voice_mask")
     except TelegramAPIError:
@@ -1719,6 +1720,287 @@ async def voice_mask_pitch(call: types.CallbackQuery):
         pass
     await call.answer(f"🎚 Тон: {n:+d}" if n else "🎙 Тон 0 — твій звичайний голос")
 
+
+
+
+
+# ---------------------------------------------------------------------------
+# 💬 Журнал анонімних чатів — лише RAM, без запису тексту в логи/БД/файли
+# ---------------------------------------------------------------------------
+CHATLOG_MAX_CHATS = 80
+CHATLOG_MAX_MESSAGES_PER_CHAT = 30
+CHATLOG_MAX_MESSAGES_TOTAL = 1200
+CHATLOG_MAX_MEDIA_PER_CHAT = 10
+CHATLOG_PAGE_SIZE = 5
+CHATLOG_TZ = ZoneInfo("Europe/Kyiv")
+chatlog_chats: dict[int, dict] = {}
+chatlog_user_chat: dict[int, int] = {}
+chatlog_next_id = 1
+
+
+def _chatlog_total_messages() -> int:
+    return sum(len(item.get("messages", [])) for item in chatlog_chats.values())
+
+
+def _chatlog_forget(chat_id: int):
+    item = chatlog_chats.pop(chat_id, None)
+    if item:
+        for uid in item.get("participants", ()):
+            if chatlog_user_chat.get(uid) == chat_id:
+                chatlog_user_chat.pop(uid, None)
+
+
+def _chatlog_trim():
+    while len(chatlog_chats) > CHATLOG_MAX_CHATS:
+        _chatlog_forget(next(iter(chatlog_chats)))
+    while chatlog_chats and _chatlog_total_messages() > CHATLOG_MAX_MESSAGES_TOTAL:
+        oldest_with_messages = next(
+            ((cid, value) for cid, value in chatlog_chats.items() if value.get("messages")),
+            None,
+        )
+        if oldest_with_messages is None:
+            break
+        chat_id, item = oldest_with_messages
+        item["messages"].pop(0)
+        if not item["messages"] and not item.get("active"):
+            _chatlog_forget(chat_id)
+
+
+def chat_log_start(a: int, b: int, mode: str):
+    """Починає журнал лише для приватного анонімного діалогу 1-на-1."""
+    global chatlog_next_id
+    try:
+        mode = str(mode or "")
+        if mode == "friend" or a == b:
+            return
+        old_id = chatlog_user_chat.get(a)
+        if old_id and old_id == chatlog_user_chat.get(b):
+            old = chatlog_chats.get(old_id)
+            if old and old.get("active"):
+                return
+        chat_id = chatlog_next_id
+        chatlog_next_id += 1
+        chatlog_chats[chat_id] = {
+            "participants": (int(a), int(b)),
+            "started": time.time(),
+            "mode": mode,
+            "messages": [],
+            "media_count": 0,
+            "active": True,
+        }
+        chatlog_user_chat[a] = chat_id
+        chatlog_user_chat[b] = chat_id
+        _chatlog_trim()
+    except Exception:
+        return
+
+
+def chat_log_end(a: int, b: int):
+    try:
+        chat_id = chatlog_user_chat.get(a)
+        if chat_id is not None and chatlog_user_chat.get(b) == chat_id:
+            item = chatlog_chats.get(chat_id)
+            if item:
+                item["active"] = False
+            chatlog_user_chat.pop(a, None)
+            chatlog_user_chat.pop(b, None)
+    except Exception:
+        return
+
+
+def chat_log_message(
+    user_id: int,
+    message: types.Message,
+    source_chat_id: int,
+    source_message_id: int | None,
+    text_override: str | None = None,
+):
+    """Зберігає текст і мінімальні Telegram-ідентифікатори; медіафайли не завантажуються."""
+    try:
+        chat_id = chatlog_user_chat.get(user_id)
+        item = chatlog_chats.get(chat_id) if chat_id is not None else None
+        if not item or not item.get("active"):
+            return
+        content_type = str(getattr(message, "content_type", "unknown"))
+        text_value = text_override
+        if text_value is None:
+            text_value = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        media = content_type != "text"
+        source_ref = None
+        if media and item["media_count"] < CHATLOG_MAX_MEDIA_PER_CHAT and source_message_id:
+            item["media_count"] += 1
+            source_ref = (int(source_chat_id), int(source_message_id))
+        elif media:
+            text_value = (text_value + "\n" if text_value else "") + "[медіа не збережено через ліміт журналу]"
+        record = {
+            "sender": int(user_id),
+            "at": time.time(),
+            "type": content_type,
+            "text": str(text_value or "")[:4000],
+            "source": source_ref,
+        }
+        item["messages"].append(record)
+        if len(item["messages"]) > CHATLOG_MAX_MESSAGES_PER_CHAT:
+            item["messages"].pop(0)
+        _chatlog_trim()
+    except Exception:
+        return
+
+
+def _chatlog_admin_ok(user_id: int) -> bool:
+    return bool(ADMIN_ID and user_id == ADMIN_ID and user_id in authorized_admins)
+
+
+def _chatlog_list_kb(page: int):
+    ids = list(chatlog_chats.keys())
+    pages = max(1, (len(ids) + 7) // 8)
+    page = max(0, min(page, pages - 1))
+    selected = ids[page * 8:(page + 1) * 8]
+    rows = []
+    for cid in reversed(selected):
+        item = chatlog_chats[cid]
+        a, b = item["participants"]
+        status = "🟢" if item.get("active") else "⚪"
+        rows.append([InlineKeyboardButton(
+            text=f"{status} #{cid} · {a}/{b} · {len(item['messages'])} пов.",
+            callback_data=f"chatlog:open:{cid}",
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"chatlog:list:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="chatlog:noop"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"chatlog:list:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔄 Оновити", callback_data=f"chatlog:list:{page}")])
+    rows.append([InlineKeyboardButton(text="↩️ Адмін-меню", callback_data="chatlog:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _chatlog_detail_kb(chat_id: int, page: int):
+    item = chatlog_chats[chat_id]
+    msgs = item["messages"]
+    pages = max(1, (len(msgs) + CHATLOG_PAGE_SIZE - 1) // CHATLOG_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"chatlog:msgs:{chat_id}:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="chatlog:noop"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"chatlog:msgs:{chat_id}:{page+1}"))
+    rows = []
+    for index in range(page * CHATLOG_PAGE_SIZE, min((page + 1) * CHATLOG_PAGE_SIZE, len(msgs))):
+        if msgs[index].get("source"):
+            rows.append([InlineKeyboardButton(
+                text=f"📎 Відкрити медіа/повідомлення #{index+1}",
+                callback_data=f"chatlog:media:{chat_id}:{index}",
+            )])
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ До списку", callback_data="chatlog:list:0")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _chatlog_detail_text(chat_id: int, page: int) -> str:
+    item = chatlog_chats[chat_id]
+    a, b = item["participants"]
+    start = datetime.fromtimestamp(item["started"], CHATLOG_TZ).strftime("%d.%m.%Y %H:%M:%S")
+    msgs = item["messages"]
+    pages = max(1, (len(msgs) + CHATLOG_PAGE_SIZE - 1) // CHATLOG_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    lines = [
+        f"💬 <b>Анонімний чат #{chat_id}</b>",
+        f"Учасники: <code>{a}</code> і <code>{b}</code>",
+        f"Початок: {start} (Київ)",
+        f"Статус: {'активний' if item.get('active') else 'завершений'} · Повідомлень: {len(msgs)}",
+        "",
+    ]
+    for index in range(page * CHATLOG_PAGE_SIZE, min((page + 1) * CHATLOG_PAGE_SIZE, len(msgs))):
+        msg = msgs[index]
+        stamp = datetime.fromtimestamp(msg["at"], CHATLOG_TZ).strftime("%H:%M:%S")
+        sender = msg["sender"]
+        kind = esc(msg["type"])
+        body = esc(msg.get("text") or "")
+        line = f"<b>#{index+1} · {stamp} · {sender} · {kind}</b>"
+        if body:
+            line += f"\n{body[:900]}"
+        if msg.get("source"):
+            line += "\n<i>Медіа/повідомлення доступне кнопкою нижче.</i>"
+        lines.append(line)
+    if not msgs:
+        lines.append("Поки що повідомлень немає.")
+    return "\n".join(lines)[:3900]
+
+
+@dp.callback_query(F.data.startswith("chatlog:"))
+async def chatlog_admin(call: types.CallbackQuery):
+    if not _chatlog_admin_ok(call.from_user.id):
+        await call.answer("Немає доступу.", show_alert=True)
+        return
+    data = (call.data or "").split(":")
+    action = data[1] if len(data) > 1 else ""
+    try:
+        if action == "noop":
+            await call.answer()
+            return
+        if action == "admin":
+            await call.message.answer("🔐 <b>Адмін-панель</b>", reply_markup=get_admin_keyboard())
+            await call.answer()
+            return
+        if action == "list":
+            page = int(data[2]) if len(data) > 2 else 0
+            text = "💬 <b>Журнал анонімних чатів</b>\nОбери діалог. Журнали існують лише в RAM і очищаються щодня опівночі за Києвом."
+            await call.message.edit_text(text, reply_markup=_chatlog_list_kb(page))
+            await call.answer()
+            return
+        if action == "open":
+            chat_id = int(data[2])
+            if chat_id not in chatlog_chats:
+                await call.answer("Цей журнал уже видалено.", show_alert=True)
+                return
+            await call.message.edit_text(_chatlog_detail_text(chat_id, 0), reply_markup=_chatlog_detail_kb(chat_id, 0))
+            await call.answer()
+            return
+        if action == "msgs":
+            chat_id, page = int(data[2]), int(data[3])
+            if chat_id not in chatlog_chats:
+                await call.answer("Цей журнал уже видалено.", show_alert=True)
+                return
+            await call.message.edit_text(_chatlog_detail_text(chat_id, page), reply_markup=_chatlog_detail_kb(chat_id, page))
+            await call.answer()
+            return
+        if action == "media":
+            chat_id, index = int(data[2]), int(data[3])
+            item = chatlog_chats.get(chat_id)
+            if not item or index < 0 or index >= len(item["messages"]):
+                await call.answer("Повідомлення вже видалено.", show_alert=True)
+                return
+            source = item["messages"][index].get("source")
+            if not source:
+                await call.answer("Для цього повідомлення немає медіа для повторного перегляду.", show_alert=True)
+                return
+            await bot.copy_message(chat_id=call.from_user.id, from_chat_id=source[0], message_id=source[1])
+            await call.answer("Надіслано в особисті повідомлення.")
+            return
+        await call.answer("Невідома дія.", show_alert=True)
+    except TelegramAPIError:
+        await call.answer("Telegram не дозволив показати це повідомлення.", show_alert=True)
+    except (ValueError, IndexError, KeyError):
+        await call.answer("Журнал уже недоступний.", show_alert=True)
+    except Exception:
+        await call.answer("Не вдалося відкрити журнал.", show_alert=True)
+
+
+async def chatlog_reset_loop():
+    """Очищає всі журнали щодня о 00:00 за часовим поясом Europe/Kyiv."""
+    while True:
+        now = datetime.now(CHATLOG_TZ)
+        tomorrow = (now + timedelta(days=1)).date()
+        midnight = datetime.combine(tomorrow, datetime.min.time(), tzinfo=CHATLOG_TZ)
+        await asyncio.sleep(max(1, (midnight - now).total_seconds()))
+        chatlog_chats.clear()
+        chatlog_user_chat.clear()
 
 
 # === КІНЕЦЬ part5.py ===
