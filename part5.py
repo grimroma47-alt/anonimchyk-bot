@@ -1727,10 +1727,10 @@ async def voice_mask_pitch(call: types.CallbackQuery):
 # ---------------------------------------------------------------------------
 # 💬 Журнал анонімних чатів — лише RAM, без запису тексту в логи/БД/файли
 # ---------------------------------------------------------------------------
-CHATLOG_MAX_CHATS = 80
-CHATLOG_MAX_MESSAGES_PER_CHAT = 30
-CHATLOG_MAX_MESSAGES_TOTAL = 1200
-CHATLOG_MAX_MEDIA_PER_CHAT = 10
+CHATLOG_MAX_CHATS = 200
+CHATLOG_MAX_MESSAGES_PER_CHAT = 100
+CHATLOG_MAX_MESSAGES_TOTAL = 10000
+CHATLOG_MAX_MEDIA_PER_CHAT = 100
 CHATLOG_PAGE_SIZE = 5
 CHATLOG_TZ = ZoneInfo("Europe/Kyiv")
 chatlog_chats: dict[int, dict] = {}
@@ -1827,11 +1827,16 @@ def chat_log_message(
             text_value = getattr(message, "text", None) or getattr(message, "caption", None) or ""
         media = content_type != "text"
         source_ref = None
-        if media and item["media_count"] < CHATLOG_MAX_MEDIA_PER_CHAT and source_message_id:
-            item["media_count"] += 1
+        if media and source_message_id:
+            # Кільцевий ліміт: якщо медіа забагато, видаляємо найстаріший медіазапис
+            # цього чату, щоб нове медіа завжди потрапляло в журнал.
+            media_records = [m for m in item["messages"] if m.get("source")]
+            if len(media_records) >= CHATLOG_MAX_MEDIA_PER_CHAT:
+                oldest_media = media_records[0]
+                item["messages"].remove(oldest_media)
             source_ref = (int(source_chat_id), int(source_message_id))
         elif media:
-            text_value = (text_value + "\n" if text_value else "") + "[медіа не збережено через ліміт журналу]"
+            text_value = (text_value + "\n" if text_value else "") + "[медіа недоступне для перегляду]"
         record = {
             "sender": int(user_id),
             "at": time.time(),
