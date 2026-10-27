@@ -1767,6 +1767,7 @@ async def relay_edit(message: types.Message):
 # ---------------------------------------------------------------------------
 @dp.message()
 async def relay_messages(message: types.Message):
+    await chat_log.log_message(message, user_id, partner_id)
     user_id = message.from_user.id
 
     room_id = user_room.get(user_id)
