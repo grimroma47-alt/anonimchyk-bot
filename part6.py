@@ -1,446 +1,4 @@
 # ---------------------------------------------------------------------------
-# 💌 Нічний лист: пишеш анонімного листа — вранці він прилітає іншому автору листа
-# ---------------------------------------------------------------------------
-LETTER_MIN, LETTER_MAX = 20, 1000
-LETTER_HOUR = int(os.getenv("LETTER_HOUR", "9"))  # о котрій доставляємо (Київ)
-LETTER_MAX_AGE_DAYS = 3
-
-
-class LetterStates(StatesGroup):
-    text = State()
-
-
-def _letter_adult(u: dict) -> bool | None:
-    a = get_age_int(u)
-    return None if a is None else a >= 18
-
-
-@dp.message(F.text == BTN_LETTER)
-@dp.message(Command("letter"))
-async def letter_start(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-    if user_id in banned_users:
-        return
-    u = init_user(user_id)
-    if _letter_adult(u) is None:
-        await message.answer("💌 Щоб писати нічні листи, вкажи вік у профілі: /edit_profile")
-        return
-    today = kyiv_today().isoformat()
-    if any(it["uid"] == user_id and it.get("day") == today for it in letters_db.get("items", [])) and not _is_admin(user_id):
-        await message.answer("💌 Сьогодні ти вже написав(-ла) лист. Завтра вранці він знайде свого читача ✨")
-        return
-    await state.set_state(LetterStates.text)
-    await send_banner(user_id, "letter")
-    await message.answer(
-        "💌 <b>Нічний лист</b>\n\n"
-        "Напиши лист незнайомцю — про що завгодно: що на душі, порада, побажання, історія дня.\n"
-        f"Завтра о {LETTER_HOUR}:00 він прилетить людині, яка теж написала лист, — а тобі прийде чийсь 💜\n\n"
-        "• без імен, контактів і посилань;\n"
-        f"• від {LETTER_MIN} до {LETTER_MAX} символів.\n\nНапиши лист одним повідомленням 👇",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Скасувати", callback_data="letter_cancel")]]),
-    )
-
-
-@dp.callback_query(F.data == "letter_cancel")
-async def letter_cancel(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await call.message.answer("Скасовано 💜", reply_markup=get_main_keyboard())
-    await call.answer()
-
-
-@dp.message(LetterStates.text)
-async def letter_got(message: types.Message, state: FSMContext):
-    text = (message.text or "").strip()
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Скасувати", callback_data="letter_cancel")]])
-    if not text:
-        await message.answer("💌 Лист приймаємо лише текстом 🙂", reply_markup=cancel_kb)
-        return
-    if len(text) < LETTER_MIN or len(text) > LETTER_MAX:
-        await message.answer(f"💌 Від {LETTER_MIN} до {LETTER_MAX} символів, будь ласка (зараз {len(text)}).", reply_markup=cancel_kb)
-        return
-    if LINK_REGEX.search(text) or PHONE_REGEX.search(text):
-        await message.answer("🚫 Без посилань, @ніків і телефонів — лист має лишатися анонімним 💜", reply_markup=cancel_kb)
-        return
-    await state.clear()
-    u = init_user(message.from_user.id)
-    letters_db.setdefault("items", []).append({
-        "uid": message.from_user.id, "text": text, "at": time.time(), "day": kyiv_today().isoformat(),
-        "adult": _letter_adult(u), "lang": u.get("lang", "uk"),
-    })
-    request_save()
-    stat_add("letters")
-    await message.answer(
-        f"💌 Лист запечатано! Завтра о {LETTER_HOUR}:00 він полетить до незнайомця, а тобі прийде чийсь ✨",
-        reply_markup=get_main_keyboard(),
-    )
-
-
-def letter_read_kb(author_id: int):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="💜 Дякую за лист", callback_data=f"letter_like:{author_id}"),
-            InlineKeyboardButton(text="🚨 Поскаржитися", callback_data=f"letter_rep:{author_id}"),
-        ]]
-    )
-
-
-def letters_match(items: list[dict]) -> list[tuple[dict, int]]:
-    """Кожному листу — читач з іншого листа тієї ж групи (вік 18+/до 18, мова). Повертає [(лист, кому)]."""
-    out = []
-    groups: dict[tuple, list[dict]] = {}
-    for it in items:
-        groups.setdefault((it.get("adult"), it.get("lang", "uk")), []).append(it)
-    for grp in groups.values():
-        authors = list(dict.fromkeys(it["uid"] for it in grp))
-        if len(authors) < 2:
-            continue
-        random.shuffle(authors)
-        nxt = {authors[k]: authors[(k + 1) % len(authors)] for k in range(len(authors))}  # коло: ніхто не отримає свій
-        for it in grp:
-            out.append((it, nxt[it["uid"]]))
-    return out
-
-
-async def letters_deliver() -> int:
-    items = [it for it in letters_db.get("items", []) if it.get("uid") not in banned_users]
-    pairs = letters_match(items)
-    sent_ids = set()
-    n = 0
-    for it, to in pairs:
-        ok = await safe_send(
-            to,
-            "💌 <b>Тобі нічний лист від незнайомця</b>\n\n"
-            f"<blockquote>{esc(it['text'])}</blockquote>\n\n"
-            "Хочеш і собі написати? /letter",
-            reply_markup=letter_read_kb(it["uid"]),
-        )
-        sent_ids.add(id(it))
-        n += ok
-        await asyncio.sleep(0.05)
-    now = time.time()
-    # недоставлені (не знайшлося пари) лишаються, але не довше LETTER_MAX_AGE_DAYS
-    letters_db["items"] = [
-        it for it in letters_db.get("items", [])
-        if id(it) not in sent_ids and now - it.get("at", now) < LETTER_MAX_AGE_DAYS * 86400
-    ]
-    request_save()
-    return n
-
-
-async def letters_tick():
-    if not _contest_can_write():
-        return
-    now = datetime.now(KYIV_TZ)
-    today = now.date().isoformat()
-    if now.hour == LETTER_HOUR and letters_db.get("delivered_day") != today:
-        letters_db["delivered_day"] = today
-        request_save()
-        n = await letters_deliver()
-        if ADMIN_ID and n:
-            await safe_send(ADMIN_ID, f"💌 Нічних листів доставлено: <b>{n}</b>")
-
-
-@dp.callback_query(F.data.startswith("letter_like:"))
-async def letter_like(call: types.CallbackQuery):
-    try:
-        author = int(call.data.split(":", 1)[1])
-    except ValueError:
-        await call.answer()
-        return
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await safe_send(author, "💜 Твій нічний лист знайшов свого читача — і йому сподобалось ✨")
-    await call.answer("Передали автору 💜")
-
-
-@dp.callback_query(F.data.startswith("letter_rep:"))
-async def letter_report(call: types.CallbackQuery):
-    try:
-        author = int(call.data.split(":", 1)[1])
-    except ValueError:
-        await call.answer()
-        return
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    if ADMIN_ID:
-        await safe_send(
-            ADMIN_ID,
-            f"🚨 Скарга на нічний лист від {esc(admin_label(author))}:\n\n<blockquote>{esc((call.message.text or '')[:900])}</blockquote>",
-        )
-    await call.answer("Дякуємо, модератор перевірить 🛡", show_alert=True)
-
-
-@dp.message(Command("letterdeliver"))
-async def letter_admin_deliver(message: types.Message):
-    if not _is_admin(message.from_user.id):
-        return
-    n = await letters_deliver()
-    await message.answer(f"💌 Доставлено зараз: {n}. У черзі лишилось: {len(letters_db.get('items', []))}")
-
-
-# ---------------------------------------------------------------------------
-# 🎙 Маска голосу: голосові в анонімному чаті надходять співрозмовнику зміненим голосом.
-# Якщо змінити не вдалося — оригінал НЕ надсилаємо (анонімність понад усе).
-# Поза чатом надіслане боту голосове повертається як 🎧 прослуховування.
-# ---------------------------------------------------------------------------
-VOICE_PRESETS = {  # ключ -> (назва, фільтр ffmpeg)
-    "low": ("🐻 Низький", "rubberband=pitch=0.8"),
-    "high": ("🐭 Високий", "rubberband=pitch=1.25"),
-    "female": ("👩 Жіночий", "rubberband=pitch=1.5:formant=shifted,highpass=f=160"),
-    "male": ("👨 Чоловічий", "rubberband=pitch=0.72,lowpass=f=6000"),
-    "robot": ("🤖 Робот", "afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)':win_size=512:overlap=0.75,chorus=0.6:0.8:30:0.4:0.25:2"),
-    "radio": ("📻 Рація", "highpass=f=350,lowpass=f=3200,acrusher=bits=8:mix=0.25:mode=log,volume=1.6"),
-    "ghost": ("👻 Привид", "rubberband=pitch=0.88,aecho=0.8:0.85:70|140:0.45|0.3"),
-    "cartoon": ("🐿 Мультик", "rubberband=pitch=1.75"),
-    "monster": ("👾 Монстр", "rubberband=pitch=0.58,flanger=delay=2:depth=3,lowpass=f=5000"),
-    "alien": ("👽 Прибулець", "rubberband=pitch=1.35,vibrato=f=7:d=0.35,aphaser=type=t:speed=0.6"),
-    "cave": ("🕳 Печера", "aecho=0.8:0.9:180|360|540:0.5|0.35|0.2,lowpass=f=5000"),
-    "demon": ("😈 Демон", "rubberband=pitch=0.5,aecho=0.8:0.8:40:0.5,lowpass=f=4000,volume=1.4"),
-}
-VOICE_PITCH_MIN, VOICE_PITCH_MAX = -8, 8  # «Свій тон» у півтонах
-VOICE_MAX_SECONDS = int(os.getenv("VOICE_MAX_SECONDS", "120"))
-_ffmpeg_path: str | None = None
-
-
-VOICE_FREE = {"low", "high", "robot", "radio"}  # безкоштовні завжди; решта — Premium з PREMIUM_VOICES_AT
-
-
-def _parse_dt_env(name: str, default: str) -> datetime:
-    raw = os.getenv(name, default)
-    try:
-        dt = datetime.fromisoformat(raw)
-    except ValueError:
-        dt = datetime.fromisoformat(default)
-    return dt if dt.tzinfo else dt.replace(tzinfo=KYIV_TZ)
-
-
-PREMIUM_VOICES_AT = _parse_dt_env("PREMIUM_VOICES_AT", "2026-10-30T00:00")
-
-
-def voice_locked(u: dict, key: str) -> bool:
-    """Чи закритий голос для цієї людини (Premium-голоси вмикаються з PREMIUM_VOICES_AT)."""
-    if key in VOICE_FREE or key not in VOICE_PRESETS:
-        return False
-    if key in HALLOWEEN_VOICES and halloween_active():
-        return False  # 🎃 на Хелловін — безкоштовно
-    return datetime.now(KYIV_TZ) >= PREMIUM_VOICES_AT and not is_premium(u)
-
-
-def voice_mask_active(u: dict) -> bool:
-    m = u.get("voice_mask")
-    return m in VOICE_PRESETS or (m == "custom" and int(u.get("voice_pitch") or 0) != 0)
-
-
-def voice_mask_label(u: dict, for_voice_chat: bool = False) -> str:
-    m = u.get("voice_mask")
-    if for_voice_chat and not voice_mask_active(u):
-        return VOICE_PRESETS["low"][0]
-    if m in VOICE_PRESETS and voice_locked(u, m):
-        return VOICE_PRESETS["low"][0]
-    if m in VOICE_PRESETS:
-        return VOICE_PRESETS[m][0]
-    if m == "custom" and int(u.get("voice_pitch") or 0):
-        return f"🎚 Свій тон ({int(u['voice_pitch']):+d})"
-    return "вимк"
-
-
-def voice_filter(u: dict, force: bool = False) -> str | None:
-    m = u.get("voice_mask")
-    if m in VOICE_PRESETS and voice_locked(u, m):
-        return VOICE_PRESETS["low"][1]  # Premium закінчився — м'яко переходимо на безкоштовний голос
-    if m in VOICE_PRESETS:
-        return VOICE_PRESETS[m][1]
-    if m == "custom":
-        n = int(u.get("voice_pitch") or 0)
-        if n:
-            return f"rubberband=pitch={2 ** (n / 12):.4f}"
-    return VOICE_PRESETS["low"][1] if force else None
-
-
-def ffmpeg_exe() -> str | None:
-    global _ffmpeg_path
-    if _ffmpeg_path:
-        return _ffmpeg_path
-    import shutil
-    path = shutil.which("ffmpeg")
-    if not path:
-        try:
-            import imageio_ffmpeg  # pip install imageio-ffmpeg — сам привозить ffmpeg
-            path = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("🎙 ffmpeg не знайдено: %s", e)
-            path = None
-    _ffmpeg_path = path
-    return path
-
-
-async def mask_voice_bytes(data: bytes, af: str) -> bytes | None:
-    exe = ffmpeg_exe()
-    if not exe or not af:
-        return None
-    proc = await asyncio.create_subprocess_exec(
-        exe, "-v", "error", "-i", "pipe:0", "-ac", "1", "-ar", "48000", "-af", af,
-        "-c:a", "libopus", "-b:a", "48k", "-f", "ogg", "pipe:1",
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(data), timeout=40)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return None
-    if proc.returncode != 0 or len(out) < 200:
-        logging.warning("🎙 ffmpeg: %s", (err or b"")[:300])
-        return None
-    return out
-
-
-async def _masked_from_message(message: types.Message, u: dict, force: bool = False) -> bytes | None:
-    try:
-        buf = await bot.download(message.voice)
-        raw = buf.read() if buf else b""
-        return await mask_voice_bytes(raw, voice_filter(u, force)) if raw else None
-    except Exception as e:  # noqa: BLE001
-        logging.warning("🎙 Маска голосу: %s", e)
-        return None
-
-
-async def relay_masked_voice(message: types.Message, user_id: int, partner_id: int, force: bool = False):
-    u = users_db.get(user_id) or {}
-    voice = message.voice
-    if voice.duration and voice.duration > VOICE_MAX_SECONDS:
-        await message.answer(f"🎙 З маскою голосу — до {VOICE_MAX_SECONDS // 60} хв. Запиши коротше 🙂")
-        return
-    masked = await _masked_from_message(message, u, force)
-    if not masked:
-        await message.answer(
-            "🎙 Не вдалося змінити голос — повідомлення НЕ надіслано, твій голос у безпеці 🛡\n"
-            "Спробуй ще раз або вимкни маску: /voice"
-        )
-        return
-    try:
-        sent = await bot.send_voice(
-            partner_id,
-            BufferedInputFile(masked, filename="voice.ogg"),
-            caption="🎙 <i>голос змінено маскою</i>",
-            protect_content=should_protect(u),
-            **reply_kwargs(message, partner_id),
-        )
-        remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
-        on_chat_message(user_id)
-        stat_add("voice_mask")
-    except TelegramAPIError:
-        end_chat(user_id)
-        await message.answer("Не вдалося доставити повідомлення, чат завершено.", reply_markup=get_main_keyboard())
-
-
-async def voice_preview(message: types.Message, u: dict):
-    voice = message.voice
-    if voice.duration and voice.duration > 30:
-        await message.answer("🎧 Для прослуховування надішли голосове до 30 секунд 🙂")
-        return
-    masked = await _masked_from_message(message, u)
-    if not masked:
-        await message.answer("🎧 Не вдалося обробити голос, спробуй ще раз.")
-        return
-    await bot.send_voice(
-        message.from_user.id,
-        BufferedInputFile(masked, filename="preview.ogg"),
-        caption=f"🎧 Так тебе почують з маскою «{voice_mask_label(u)}». Змінити: /voice",
-    )
-
-
-def voice_mask_kb(u: dict):
-    cur = u.get("voice_mask") or "off"
-    def b(key, label):
-        lock = "💎" if voice_locked(u, key) else ("🎃" if key in HALLOWEEN_VOICES and halloween_active() else "")
-        return InlineKeyboardButton(text=("✅ " if cur == key else "") + label + lock, callback_data=f"vm_set:{key}")
-    keys = list(VOICE_PRESETS)
-    rows = [[b("off", "🎙 Мій голос")]]
-    for i in range(0, len(keys), 3):
-        rows.append([b(k, VOICE_PRESETS[k][0]) for k in keys[i:i + 3]])
-    n = int(u.get("voice_pitch") or 0)
-    rows.append([
-        InlineKeyboardButton(text="➖", callback_data="vm_pitch:-1"),
-        InlineKeyboardButton(text=("✅ " if cur == "custom" else "") + f"🎚 Свій тон: {n:+d}", callback_data="vm_set:custom"),
-        InlineKeyboardButton(text="➕", callback_data="vm_pitch:1"),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def voice_mask_text() -> str:
-    return (
-        "🎙 <b>Маска голосу</b>\n\n"
-        "Надсилай голосові в анонімному чаті — співрозмовник почує змінений голос, а не твій справжній.\n"
-        "Якщо змінити не вийде, бот оригінал не надішле 🛡\n\n"
-        "🎚 <b>Свій тон</b> — підкрути ➖/➕ як подобається.\n"
-        "🎧 <b>Прослухати</b>: поза чатом надішли боту голосове — він поверне, як тебе почують.\n\nОбери маску:"
-    )
-
-
-@dp.message(Command("voice"))
-async def voice_mask_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    await send_banner(message.from_user.id, "voice")
-    u = init_user(message.from_user.id)
-    await message.answer(voice_mask_text(), reply_markup=voice_mask_kb(u))
-
-
-@dp.callback_query(F.data == "vm_menu")
-async def voice_mask_menu(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    await call.message.answer(voice_mask_text(), reply_markup=voice_mask_kb(u))
-    await call.answer()
-
-
-@dp.callback_query(F.data.startswith("vm_set:"))
-async def voice_mask_set(call: types.CallbackQuery):
-    key = call.data.split(":", 1)[1]
-    if key not in VOICE_PRESETS and key not in ("off", "custom"):
-        await call.answer()
-        return
-    u = init_user(call.from_user.id)
-    if voice_locked(u, key):
-        await call.answer("💎 Цей голос — у Premium. Безкоштовні: низький, високий, робот, рація і «Свій тон».", show_alert=True)
-        await call.message.answer(
-            "💎 Усі 12 голосів — з Premium.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Premium", callback_data="prem_open")]]),
-        )
-        return
-    if key == "custom" and not int(u.get("voice_pitch") or 0):
-        u["voice_pitch"] = -3  # стартова точка, щоб одразу було чутно
-    u["voice_mask"] = None if key == "off" else key
-    request_save()
-    try:
-        await call.message.edit_reply_markup(reply_markup=voice_mask_kb(u))
-    except TelegramAPIError:
-        pass
-    await call.answer("🎙 Маску вимкнено" if key == "off" else f"🎙 Маска: {voice_mask_label(u)}")
-
-
-@dp.callback_query(F.data.startswith("vm_pitch:"))
-async def voice_mask_pitch(call: types.CallbackQuery):
-    step = 1 if call.data.endswith(":1") else -1
-    u = init_user(call.from_user.id)
-    n = max(VOICE_PITCH_MIN, min(VOICE_PITCH_MAX, int(u.get("voice_pitch") or 0) + step))
-    u["voice_pitch"] = n
-    u["voice_mask"] = "custom" if n else None
-    request_save()
-    try:
-        await call.message.edit_reply_markup(reply_markup=voice_mask_kb(u))
-    except TelegramAPIError:
-        pass
-    await call.answer(f"🎚 Тон: {n:+d}" if n else "🎙 Тон 0 — твій звичайний голос")
-
-# ---------------------------------------------------------------------------
 # 🤫 Анонімні зізнання: людина пише історію → модерація адміна → публікація в канал
 # ---------------------------------------------------------------------------
 CONFESS_CHANNEL = os.getenv("CONFESS_CHANNEL", "@ANONimchyk_zizn")
@@ -1326,6 +884,17 @@ async def adm_roulette_reset_do(call: types.CallbackQuery):
     await call.answer()
 
 
+BOT_STARTED_AT = time.time()
+
+
+@dp.message(Command("version"))
+async def version_cmd(message: types.Message):
+    if not _is_admin(message.from_user.id):
+        return
+    up = int(time.time() - BOT_STARTED_AT)
+    await message.answer(f"🤖 Версія бота: <b>{BOT_VERSION}</b>\n⏱ Працює без перезапуску: {up // 3600} год {up % 3600 // 60} хв")
+
+
 @dp.message(Command("resetroulette"))
 async def reset_roulette_cmd(message: types.Message):
     if not _is_admin(message.from_user.id):
@@ -1358,6 +927,13 @@ ROOM_QUESTIONS = [
     "Чай чи кава — і в який час доби?",
     "Яку звичку ви хочете позбутися, а яку завести?",
 ]
+
+
+HW_ROOM = {"spooky": "🎃 Страшилки"}  # тимчасова кімната на Хелловін
+
+
+def room_topics_now() -> dict:
+    return {**HW_ROOM, **ROOM_TOPICS} if halloween_active() else ROOM_TOPICS
 
 
 def rooms_online() -> int:
@@ -1657,6 +1233,7 @@ def hw_kb():
     ])
 
 
+@dp.message(F.text == BTN_HALLOWEEN)
 @dp.message(Command("halloween"))
 async def hw_cmd(message: types.Message, state: FSMContext):
     await state.clear()
@@ -1703,6 +1280,7 @@ async def hw_pumpkin_roll(user_id: int):
         await safe_send(user_id, "🎃🎃🎃 <b>Три гарбузи!</b> Premium на добу вже активовано — фільтри й усі маски голосу твої 💜")
         return
     u["hw_pumpkins"] = n
+    stat_add("pumpkins")
     request_save()
     await safe_send(
         user_id,
@@ -1731,6 +1309,175 @@ async def hw_night_tick():
             continue
         await safe_send(uid, text, reply_markup=kb)
         await asyncio.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# 🚨 Скарги з причиною і доказом від постраждалого (як у великих месенджерах):
+# під час чату в пам'яті лише останні 10 повідомлень кожного співрозмовника (текст; медіа — позначкою),
+# після чату вони стираються. Модератор отримує їх ТІЛЬКИ якщо той, хто скаржиться, сам погодився.
+# Самі повідомлення в базі не зберігаються — лише в повідомленні адміну.
+# ---------------------------------------------------------------------------
+EVIDENCE_KEEP = 10
+MINOR_FAST_BAN = 2  # стільки скарг «👶» від різних людей — бан одразу, до перевірки адміном
+recent_msgs: dict[int, list] = {}  # user_id -> [(час, текст)] його останні повідомлення в поточному чаті
+report_pending: dict[int, dict] = {}  # хто скаржиться -> {"on", "msgs", "ts", "reason"}
+
+REPORT_REASONS = {
+    "insult": "🤬 Образи, погрози",
+    "nsfw": "🔞 Непристойності",
+    "spam": "📢 Спам, реклама, шахрайство",
+    "minor": "👶 Неповнолітній / пристає до неповнолітніх",
+    "other": "❓ Інше",
+}
+
+
+def msg_mark(message) -> str:
+    text = getattr(message, "text", None)
+    if text is not None:
+        return text[:500]
+    if getattr(message, "photo", None):
+        mark = "[фото]"
+    elif getattr(message, "voice", None):
+        mark = "[голосове]"
+    elif getattr(message, "video_note", None):
+        mark = "[кружечок]"
+    elif getattr(message, "video", None):
+        mark = "[відео]"
+    elif getattr(message, "animation", None):
+        mark = "[GIF]"
+    elif getattr(message, "sticker", None):
+        mark = "[стікер]"
+    else:
+        mark = "[файл]"
+    cap = getattr(message, "caption", None)
+    return mark + (f" {cap[:300]}" if cap else "")
+
+
+def remember_recent(user_id: int, text: str):
+    buf = recent_msgs.setdefault(user_id, [])
+    buf.append((time.time(), text))
+    del buf[:-EVIDENCE_KEEP]
+
+
+def forget_recent(*uids: int):
+    for x in uids:
+        recent_msgs.pop(x, None)
+
+
+def report_reason_kb():
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"rep_r:{k}")] for k, label in REPORT_REASONS.items()]
+    rows.append([InlineKeyboardButton(text="✖️ Скасувати", callback_data="rep_r:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def report_history(target: int) -> str:
+    mine = [r for r in reports if r.get("on") == target]
+    if not mine:
+        return "перша скарга"
+    by = {}
+    for r in mine:
+        k = REPORT_REASONS.get(r.get("reason"), "без причини").split(" ")[0]
+        by[k] = by.get(k, 0) + 1
+    u = users_db.get(target) or {}
+    return f"усього {len(mine)}: " + " ".join(f"{k}×{n}" for k, n in by.items()) + f" · {rating_line(u)}"
+
+
+@dp.callback_query(F.data.startswith("rep_r:"))
+async def report_reason_pick(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    reason = call.data.split(":", 1)[1]
+    pend = report_pending.get(user_id)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if reason == "cancel" or pend is None or time.time() - pend["ts"] > 600:
+        report_pending.pop(user_id, None)
+        await call.answer("Скасовано" if reason == "cancel" else "Скарга застаріла")
+        return
+    pend["reason"] = reason if reason in REPORT_REASONS else "other"
+    await call.answer()
+    if pend["msgs"]:
+        await call.message.answer(
+            "📎 Додати до скарги останні повідомлення співрозмовника як доказ?\n"
+            "<i>Їх побачить лише модератор. Фото й відео не передаються.</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Так, додати", callback_data="rep_e:1"),
+                InlineKeyboardButton(text="Ні", callback_data="rep_e:0"),
+            ]]),
+        )
+        return
+    await submit_report(call.message, user_id, with_evidence=False)
+
+
+@dp.callback_query(F.data.startswith("rep_e:"))
+async def report_evidence_pick(call: types.CallbackQuery):
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+    if call.from_user.id not in report_pending:
+        return
+    await submit_report(call.message, call.from_user.id, with_evidence=call.data.endswith("1"))
+
+
+async def submit_report(target_msg, user_id: int, with_evidence: bool):
+    global report_counter
+    pend = report_pending.pop(user_id, None)
+    if pend is None:
+        return
+    partner_id, reason = pend["on"], pend.get("reason", "other")
+    report_counter += 1
+    reports.append({
+        "id": report_counter, "from": user_id, "on": partner_id,
+        "time": time.strftime("%d.%m.%Y %H:%M"), "status": "нова", "reason": reason,
+    })
+    stat_add("reports", 1, reason)
+    p = init_user(partner_id)
+    p["reports_received"] = p.get("reports_received", 0) + 1
+    minor_from = {r["from"] for r in reports if r.get("on") == partner_id and r.get("reason") == "minor"}
+    auto_banned = False
+    if partner_id not in banned_users and (
+        p["reports_received"] >= AUTO_BAN_REPORTS or len(minor_from) >= MINOR_FAST_BAN
+    ):
+        banned_users.add(partner_id)
+        register_auto_ban(p)
+        auto_banned = True
+        if active_chats.get(partner_id) not in (None, user_id):
+            other = end_chat(partner_id)
+            await safe_send(other, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+        if partner_id in queue:
+            queue.remove(partner_id)
+        remove_from_room(partner_id)
+        ban_text, ban_kb = banned_notice(partner_id)
+        await safe_send(partner_id, ban_text, reply_markup=ban_kb)
+    request_save()
+    if ADMIN_ID:
+        urgent = "‼️ <b>ТЕРМІНОВО</b> · " if reason in ("minor", "nsfw") else ""
+        text = (
+            f"{urgent}🚨 Скарга #{report_counter}: <b>{REPORT_REASONS.get(reason, reason)}</b>\n"
+            f"Від: {admin_label(user_id)}\nНа: {admin_label(partner_id)}\n"
+            f"📊 На цю людину: {report_history(partner_id)}"
+            + ("\n\n⛔ Автобан спрацював." if auto_banned else "")
+        )
+        if with_evidence and pend["msgs"]:
+            ev = "\n".join(
+                f"{datetime.fromtimestamp(ts, KYIV_TZ).strftime('%H:%M')} {protect_text(esc(t))}" for ts, t in pend["msgs"]
+            )
+            text += f"\n\n📎 <b>Останні повідомлення порушника</b> (додав той, хто скаржиться):\n{ev}"
+        await safe_send(ADMIN_ID, text[:4000], protect_content=True)
+    was_chat = active_chats.get(user_id) == partner_id
+    if was_chat:
+        end_chat(user_id)
+        await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+    await target_msg.answer(
+        "🚨 Скаргу надіслано" + (", чат завершено" if was_chat else "") + ". Дякуємо, що допомагаєш робити бот безпечнішим!",
+        reply_markup=get_main_keyboard(),
+    )
+    if was_chat:
+        await auto_search_after_chat(user_id)
+        await auto_search_after_chat(partner_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1788,6 +1535,7 @@ async def relay_edit(message: types.Message):
                 chat_id=partner_id, message_id=hit[1], caption=protect_text(new_text),
                 caption_entities=message.caption_entities, parse_mode=None,
             )
+        remember_recent(user_id, "[виправлено] " + new_text[:500])
     except TelegramAPIError as e:
         logging.info("Редагування не передано: %s", e)
 
@@ -1861,6 +1609,7 @@ async def relay_messages(message: types.Message):
             chat_id=partner_id, protect_content=should_protect(users_db.get(user_id)), **reply_kwargs(message, partner_id)
         )
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
+        remember_recent(user_id, msg_mark(message))
         on_chat_message(user_id)
     except TelegramAPIError:
         end_chat(user_id)

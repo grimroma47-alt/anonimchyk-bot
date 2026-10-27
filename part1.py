@@ -36,6 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
+BOT_VERSION = "27.10-b"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -723,6 +724,7 @@ BTN_FUN = "✨ Розваги"
 BTN_BACK_CHAT = "💬 Ти в чаті — повернутися"
 BTN_SEARCHING = "⏳ Йде пошук · зупинити"
 BTN_MORE = "☰ Ще"
+BTN_HALLOWEEN = "🎃 Хелловін"
 BTN_MENU_BACK = "⬅️ Головне меню"
 BTN_BACK_ROOM = "👥 Ти в кімнаті — повернутися"
 BTN_FRIENDS = "👫 Друзі"
@@ -820,7 +822,7 @@ def get_more_keyboard():
             [K(text=BTN_FRIENDS), K(text=BTN_FILTERS)],
             [K(text=BTN_ONLINE), K(text=BTN_TOP), K(text=BTN_SETTINGS)],
             [K(text=BTN_HELP), K(text=BTN_MENU_BACK)],
-        ],
+        ] + ([[K(text=BTN_HALLOWEEN)]] if halloween_active() else []),
         resize_keyboard=True,
     )
 
@@ -847,7 +849,7 @@ def get_room_topics_keyboard():
                 callback_data=f"room_join_{key}",
             )
         ]
-        for key, title in ROOM_TOPICS.items()
+        for key, title in room_topics_now().items()
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1394,6 +1396,7 @@ def end_chat(user_id: int):
         unmask_requests.pop(partner_id, None)
         unmask_done.discard(frozenset((user_id, partner_id)))
         game_state.pop(frozenset((user_id, partner_id)), None)
+        forget_recent(user_id, partner_id)
         on_chat_ended(user_id, partner_id)
         if user_id in users_db:
             users_db[user_id]["last_partner_id"] = partner_id
@@ -1526,6 +1529,415 @@ async def crypto_poll_loop():
                     info["user_id"],
                     f"✅ Оплату {info['amount']} USDT отримано! Баланс поповнено на {info['credit']:.2f} грн.",
                 )
+
+
+# ---------------------------------------------------------------------------
+# База даних (Postgres): збереження балансів, профілів, друзів тощо між перезапусками.
+# Весь важливий стан зберігається одним "знімком". Якщо DATABASE_URL не задано —
+# бот працює як раніше, лише в пам'яті.
+# ---------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+SAVE_INTERVAL = int(os.getenv("SAVE_INTERVAL", "60"))  # секунд між автозбереженнями
+
+_db_ready = False  # True лише після успішного завантаження — щоб не затерти базу порожнім станом
+_last_saved_blob: bytes | None = None
+_save_event = asyncio.Event()
+
+# "Естафета" між копіями бота під час деплою: працює і пише в базу лише власник.
+# Нова копія чекає, поки стара збереже дані й віддасть естафету, — тоді нічого не губиться.
+INSTANCE_ID = os.urandom(6).hex()
+LEASE_HEARTBEAT_SECONDS = 10  # як часто власник відмічається в базі
+LEASE_STALE_SECONDS = 45  # без відмітки стільки секунд — копія вважається мертвою
+LEASE_MAX_WAIT = int(os.getenv("LEASE_MAX_WAIT", "180"))  # макс. очікування старої копії, сек
+_lease_held = False
+_background_tasks: set = set()
+
+
+def request_save():
+    """Попросити зберегти стан якнайшвидше (напр. одразу після оплати)."""
+    _save_event.set()
+
+
+def _db_connect():
+    import ssl
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    import pg8000.native
+
+    url = urlparse(DATABASE_URL)
+    sslmode = (parse_qs(url.query).get("sslmode") or ["require"])[0]
+    host = url.hostname or "localhost"
+    port = url.port or 5432
+    if sslmode == "disable":
+        ssl_context = None
+    elif sslmode in ("verify-ca", "verify-full"):
+        ssl_context = ssl.create_default_context()
+    else:
+        # як sslmode=require: з'єднання шифроване, сертифікат не перевіряється
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+    if sslmode not in ("verify-ca", "verify-full"):
+        # Перетворюємо назву сервера на IP-адресу (спершу IPv4): бібліотека на Render
+        # падала з "... does not appear to be an IPv4 or IPv6 address" на назві сервера.
+        import socket
+
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        except socket.gaierror:
+            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        if not infos:
+            raise ConnectionError(f"Не вдалося знайти IP-адресу сервера бази {host}")
+        host = infos[0][4][0]
+
+    return pg8000.native.Connection(
+        user=unquote(url.username or ""),
+        password=unquote(url.password or ""),
+        host=host,
+        port=port,
+        database=(url.path or "/postgres").lstrip("/") or "postgres",
+        ssl_context=ssl_context,
+        timeout=30,
+    )
+
+
+def _db_init_tables():
+    con = _db_connect()
+    try:
+        con.run(
+            "CREATE TABLE IF NOT EXISTS bot_state ("
+            " id INTEGER PRIMARY KEY,"
+            " data BYTEA NOT NULL,"
+            " prev_data BYTEA,"
+            " updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        con.run(
+            "CREATE TABLE IF NOT EXISTS bot_lease ("
+            " id INTEGER PRIMARY KEY,"
+            " owner TEXT,"
+            " heartbeat TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+    finally:
+        con.close()
+
+
+def _db_try_acquire(force: bool = False) -> bool:
+    """Забрати естафету: якщо вона вільна, наша, прострочена — або примусово."""
+    con = _db_connect()
+    try:
+        rows = con.run(
+            "INSERT INTO bot_lease (id, owner, heartbeat) VALUES (1, :me, now()) "
+            "ON CONFLICT (id) DO UPDATE SET owner = EXCLUDED.owner, heartbeat = now() "
+            "WHERE bot_lease.owner IS NULL OR bot_lease.owner = EXCLUDED.owner "
+            f"OR bot_lease.heartbeat < now() - interval '{LEASE_STALE_SECONDS} seconds' OR :force "
+            "RETURNING owner",
+            me=INSTANCE_ID,
+            force=bool(force),
+        )
+        return bool(rows)
+    finally:
+        con.close()
+
+
+def _db_heartbeat() -> bool:
+    """Відмітка "я живий". False — естафету в нас забрали."""
+    con = _db_connect()
+    try:
+        rows = con.run(
+            "UPDATE bot_lease SET heartbeat = now() WHERE id = 1 AND owner = :me RETURNING id",
+            me=INSTANCE_ID,
+        )
+        return bool(rows)
+    finally:
+        con.close()
+
+
+def _db_release():
+    con = _db_connect()
+    try:
+        con.run("UPDATE bot_lease SET owner = NULL WHERE id = 1 AND owner = :me", me=INSTANCE_ID)
+    finally:
+        con.close()
+
+
+def _db_load_blob() -> bytes | None:
+    con = _db_connect()
+    try:
+        rows = con.run("SELECT data FROM bot_state WHERE id = 1")
+        return bytes(rows[0][0]) if rows else None
+    finally:
+        con.close()
+
+
+def _db_load_prev_blob() -> bytes | None:
+    con = _db_connect()
+    try:
+        rows = con.run("SELECT prev_data FROM bot_state WHERE id = 1")
+        return bytes(rows[0][0]) if rows and rows[0][0] is not None else None
+    finally:
+        con.close()
+
+
+def _db_save_blob(blob: bytes) -> bool:
+    """Записує дані, ЛИШЕ якщо естафета наша (одним запитом, з блокуванням). False — не наша."""
+    con = _db_connect()
+    try:
+        # попередню версію зберігаємо в prev_data — запасна копія
+        rows = con.run(
+            "WITH lease AS (SELECT 1 FROM bot_lease WHERE id = 1 AND owner = :me FOR UPDATE) "
+            "INSERT INTO bot_state (id, data) SELECT 1, :d FROM lease "
+            "ON CONFLICT (id) DO UPDATE SET prev_data = bot_state.data, data = EXCLUDED.data, updated_at = now() "
+            "RETURNING id",
+            d=blob,
+            me=INSTANCE_ID,
+        )
+        return bool(rows)
+    finally:
+        con.close()
+
+
+def _make_snapshot() -> bytes:
+    import pickle
+
+    return pickle.dumps(
+        {
+            "version": 1,
+            "users_db": users_db,
+            "user_counter": user_counter,
+            "banned_users": banned_users,
+            "reports": reports,
+            "report_counter": report_counter,
+            "pending_crypto_invoices": pending_crypto_invoices,
+            "manual_payments": manual_payments,
+            "mono_seen_ids": mono_seen_ids,
+            "gift_revenue_total": gift_revenue_total,
+            "lottery_revenue_total": lottery_revenue_total,
+            "ads": ads,
+            "ad_counter": ad_counter,
+            "stats_days": stats_days,
+            "banners": banners,
+            "ref_contest": ref_contest,
+            "top_week": top_week,
+            "meet_hour": meet_hour,
+            "launch_state": launch_state,
+            "confess_db": confess_db,
+            "letters_db": letters_db,
+            "withdraw_db": withdraw_db,
+        },
+        protocol=4,
+    )
+
+
+def _apply_snapshot(blob: bytes):
+    import copy
+    import pickle
+
+    global user_counter, report_counter, gift_revenue_total, lottery_revenue_total, ad_counter
+    data = pickle.loads(blob)
+
+    users_db.clear()
+    users_db.update(data.get("users_db", {}))
+    banned_users.clear()
+    banned_users.update(data.get("banned_users", set()))
+    reports.clear()
+    reports.extend(data.get("reports", []))
+    pending_crypto_invoices.clear()
+    pending_crypto_invoices.update(data.get("pending_crypto_invoices", {}))
+    manual_payments.clear()
+    manual_payments.update(data.get("manual_payments", {}))
+    mono_seen_ids.clear()
+    mono_seen_ids.extend(data.get("mono_seen_ids", []))
+    user_counter = data.get("user_counter", user_counter)
+    report_counter = data.get("report_counter", report_counter)
+    gift_revenue_total = data.get("gift_revenue_total", gift_revenue_total)
+    lottery_revenue_total = data.get("lottery_revenue_total", lottery_revenue_total)
+    ads.clear()
+    ads.extend(data.get("ads", []))
+    ad_counter = data.get("ad_counter", ad_counter)
+    stats_days.clear()
+    stats_days.update(data.get("stats_days", {}))
+    banners.clear()
+    banners.update(data.get("banners", {}))
+    ref_contest.clear()
+    ref_contest.update(data.get("ref_contest") or {"week": None, "counts": {}, "awarded": [], "history": []})
+    top_week.clear()
+    top_week.update(data.get("top_week") or {"week": None, "votes": {}, "pairs": set(), "published": [], "history": []})
+    meet_hour.clear()
+    meet_hour.update(data.get("meet_hour") or {"reminded": None, "summary": None, "chats_start": None, "peak": 0, "sent": 0})
+    launch_state.clear()
+    launch_state.update(data.get("launch_state") or {"done": False, "sent": 0})
+    confess_db.clear()
+    confess_db.update(data.get("confess_db") or {"next_id": 1, "pub_no": 0, "items": {}, "last_by": {}})
+    letters_db.clear()
+    letters_db.update(data.get("letters_db") or {"items": [], "delivered_day": None})
+    withdraw_db.clear()
+    withdraw_db.update(data.get("withdraw_db") or {"next": 1, "items": {}})
+
+    # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
+    saved_counter = user_counter
+    template = init_user(-1)
+    users_db.pop(-1, None)
+    user_counter = saved_counter
+    old_chatters = sorted(
+        (uid for uid, u in users_db.items() if "founder_no" not in u and u.get("total_chats") and uid != ADMIN_ID),
+        key=lambda uid: int(re.sub(r"\D", "", str(users_db[uid].get("custom_id", ""))) or 0),
+    )
+    for u in users_db.values():
+        if "ref_qualified" not in u:
+            # ті, хто вже спілкувався до запуску конкурсу, не зараховуються в нього заднім числом
+            u["ref_qualified"] = bool(u.get("total_chats"))
+        for key, value in template.items():
+            if key not in u:
+                u[key] = copy.deepcopy(value)
+        refresh_default_nick(u)  # «Користувач_N» → «Незнайомець_N» / «Незнайомка_N»
+        if u.get("country") not in (None, "", "Не вказано"):
+            u["country"] = normalize_country(u["country"])  # «Львів» → «Україна»
+    # 👑 ті, хто спілкувався ще до появи значка, стають першими засновниками (за порядком приходу)
+    next_no = max((u.get("founder_no") or 0 for u in users_db.values()), default=0) + 1
+    for uid in old_chatters:
+        if next_no > FOUNDERS_LIMIT:
+            break
+        if uid not in banned_users and not users_db[uid].get("founder_no"):
+            users_db[uid]["founder_no"] = next_no
+            next_no += 1
+
+
+async def load_state_from_db():
+    """Завантажує стан з бази при старті. Без успішного завантаження збереження вимкнене."""
+    global _db_ready, _last_saved_blob, _lease_held
+    if not DATABASE_URL:
+        logging.warning("DATABASE_URL не задано — дані зберігаються лише в пам'яті і зникнуть після перезапуску.")
+        return
+
+    last_error = None
+    for attempt in range(1, 6):
+        try:
+            await asyncio.to_thread(_db_init_tables)
+            break
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            logging.warning("База даних недоступна (спроба %s/5): %s", attempt, e)
+            await asyncio.sleep(3 * attempt)
+    else:
+        # Краще не запускатись, ніж запуститись з порожніми даними і затерти ними базу.
+        raise SystemExit(f"❌ Не вдалося підключитися до бази даних: {last_error}")
+
+    # Чекаємо, поки попередня копія бота (під час деплою) збереже дані й віддасть естафету.
+    waited = 0.0
+    announced = False
+    while True:
+        force = waited >= LEASE_MAX_WAIT
+        if force:
+            logging.warning("Стара копія бота не віддає естафету %s с — перебираю її примусово.", LEASE_MAX_WAIT)
+        try:
+            if await asyncio.to_thread(_db_try_acquire, force):
+                break
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Помилка при отриманні естафети: %s", e)
+        if not announced:
+            logging.info("Чекаю, поки попередня копія бота збереже дані і вимкнеться...")
+            announced = True
+        await asyncio.sleep(3)
+        waited += 3
+    _lease_held = True
+    logging.info("Естафету отримано (копія %s).", INSTANCE_ID)
+
+    last_error = None
+    for attempt in range(1, 6):
+        try:
+            blob = await asyncio.to_thread(_db_load_blob)
+            break
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            logging.warning("Не вдалося прочитати дані (спроба %s/5): %s", attempt, e)
+            await asyncio.sleep(3 * attempt)
+    else:
+        raise SystemExit(f"❌ Не вдалося прочитати дані з бази: {last_error}")
+
+    if blob is None:
+        logging.info("База даних порожня — починаємо з нуля.")
+    else:
+        try:
+            _apply_snapshot(blob)
+        except Exception as e:  # noqa: BLE001
+            logging.error("Основна копія даних пошкоджена (%s) — пробую запасну.", e)
+            prev = await asyncio.to_thread(_db_load_prev_blob)
+            if prev is None:
+                raise SystemExit("❌ Дані в базі пошкоджені, а запасної копії немає.")
+            _apply_snapshot(prev)
+        logging.info("Дані завантажено з бази: %s користувачів.", len(users_db))
+        _last_saved_blob = blob
+
+    _db_ready = True
+
+
+async def save_state_to_db():
+    global _last_saved_blob
+    if not _db_ready:
+        return
+    try:
+        blob = _make_snapshot()  # знімок робимо в основному потоці — дані не змінюються посередині
+        if blob == _last_saved_blob:
+            return  # нічого не змінилось
+        if await asyncio.to_thread(_db_save_blob, blob):
+            _last_saved_blob = blob
+        else:
+            _on_lease_lost()
+    except Exception as e:  # noqa: BLE001
+        logging.error("Не вдалося зберегти дані в базу: %s", e)
+
+
+def _on_lease_lost():
+    """Естафету забрала інша (новіша) копія бота — ця копія більше не пише в базу і зупиняється."""
+    global _db_ready, _lease_held
+    if not _lease_held and not _db_ready:
+        return
+    _db_ready = False
+    _lease_held = False
+    logging.error("Естафету забрала інша копія бота — ця копія зупиняється, щоб не зіпсувати дані.")
+    try:
+        # тримаємо посилання на задачу, щоб її не прибрав збирач сміття до виконання
+        _background_tasks.add(asyncio.get_running_loop().create_task(dp.stop_polling()))
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Не вдалося зупинити polling: %s", e)
+
+
+async def lease_heartbeat_loop():
+    while True:
+        await asyncio.sleep(LEASE_HEARTBEAT_SECONDS)
+        if not _lease_held:
+            continue
+        try:
+            still_mine = await asyncio.to_thread(_db_heartbeat)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Не вдалося відмітитись у базі: %s", e)
+            continue
+        if not still_mine:
+            _on_lease_lost()
+
+
+async def release_lease():
+    """При зупинці (вже після фінального збереження) віддаємо естафету новій копії."""
+    global _lease_held
+    if not _lease_held:
+        return
+    try:
+        await asyncio.to_thread(_db_release)
+        logging.info("Естафету віддано.")
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Не вдалося віддати естафету (нова копія перебере її за %s с): %s", LEASE_STALE_SECONDS, e)
+    _lease_held = False
+
+
+async def persistence_loop():
+    while True:
+        try:
+            await asyncio.wait_for(_save_event.wait(), timeout=SAVE_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+        _save_event.clear()
+        await save_state_to_db()
 
 
 

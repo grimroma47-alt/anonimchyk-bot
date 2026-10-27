@@ -1,366 +1,4 @@
 # ---------------------------------------------------------------------------
-# Переписка з друзями (окремо від анонімного чату)
-# ---------------------------------------------------------------------------
-@dp.message(FriendStates.write)
-async def friend_write_finish(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    target_id = data.get("friend_target")
-    await state.clear()
-    if not target_id:
-        await message.answer("Не вдалося визначити друга. Відкрий «👫 Друзі» ще раз.")
-        return
-    err = await deliver_friend_message(message.from_user.id, target_id, message)
-    if err:
-        await message.answer(f"❌ {err}")
-    else:
-        await message.answer("✅ Надіслано другу.")
-
-
-def _is_reply_to_friend(message: types.Message) -> bool:
-    r = message.reply_to_message
-    return r is not None and (message.chat.id, r.message_id) in friend_msg_map
-
-
-@dp.message(_is_reply_to_friend)
-async def friend_reply(message: types.Message):
-    target_id = friend_msg_map.get((message.chat.id, message.reply_to_message.message_id))
-    if not target_id:
-        return
-    err = await deliver_friend_message(message.from_user.id, target_id, message)
-    if err:
-        await message.answer(f"❌ {err}")
-    else:
-        await message.answer("✅ Надіслано другу.")
-
-
-# ---------------------------------------------------------------------------
-# Оплата через Банку monobank з автоматичним підтвердженням
-# (бот раз на хвилину читає виписку Банки і шукає код платежу в коментарі)
-# ---------------------------------------------------------------------------
-MONO_API = "https://api.monobank.ua"
-MONO_POLL_SECONDS = 65  # API дозволяє виписку не частіше ніж раз на 60 с
-MONO_SEEN_LIMIT = 2000
-MONO_CODE_REGEX = re.compile(r"[PР]\s?(\d{6})", re.IGNORECASE)  # латинська P або кирилична Р
-mono_state = {"jar": None, "last_poll": None, "last_error": None, "jars": []}
-
-
-def mono_jar_link() -> str:
-    if PAY_JAR_LINK:
-        return PAY_JAR_LINK
-    jar = mono_state.get("jar")
-    if jar and jar.get("sendId"):
-        send_id = jar["sendId"]
-        return send_id if send_id.startswith("http") else f"https://send.monobank.ua/{send_id}"
-    return ""
-
-
-async def _mono_get(path: str):
-    """GET до API monobank. Повертає (статус, json або None)."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            f"{MONO_API}{path}", headers={"X-Token": MONO_TOKEN}, timeout=aiohttp.ClientTimeout(total=20)
-        ) as resp:
-            try:
-                data = await resp.json(content_type=None)
-            except Exception:  # noqa: BLE001
-                data = None
-            return resp.status, data
-
-
-def _choose_jar(jars: list[dict]) -> dict | None:
-    if MONO_JAR_ID:
-        return next((j for j in jars if j.get("id") == MONO_JAR_ID), None)
-    if MONO_JAR_TITLE:
-        wanted = MONO_JAR_TITLE.lower()
-        matches = [j for j in jars if wanted in (j.get("title") or "").lower()]
-        return matches[0] if len(matches) == 1 else None
-    uah = [j for j in jars if j.get("currencyCode") in (980, None)]
-    return uah[0] if len(uah) == 1 else None
-
-
-async def mono_detect_jar() -> bool:
-    status, data = await _mono_get("/personal/client-info")
-    if status != 200 or not isinstance(data, dict):
-        desc = (data or {}).get("errorDescription") if isinstance(data, dict) else None
-        mono_state["last_error"] = f"client-info: HTTP {status} {desc or ''}".strip()
-        return False
-    jars = data.get("jars") or []
-    mono_state["jars"] = jars
-    jar = _choose_jar(jars)
-    if jar is None:
-        mono_state["last_error"] = (
-            f"Не вдалося вибрати Банку (знайдено: {len(jars)}). "
-            "Задай MONO_JAR_TITLE (частину назви) або MONO_JAR_ID — список: /mono"
-        )
-        return False
-    mono_state["jar"] = jar
-    mono_state["last_error"] = None
-    logging.info("Monobank: використовую Банку «%s».", jar.get("title"))
-    return True
-
-
-def find_payment_code(comment: str) -> str | None:
-    m = MONO_CODE_REGEX.search(comment or "")
-    return f"P{m.group(1)}" if m else None
-
-
-MONO_MATCH_WINDOW = 30 * 60  # оплата без коду: шукаємо заявку з тією ж сумою за останні 30 хв
-# Надходження без коду, які чекають вибору адміна (лише в пам'яті): ключ -> {"paid", "comment"}
-mono_unmatched: dict[str, dict] = {}
-_mono_unmatched_seq = [0]
-
-
-def _amount_candidates(paid, item_time: float) -> list[str]:
-    """Неоплачені заявки з точно такою ж сумою, створені незадовго до оплати."""
-    found = []
-    for code, p in manual_payments.items():
-        if p.get("status") != "pending" or not p.get("ts"):
-            continue
-        if abs(float(p["amount"]) - float(paid)) >= 0.01:
-            continue
-        if p["ts"] - 120 <= item_time <= p["ts"] + MONO_MATCH_WINDOW:
-            found.append(code)
-    return found
-
-
-def _recent_pending(item_time: float, limit: int = 5) -> list[str]:
-    recent = [
-        (p["ts"], code)
-        for code, p in manual_payments.items()
-        if p.get("status") == "pending" and p.get("ts") and 0 <= item_time - p["ts"] + 120 <= 86400
-    ]
-    return [code for _ts, code in sorted(recent, reverse=True)[:limit]]
-
-
-async def _credit_jar_payment(code: str, paid, how: str) -> str:
-    p = manual_payments[code]
-    expected = p["amount"]
-    if abs(float(paid) - float(expected)) >= 0.01:
-        p["expected_amount"] = expected
-        p["amount"] = paid  # зараховуємо фактично отриману суму
-    p["method"] = "jar"
-    result = await _resolve_payment(code, True)
-    if ADMIN_ID:
-        note = "" if abs(float(paid) - float(expected)) < 0.01 else f" (очікувалось {expected} грн)"
-        await safe_send(ADMIN_ID, f"🤖 {how}{note}:\n{result}")
-    return result
-
-
-async def process_jar_statement(items: list[dict]) -> int:
-    """Обробляє операції з виписки Банки. Повертає, скільки платежів зараховано."""
-    credited = 0
-    changed = False
-    seen = set(mono_seen_ids)
-    for item in sorted(items, key=lambda i: i.get("time", 0)):
-        item_id = str(item.get("id") or "")
-        amount_kop = item.get("amount") or 0
-        if not item_id or item_id in seen or amount_kop <= 0:
-            continue
-        seen.add(item_id)
-        mono_seen_ids.append(item_id)
-        changed = True
-        paid = round(amount_kop / 100, 2)
-        if float(paid).is_integer():
-            paid = int(paid)
-        item_time = float(item.get("time") or time.time())
-        comment = item.get("comment") or ""
-
-        # 1) код у коментарі
-        code = find_payment_code(comment)
-        p = manual_payments.get(code) if code else None
-        if p is not None and p.get("status") == "pending":
-            await _credit_jar_payment(code, paid, "Автоматично через Банку")
-            credited += 1
-            continue
-
-        # 2) коду немає — шукаємо заявку з тією ж сумою
-        candidates = _amount_candidates(paid, item_time)
-        if len(candidates) == 1:
-            await _credit_jar_payment(candidates[0], paid, "Зараховано за сумою (у коментарі не було коду)")
-            credited += 1
-            continue
-
-        # 3) кілька або жодної — питаємо адміна кнопками
-        if not ADMIN_ID:
-            continue
-        options = candidates or _recent_pending(item_time)
-        text = (
-            f"🫙 Надходження в Банку без коду: <b>{paid:g} грн</b>\n"
-            f"Коментар: «{esc(comment) or '—'}»\n"
-        )
-        kb = None
-        if options:
-            _mono_unmatched_seq[0] += 1
-            key = str(_mono_unmatched_seq[0])
-            mono_unmatched[key] = {"paid": paid, "comment": comment}
-            text += (
-                "Кілька заявок з такою сумою — обери, кому зарахувати:"
-                if candidates
-                else "Заявки з такою сумою немає. Ось останні неоплачені — обери, кому зарахувати:"
-            )
-            rows = []
-            for c in options:
-                cp = manual_payments[c]
-                cu = users_db.get(cp["user_id"]) or {}
-                label = f"✅ {c}: {cu.get('nickname', cp['user_id'])} ({cu.get('custom_id', '?')}), заявка {cp['amount']} грн"
-                rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"jp_{key}_{c}")])
-            kb = InlineKeyboardMarkup(inline_keyboard=rows)
-        else:
-            text += "Неоплачених заявок немає. Якщо це оплата від користувача — зарахуй вручну (/addbalance)."
-        await safe_send(ADMIN_ID, text, reply_markup=kb)
-    if len(mono_seen_ids) > MONO_SEEN_LIMIT:
-        del mono_seen_ids[: len(mono_seen_ids) - MONO_SEEN_LIMIT]
-    if changed:
-        request_save()
-    return credited
-
-
-@dp.callback_query(F.data.startswith("jp_"))
-async def jar_pick(call: types.CallbackQuery):
-    """Адмін вибрав, кому зарахувати надходження без коду."""
-    if not _is_admin(call.from_user.id):
-        await call.answer("Доступ заборонено", show_alert=True)
-        return
-    try:
-        _prefix, key, code = call.data.split("_", 2)
-    except ValueError:
-        await call.answer()
-        return
-    entry = mono_unmatched.get(key)
-    if entry is None:
-        await call.answer(
-            "Це надходження вже оброблено або бот перезапускався. Зарахуй вручну: /addbalance", show_alert=True
-        )
-        return
-    p = manual_payments.get(code)
-    if p is None or p.get("status") != "pending":
-        await call.answer("Ця заявка вже оброблена. Обери іншу.", show_alert=True)
-        return
-    mono_unmatched.pop(key, None)
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await _credit_jar_payment(code, entry["paid"], "Зараховано вручну з Банки")
-    await call.answer("Зараховано ✅")
-
-
-async def mono_poll_once():
-    now = int(time.time())
-    # стежимо лише за свіжими заявками (до 3 діб); старші можна підтвердити вручну
-    pending = [
-        p
-        for p in manual_payments.values()
-        if p.get("status") == "pending" and p.get("ts") and now - p["ts"] < 3 * 86400
-    ]
-    if not pending:
-        return
-    oldest = min(int(p["ts"]) for p in pending) - 300
-    frm = max(oldest, now - 2682000 + 60)  # не більше 31 доби + 1 год
-    status, data = await _mono_get(f"/personal/statement/{mono_state['jar']['id']}/{frm}/{now}")
-    mono_state["last_poll"] = time.strftime("%d.%m.%Y %H:%M:%S")
-    if status != 200 or not isinstance(data, list):
-        desc = data.get("errorDescription") if isinstance(data, dict) else ""
-        mono_state["last_error"] = f"statement: HTTP {status} {desc or ''}".strip()
-        logging.warning("Monobank: %s", mono_state["last_error"])
-        return
-    mono_state["last_error"] = None
-    await process_jar_statement(data)
-
-
-async def mono_poll_loop():
-    if not MONO_TOKEN:
-        return
-    await asyncio.sleep(10)
-    while True:
-        try:
-            if mono_state.get("jar") is None:
-                if not await mono_detect_jar():
-                    logging.warning("Monobank: %s", mono_state["last_error"])
-                    await asyncio.sleep(300)
-                    continue
-                await asyncio.sleep(MONO_POLL_SECONDS)  # окремий ліміт для client-info / statement
-            await mono_poll_once()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            mono_state["last_error"] = str(e)
-            logging.warning("Monobank: помилка перевірки Банки: %s", e)
-        await asyncio.sleep(MONO_POLL_SECONDS)
-
-
-@dp.callback_query(F.data.startswith("topup_jar_"))
-async def topup_pay_jar(call: types.CallbackQuery):
-    link = mono_jar_link()
-    if not link:
-        await call.answer("Цей спосіб оплати зараз недоступний", show_alert=True)
-        return
-    amount = _parse_topup_amount(call.data[len("topup_jar_"):])
-    if amount is None:
-        await call.answer("Недоступна сума.", show_alert=True)
-        return
-    code = new_payment_code()
-    manual_payments[code] = {
-        "user_id": call.from_user.id,
-        "amount": amount,
-        "created": time.strftime("%d.%m.%Y %H:%M"),
-        "ts": time.time(),
-        "status": "pending",
-        "receipt": False,
-        "method": "jar",
-    }
-    request_save()
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🫙 Відкрити Банку і оплатити", url=link)],
-            [InlineKeyboardButton(text="📸 Не зарахувалось? Надіслати квитанцію", callback_data=f"bank_paid_{code}")],
-        ]
-    )
-    auto = bool(MONO_TOKEN and mono_state.get("jar"))
-    await call.message.answer(
-        "🫙 <b>Оплата через Банку monobank</b>\n\n"
-        f"1️⃣ Натисни «Відкрити Банку» і введи суму <b>{amount} грн</b>.\n"
-        f"2️⃣ У полі <b>коментар</b> обов'язково напиши код: <code>{code}</code>\n"
-        "3️⃣ Оплати будь-якою карткою.\n\n"
-        + (
-            "🤖 Баланс поповниться <b>автоматично</b> за 1–2 хвилини після оплати."
-            if auto
-            else "⏳ Платіж перевіряється вручну, зазвичай протягом кількох годин."
-        )
-        + f"\n\n⚠️ Без коду {code} у коментарі ми не зможемо знайти твій платіж.",
-        reply_markup=kb,
-    )
-    await call.answer()
-
-
-@dp.message(Command("mono"))
-async def mono_status(message: types.Message):
-    """Адмін: стан підключення до Банки monobank."""
-    if not _is_admin(message.from_user.id):
-        return
-    if not MONO_TOKEN:
-        await message.answer("🫙 MONO_TOKEN не задано в Render — автопідтвердження вимкнене.")
-        return
-    jar = mono_state.get("jar")
-    pending = sum(1 for p in manual_payments.values() if p.get("status") == "pending" and p.get("method") == "jar")
-    lines = ["🫙 <b>Банка monobank</b>"]
-    if jar:
-        lines.append(f"Банка: «{esc(jar.get('title'))}», баланс {jar.get('balance', 0) / 100:g} грн")
-        lines.append(f"Посилання: {esc(mono_jar_link())}")
-    else:
-        lines.append("Банку ще не вибрано.")
-    lines.append(f"Оплат через Банку на перевірці: {pending}")
-    lines.append(f"Остання перевірка виписки: {mono_state.get('last_poll') or '—'}")
-    if mono_state.get("last_error"):
-        lines.append(f"⚠️ Помилка: {esc(mono_state['last_error'])}")
-    if mono_state.get("jars"):
-        lines.append("\nУсі твої Банки (для MONO_JAR_TITLE / MONO_JAR_ID):")
-        for j in mono_state["jars"]:
-            lines.append(f"• «{esc(j.get('title'))}» — <code>{esc(j.get('id'))}</code>")
-    await message.answer("\n".join(lines))
-
-
-# ---------------------------------------------------------------------------
 # Статистика: щоденні лічильники для адміна
 # ---------------------------------------------------------------------------
 STATS_KEEP_DAYS = 62  # скільки днів історії тримаємо в базі
@@ -1785,6 +1423,497 @@ async def toggle_setting(call: types.CallbackQuery):
     request_save()
     await _set_markup(call, privacy_keyboard(u) if menu == "privacy" else notify_keyboard(u))
     await call.answer("Збережено ✅")
+
+
+# ---------------------------------------------------------------------------
+# Редагування профілю кнопками (без /edit_profile)
+# ---------------------------------------------------------------------------
+class ProfileEditStates(StatesGroup):
+    age = State()
+    country = State()
+    bio = State()
+
+
+def _archive_profile(u: dict):
+    stamp = time.strftime("%d.%m.%Y %H:%M")
+    u["archive"].append(f"{stamp} — Стать: {u['gender']}, Вік: {u['age']}, Країна: {u['country']}")
+    u["archive"] = u["archive"][-50:]
+
+
+def profile_edit_text(u: dict) -> str:
+    return (
+        "✏️ <b>Мій профіль</b>\n\n"
+        f"👤 Стать: <b>{esc(u['gender'])}</b>\n"
+        f"🎂 Вік: <b>{esc(u['age'])}</b>{' (🙈 прихований)' if u.get('hide_age') else ''}\n"
+        f"🌍 Країна: <b>{esc(u['country'])}</b>{' (🙈 прихована)' if u.get('hide_country') else ''}\n"
+        f"🧩 Інтереси: {interests_line(u)}\n"
+        f"📝 Про себе: {('«' + protect_text(esc(u['bio'])) + '»') if u.get('bio') else 'не заповнено'}\n\n"
+        "Що змінити?"
+    )
+
+
+def profile_edit_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👤 Стать", callback_data="pe_gender"),
+                InlineKeyboardButton(text="🎂 Вік", callback_data="pe_age"),
+            ],
+            [
+                InlineKeyboardButton(text="🌍 Країна", callback_data="pe_country"),
+                InlineKeyboardButton(text="🧩 Інтереси", callback_data="pi_open"),
+            ],
+            [InlineKeyboardButton(text="📝 Про себе", callback_data="pe_bio")],
+        ]
+    )
+
+
+async def _show_profile_editor(chat_id: int, u: dict):
+    await safe_send(chat_id, profile_edit_text(u), reply_markup=profile_edit_keyboard())
+
+
+@dp.callback_query(F.data == "pe_menu")
+async def pe_menu(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await _show_profile_editor(call.from_user.id, init_user(call.from_user.id))
+    await call.answer()
+
+
+BIO_MAX = 70
+
+
+@dp.callback_query(F.data == "pe_bio")
+async def pe_bio(call: types.CallbackQuery, state: FSMContext):
+    u = init_user(call.from_user.id)
+    await state.set_state(ProfileEditStates.bio)
+    rows = [[InlineKeyboardButton(text="🗑 Прибрати опис", callback_data="pe_bio_del")]] if u.get("bio") else []
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="pe_menu")])
+    await call.message.answer(
+        f"📝 Напиши коротко про себе — до {BIO_MAX} символів. Співрозмовник побачить це на початку чату.\n\n"
+        "Наприклад: «Люблю нічні прогулянки й інді-музику 🎧»\n"
+        "<i>Без імені, контактів, @ніків і посилань — анонімність понад усе.</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "pe_bio_del")
+async def pe_bio_del(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    u = init_user(call.from_user.id)
+    u.pop("bio", None)
+    request_save()
+    await _show_profile_editor(call.from_user.id, u)
+    await call.answer("Опис прибрано")
+
+
+@dp.message(ProfileEditStates.bio)
+async def pe_bio_save(message: types.Message, state: FSMContext):
+    text = " ".join((message.text or "").split())
+    if not text:
+        await message.answer("Напиши опис текстом 🙂")
+        return
+    if len(text) > BIO_MAX:
+        await message.answer(f"Задовго — {len(text)} символів. Скороти до {BIO_MAX} 🙂")
+        return
+    if LINK_REGEX.search(text) or PHONE_REGEX.search(text) or "@" in text:
+        await message.answer("🚫 Без контактів, @ніків і посилань — напиши інакше 🙂")
+        return
+    await state.clear()
+    u = init_user(message.from_user.id)
+    u["bio"] = text
+    request_save()
+    await message.answer("✅ Збережено!")
+    await _show_profile_editor(message.from_user.id, u)
+
+
+@dp.callback_query(F.data == "pe_gender")
+async def pe_gender(call: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👦 Хлопець", callback_data="pe_g_m"),
+                InlineKeyboardButton(text="👧 Дівчина", callback_data="pe_g_f"),
+            ]
+        ]
+    )
+    try:
+        await call.message.edit_text("👤 Обери стать:", reply_markup=kb)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+@dp.callback_query(F.data.in_({"pe_g_m", "pe_g_f"}))
+async def pe_gender_set(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    new = "Хлопець" if call.data == "pe_g_m" else "Дівчина"
+    if u["gender"] != new:
+        _archive_profile(u)
+        u["gender"] = new
+        refresh_default_nick(u)
+        request_save()
+    try:
+        await call.message.edit_text(profile_edit_text(u), reply_markup=profile_edit_keyboard())
+    except TelegramAPIError:
+        pass
+    await call.answer("Збережено ✅")
+
+
+@dp.callback_query(F.data == "pe_age")
+async def pe_age(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ProfileEditStates.age)
+    await call.message.answer("🎂 Напиши свій вік числом (наприклад, 19).\nСкасувати: /cancel")
+    await call.answer()
+
+
+@dp.message(ProfileEditStates.age, F.text)
+async def pe_age_set(message: types.Message, state: FSMContext):
+    m = ONBOARD_AGE_REGEX.match(message.text or "")
+    if not m or not (10 <= int(m.group(1)) <= 99):
+        await message.answer("Напиши вік числом від 10 до 99. Скасувати: /cancel")
+        return
+    age = int(m.group(1))
+    u = init_user(message.from_user.id)
+    if u["age"] != str(age):
+        _archive_profile(u)
+        u["age"] = str(age)
+        prev_min = u.get("min_age_seen")
+        u["min_age_seen"] = age if prev_min is None else min(int(prev_min), age)
+        request_save()
+    await state.clear()
+    await _show_profile_editor(message.from_user.id, u)
+    await maybe_send_safety_memo(message.from_user.id, u)
+
+
+@dp.callback_query(F.data == "pe_country")
+async def pe_country(call: types.CallbackQuery):
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"pe_c_{key}") for key, label, _n in ONBOARD_COUNTRIES[i : i + 2]]
+        for i in range(0, len(ONBOARD_COUNTRIES), 2)
+    ]
+    rows.append([InlineKeyboardButton(text="🌍 Інша — напишу сам(а)", callback_data="pe_c_other")])
+    try:
+        await call.message.edit_text("🌍 Звідки ти?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+def _set_country(u: dict, country: str):
+    if u["country"] != country:
+        _archive_profile(u)
+        u["country"] = country
+        request_save()
+
+
+@dp.callback_query(F.data.startswith("pe_c_"))
+async def pe_country_set(call: types.CallbackQuery, state: FSMContext):
+    key = call.data[len("pe_c_"):]
+    if key == "other":
+        await state.set_state(ProfileEditStates.country)
+        await call.message.answer("🌍 Напиши свою країну (наприклад: Франція, США, Канада). Скасувати: /cancel")
+        await call.answer()
+        return
+    country = next((name for k, _label, name in ONBOARD_COUNTRIES if k == key), None)
+    if country is None:
+        await call.answer("Невідома країна", show_alert=True)
+        return
+    u = init_user(call.from_user.id)
+    _set_country(u, country)
+    try:
+        await call.message.edit_text(profile_edit_text(u), reply_markup=profile_edit_keyboard())
+    except TelegramAPIError:
+        pass
+    await call.answer("Збережено ✅")
+
+
+@dp.message(ProfileEditStates.country, F.text)
+async def pe_country_text(message: types.Message, state: FSMContext):
+    country = normalize_country(message.text or "")
+    if len(country) < 2 or LINK_REGEX.search(country):
+        await message.answer("Напиши назву країни. Скасувати: /cancel")
+        return
+    u = init_user(message.from_user.id)
+    _set_country(u, country)
+    await state.clear()
+    await _show_profile_editor(message.from_user.id, u)
+
+
+# ---------------------------------------------------------------------------
+# Банери-картинки: адмін ставить їх з телефона (надсилає фото боту), file_id — у базі
+# ---------------------------------------------------------------------------
+BANNER_PLACES = {
+    "start": "🚀 Привітання (/start)",
+    "premium": "💎 Premium",
+    "shop": "🏪 Магазин",
+    "topup": "💳 Поповнення",
+    "tasks": "📋 Завдання",
+    "lottery": "🎰 Рулетка",
+    "voicechat": "🎙 Голосовий чат",
+    "voice": "🎙 Маска голосу",
+    "flirt": "❤️ Флірт-пошук",
+    "interests": "🧩 За інтересами",
+    "games": "🎲 Ігри",
+    "fun": "✨ Розваги",
+    "confess": "🤫 Зізнання",
+    "letter": "💌 Нічний лист",
+    "unmask": "🎭 Маски знято",
+    "friends": "👫 Друзі",
+    "rooms": "👥 Кімнати",
+    "halloween": "🎃 Хелловін",
+}
+BANNER_COOLDOWN = 10 * 60  # той самий банер одній людині — не частіше ніж раз на 10 хв
+banner_last_shown: dict[tuple[int, str], float] = {}
+
+
+class AdminGiftStates(StatesGroup):
+    target = State()
+    note = State()
+
+
+def admin_gift_keyboard(uid: int):
+    items = [
+        InlineKeyboardButton(text=f"{title}", callback_data=f"adm_gift_pick:{uid}:{key}")
+        for key, (title, _price) in GIFT_CATALOG.items()
+    ]
+    rows = [items[i:i + 3] for i in range(0, len(items), 3)]
+    rows.append([InlineKeyboardButton(text="✖️ Скасувати", callback_data="adm_gift_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _admin_gift_choose(answer, uid: int):
+    u = users_db[uid]
+    await answer(
+        f"🎁 Подарунок для {admin_label(uid)}\n"
+        f"{short_info(u, public=False)}\n\nОбери, що подарувати:",
+        reply_markup=admin_gift_keyboard(uid),
+    )
+
+
+@dp.callback_query(F.data == "adm_gift")
+@admin_only
+async def adm_gift_start(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminGiftStates.target)
+    await call.message.answer(
+        "🎁 <b>Подарунок користувачу</b>\n\n"
+        "Надішли ID людини — наш (напр. <code>ID_1012</code>) або Telegram ID.\n"
+        "Знайти людину зручно в 📊 Статистика → 🆕 Нові учасники (там є кнопки 🎁).\n\nСкасувати: /cancel"
+    )
+    await call.answer()
+
+
+@dp.message(AdminGiftStates.target)
+async def adm_gift_target(message: types.Message, state: FSMContext):
+    if not _is_banner_admin(message.from_user.id):
+        await state.clear()
+        return
+    uid = resolve_user_id(message.text or "")
+    if uid is None or uid not in users_db:
+        await message.answer("Не знайшов такого користувача 🤔 Перевір ID (напр. ID_1012) або /cancel.")
+        return
+    await state.clear()
+    await _admin_gift_choose(message.answer, uid)
+
+
+@dp.callback_query(F.data.startswith("adm_gift_to:"))
+@admin_only
+async def adm_gift_to(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        uid = int(call.data.split(":", 1)[1])
+    except ValueError:
+        await call.answer()
+        return
+    if uid not in users_db:
+        await call.answer("Користувача не знайдено", show_alert=True)
+        return
+    await _admin_gift_choose(call.message.answer, uid)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_gift_pick:"))
+@admin_only
+async def adm_gift_pick(call: types.CallbackQuery, state: FSMContext):
+    try:
+        _, uid, key = call.data.split(":", 2)
+        uid = int(uid)
+    except ValueError:
+        await call.answer()
+        return
+    if uid not in users_db or key not in GIFT_CATALOG:
+        await call.answer("Щось не так 🤔", show_alert=True)
+        return
+    await state.set_state(AdminGiftStates.note)
+    await state.update_data(gift_uid=uid, gift_key=key)
+    await call.message.answer(
+        f"Дарую {GIFT_CATALOG[key][0]} для {admin_label(uid)}.\n\n"
+        "✍️ Напиши коротку записку, яку людина побачить разом з подарунком "
+        "(напр. «Наталіє, це ведмедик з TikTok 🧸»), або натисни кнопку нижче.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📨 Надіслати без записки", callback_data="adm_gift_send")],
+                [InlineKeyboardButton(text="✖️ Скасувати", callback_data="adm_gift_cancel")],
+            ]
+        ),
+    )
+    await call.answer()
+
+
+async def _admin_gift_deliver(state: FSMContext, note: str | None, reply):
+    data = await state.get_data()
+    await state.clear()
+    uid, key = data.get("gift_uid"), data.get("gift_key")
+    if uid not in users_db or key not in GIFT_CATALOG:
+        await reply("Подарунок не знайдено — почни спочатку: /admin → 🎁 Подарувати подарунок")
+        return
+    u = users_db[uid]
+    u.setdefault("gifts", {})
+    u["gifts"][key] = u["gifts"].get(key, 0) + 1
+    request_save()
+    title = GIFT_CATALOG[key][0]
+    text = f"🎁 <b>Тобі подарунок від команди ANONimchyk!</b>\n\n{esc(title)}"
+    if note:
+        text += f"\n\n💌 <i>{protect_text(esc(note))}</i>"
+    text += (
+        "\n\nВін уже у твоєму інвентарі (👤 Мій профіль). "
+        "Можеш залишити собі або подарувати співрозмовнику під час чату 💜"
+    )
+    ok = await safe_send(uid, text)
+    if ok:
+        await reply(f"✅ Подаровано {title} → {admin_label(uid)}")
+    else:
+        await reply(
+            f"⚠️ Подарунок {title} додано в інвентар {admin_label(uid)}, "
+            "але повідомлення не дійшло (людина могла заблокувати бота)."
+        )
+
+
+@dp.callback_query(F.data == "adm_gift_send")
+@admin_only
+async def adm_gift_send(call: types.CallbackQuery, state: FSMContext):
+    await _admin_gift_deliver(state, None, call.message.answer)
+    await call.answer()
+
+
+@dp.message(AdminGiftStates.note)
+async def adm_gift_note(message: types.Message, state: FSMContext):
+    if not _is_banner_admin(message.from_user.id):
+        await state.clear()
+        return
+    note = (message.text or "").strip()[:1500]
+    await _admin_gift_deliver(state, note or None, message.answer)
+
+
+@dp.callback_query(F.data == "adm_gift_cancel")
+@admin_only
+async def adm_gift_cancel(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("Скасовано.")
+    await call.answer()
+
+
+class BannerStates(StatesGroup):
+    photo = State()
+
+
+async def send_banner(chat_id: int, place: str, caption: str | None = None, **kwargs) -> bool:
+    """Надсилає банер (якщо адмін його поставив). Повертає True, якщо картинку надіслано."""
+    file_id = banners.get(place)
+    if not file_id:
+        return False
+    now = time.time()
+    if caption is None and now - banner_last_shown.get((chat_id, place), 0) < BANNER_COOLDOWN:
+        return False
+    try:
+        await bot.send_photo(chat_id, file_id, caption=caption, **kwargs)
+    except TelegramAPIError as e:
+        logging.warning("Банер %s не надіслано: %s", place, e)
+        return False
+    banner_last_shown[(chat_id, place)] = now
+    return True
+
+
+def _is_banner_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID and user_id in authorized_admins
+
+
+def banners_admin_keyboard():
+    btns = [
+        InlineKeyboardButton(text=("✅ " if key in banners else "➕ ") + label, callback_data=f"adm_bn_{key}")
+        for key, label in BANNER_PLACES.items()
+    ]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+BANNERS_HELP = (
+    "🖼 <b>Банери</b>\n\n"
+    "Картинка над екраном бота. ✅ — банер стоїть, ➕ — немає.\n"
+    "Обери місце і надішли картинку <b>як фото</b> (не файлом).\n"
+    "Найкращий розмір: <b>1280×720</b> (горизонтальна, 16:9)."
+)
+
+
+@dp.callback_query(F.data == "adm_banners")
+@admin_only
+async def adm_banners(call: types.CallbackQuery):
+    await call.message.answer(BANNERS_HELP, reply_markup=banners_admin_keyboard())
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_bn_"))
+@admin_only
+async def adm_banner_pick(call: types.CallbackQuery, state: FSMContext):
+    place = call.data[len("adm_bn_"):]
+    if place not in BANNER_PLACES:
+        await call.answer()
+        return
+    await state.set_state(BannerStates.photo)
+    await state.update_data(banner_place=place)
+    rows = []
+    if place in banners:
+        rows.append([InlineKeyboardButton(text="🗑 Прибрати цей банер", callback_data=f"adm_bnrm_{place}")])
+        await send_banner(call.from_user.id, place, caption="Зараз стоїть оцей 👆")
+    await call.message.answer(
+        f"Надішли картинку для «{BANNER_PLACES[place]}» як фото.\nСкасувати: /cancel",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_bnrm_"))
+@admin_only
+async def adm_banner_remove(call: types.CallbackQuery, state: FSMContext):
+    place = call.data[len("adm_bnrm_"):]
+    banners.pop(place, None)
+    request_save()
+    await state.clear()
+    await call.message.answer(f"🗑 Банер «{BANNER_PLACES.get(place, place)}» прибрано.", reply_markup=banners_admin_keyboard())
+    await call.answer()
+
+
+@dp.message(BannerStates.photo)
+async def adm_banner_photo(message: types.Message, state: FSMContext):
+    if not _is_banner_admin(message.from_user.id):
+        await state.clear()
+        return
+    if not message.photo:
+        await message.answer("Надішли саме картинку як фото (не файлом і не текстом). Скасувати: /cancel")
+        return
+    data = await state.get_data()
+    place = data.get("banner_place")
+    await state.clear()
+    if place not in BANNER_PLACES:
+        await message.answer("Щось пішло не так — обери місце ще раз у 🖼 Банери.")
+        return
+    banners[place] = message.photo[-1].file_id  # найбільший розмір
+    request_save()
+    banner_last_shown.clear()
+    await message.answer(
+        f"✅ Банер для «{BANNER_PLACES[place]}» встановлено! Відкрий цей екран у боті, щоб подивитись.",
+        reply_markup=banners_admin_keyboard(),
+    )
 
 
 

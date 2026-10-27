@@ -1,414 +1,4 @@
 # ---------------------------------------------------------------------------
-# Групові кімнати за інтересами
-# ---------------------------------------------------------------------------
-@dp.message(F.text.startswith(BTN_ROOMS))
-@dp.message(Command("rooms"))
-async def rooms_menu(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-
-    if user_id in banned_users:
-        ban_text, ban_kb = banned_notice(user_id)
-        await message.answer(ban_text, reply_markup=ban_kb)
-        return
-    if user_id in user_room:
-        await message.answer("Ти вже в кімнаті. Спочатку вийди з неї.", reply_markup=get_room_keyboard())
-        return
-    if user_id in active_chats:
-        await message.answer("Спочатку заверши приватний чат.", reply_markup=get_chat_keyboard())
-        return
-
-    await send_banner(user_id, "rooms")
-    await message.answer(rooms_intro_text(user_id), reply_markup=get_room_topics_keyboard())
-
-
-@dp.callback_query(F.data.startswith("room_join_"))
-async def room_join(call: types.CallbackQuery):
-    user_id = call.from_user.id
-
-    if user_id in banned_users:
-        await call.answer("⛔ Вас заблоковано в цьому боті.", show_alert=True)
-        return
-    if user_id in user_room:
-        await call.answer("Ти вже в кімнаті. Спочатку вийди з неї.", show_alert=True)
-        return
-    if user_id in active_chats:
-        await call.answer("Спочатку заверши приватний чат.", show_alert=True)
-        return
-
-    topic_key = call.data[len("room_join_"):]
-    if topic_key not in ROOM_TOPICS:
-        await call.answer("Невідома тема", show_alert=True)
-        return
-
-    global room_counter
-    target_room_id = None
-    lang = (users_db.get(user_id) or {}).get("lang", "uk")
-    for rid, r in rooms.items():
-        if r["topic"] == topic_key and r.get("lang", "uk") == lang and len(r["members"]) < ROOM_CAPACITY:
-            target_room_id = rid
-            break
-    if target_room_id is None:
-        room_counter += 1
-        target_room_id = f"room_{room_counter}"
-        rooms[target_room_id] = {"topic": topic_key, "members": set(), "lang": lang}
-
-    room = rooms[target_room_id]
-    u = init_user(user_id)
-
-    for member_id in room["members"]:
-        await safe_send(member_id, f"🆕 <b>{esc(u['nickname'])}</b> приєднався до кімнати!")
-
-    room["members"].add(user_id)
-    user_room[user_id] = target_room_id
-
-    room.setdefault("last_msg", time.time())
-    searching = user_id in queue
-    await call.message.answer(
-        f"✅ Ти приєднався до кімнати: <b>{esc(ROOM_TOPICS[topic_key])}</b> "
-        f"({len(room['members'])}/{ROOM_CAPACITY} 👥)\n\n"
-        "Просто пиши текстом — повідомлення побачать усі учасники кімнати."
-        + ("\n\n🔔 Пошук співрозмовника триває — щойно когось знайду, покличу тебе в приватний чат." if searching else ""),
-        reply_markup=get_room_keyboard(),
-    )
-    await call.answer()
-
-
-@dp.message(F.text == BTN_ROOM_LEAVE)
-async def room_leave(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-    room_id = user_room.get(user_id)
-    if room_id is None:
-        await message.answer("Ти зараз не в кімнаті.", reply_markup=get_main_keyboard())
-        return
-
-    room = rooms.get(room_id)
-    u = init_user(user_id)
-    remove_from_room(user_id)
-
-    if room:
-        for member_id in room["members"]:
-            await safe_send(member_id, f"🚪 <b>{esc(u['nickname'])}</b> покинув кімнату.")
-
-    await message.answer("Ти вийшов з кімнати.", reply_markup=get_main_keyboard())
-
-
-@dp.message(F.text == BTN_ROOM_REPORT)
-async def room_report_start(message: types.Message):
-    user_id = message.from_user.id
-    room_id = user_room.get(user_id)
-    if room_id is None:
-        await message.answer("Ти зараз не в кімнаті.", reply_markup=get_main_keyboard())
-        return
-    room = rooms.get(room_id)
-    others = [uid for uid in room["members"] if uid != user_id] if room else []
-    if not others:
-        await message.answer("У кімнаті, крім тебе, нікого немає.")
-        return
-
-    rows = [
-        [InlineKeyboardButton(text=users_db[uid]["nickname"], callback_data=f"roomrep_{uid}")]
-        for uid in others
-    ]
-    await message.answer(
-        "🚨 На кого з учасників кімнати поскаржитись?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
-
-
-@dp.callback_query(F.data.startswith("roomrep_"))
-async def room_report_submit(call: types.CallbackQuery):
-    global report_counter
-    target_id = int(call.data[len("roomrep_"):])
-    user_id = call.from_user.id
-
-    report_counter += 1
-    reports.append(
-        {
-            "id": report_counter,
-            "from": user_id,
-            "on": target_id,
-            "time": time.strftime("%d.%m.%Y %H:%M"),
-            "status": "нова",
-        }
-    )
-
-    p = init_user(target_id)
-    p["reports_received"] = p.get("reports_received", 0) + 1
-    auto_banned = False
-    if p["reports_received"] >= AUTO_BAN_REPORTS and target_id not in banned_users:
-        banned_users.add(target_id)
-        register_auto_ban(p)
-        request_save()
-        auto_banned = True
-        if target_id in queue:
-            queue.remove(target_id)
-        remove_from_room(target_id)
-        end_chat(target_id)
-        ban_text, ban_kb = banned_notice(target_id)
-        await safe_send(target_id, ban_text, reply_markup=ban_kb)
-
-    if ADMIN_ID:
-        extra = (
-            f"\n\n⛔ Автобан: досягнуто {AUTO_BAN_REPORTS} скарг, користувача заблоковано автоматично."
-            if auto_banned
-            else ""
-        )
-        await safe_send(
-            ADMIN_ID,
-            f"🚨 Скарга з кімнати #{report_counter}\nВід: {admin_label(user_id)}\nНа: {admin_label(target_id)}{extra}",
-        )
-
-    await call.message.answer("🚨 Скаргу надіслано, дякуємо!")
-    await call.answer()
-
-
-# ---------------------------------------------------------------------------
-# Пошук та чат
-# ---------------------------------------------------------------------------
-@dp.message(F.text == BTN_SEARCH)
-async def search_partner(message: types.Message, state: FSMContext):
-    await run_search(message, state, "normal")
-
-
-FLIRT_MIN_AGE = 18
-FLIRT_RULES = (
-    "❤️ <b>Флірт-чат</b>\n"
-    "• Повага і згода — понад усе. «Ні» означає «ні».\n"
-    "• Жодних інтимних фото без явної згоди співрозмовника.\n"
-    "• Не тиснемо і не просимо грошей чи контактів.\n"
-    f"• Порушують — тисни «{BTN_REPORT}»."
-)
-
-
-def min_age_ever(u: dict) -> int | None:
-    """Найменший вік, який будь-коли був у профілі (поточний, архів, онбординг)."""
-    ages = []
-    cur = get_age_int(u)
-    if cur is not None:
-        ages.append(cur)
-    if u.get("min_age_seen") is not None:
-        ages.append(int(u["min_age_seen"]))
-    for line in u.get("archive") or []:
-        m = re.search(r"Вік:\s*(\d+)", line)
-        if m:
-            ages.append(int(m.group(1)))
-    return min(ages) if ages else None
-
-
-def flirt_block_reason(u: dict) -> str | None:
-    """Чому людині не можна у флірт-пошук (або None — можна)."""
-    age = get_age_int(u)
-    if age is None or u.get("gender") not in ("Хлопець", "Дівчина"):
-        return "❤️ Щоб увімкнути флірт-пошук, вкажи у профілі стать і вік: /edit_profile"
-    if age < FLIRT_MIN_AGE:
-        return f"❤️ Флірт-пошук доступний лише з {FLIRT_MIN_AGE} років."
-    # Перевірку історії віку (min_age_ever) вимкнено за рішенням власника.
-    # Щоб увімкнути: якщо min_age_ever(u) < FLIRT_MIN_AGE — повертати відмову.
-    return None
-
-
-@dp.message(F.text == BTN_FLIRT)
-@dp.message(Command("flirt"))
-async def flirt_search(message: types.Message, state: FSMContext):
-    u = init_user(message.from_user.id)
-    reason = flirt_block_reason(u)
-    if reason and message.from_user.id not in banned_users:
-        await state.clear()
-        await message.answer(reason)
-        return
-    await send_banner(message.from_user.id, "flirt")
-    await run_search(message, state, "flirt")
-
-
-async def run_search(message: types.Message, state: FSMContext, mode: str = "normal", user_id: int | None = None):
-    await state.clear()
-    user_id = user_id or message.from_user.id
-
-    if user_id in banned_users:
-        ban_text, ban_kb = banned_notice(user_id)
-        await message.answer(ban_text, reply_markup=ban_kb)
-        return
-
-    u = init_user(user_id)
-
-    if user_id in active_chats:
-        await message.answer("Ти вже перебуваєш у чаті!", reply_markup=get_chat_keyboard())
-        return
-    if user_id in queue:
-        await message.answer("Ти вже в черзі пошуку. Зачекай трохи... ⏳")
-        return
-    if user_id in user_room:
-        await message.answer("Спочатку вийди з групової кімнати.", reply_markup=get_room_keyboard())
-        return
-
-    best = None  # (бали, позиція в черзі)
-    stale = []  # давно чекають — спершу питаємо «ти тут?», а не з'єднуємо наосліп
-    now_ts = time.time()
-    for i, candidate_id in enumerate(queue):
-        if search_mode.get(candidate_id, "normal") != mode:
-            continue  # флірт шукає лише флірт, звичайний — лише звичайний
-        p_candidate = init_user(candidate_id)
-        if is_blacklisted(u, user_id, p_candidate, candidate_id):
-            continue
-        if mode == "flirt" and p_candidate.get("gender") == u.get("gender"):
-            continue  # у флірті з'єднуємо лише хлопця з дівчиною
-        if not passes_filters(u, p_candidate) or not passes_filters(p_candidate, u):
-            continue
-        if now_ts - queue_since.get(candidate_id, now_ts) > QUEUE_STALE_AFTER and candidate_id not in user_room:
-            stale.append(candidate_id)  # хто в кімнаті — точно поруч, його не перепитуємо
-            continue
-        score = match_score(u, p_candidate, mode)
-        if best is None or score > best[0]:
-            best = (score, i)
-            if score >= MATCH_SCORE_MAX:
-                break
-    match_index = best[1] if best else None
-
-    if match_index is not None:
-        partner_id = queue.pop(match_index)
-        await pull_from_room(partner_id)
-        active_chats[user_id] = partner_id
-        active_chats[partner_id] = user_id
-        p = init_user(partner_id)
-
-        ok_partner = await safe_send(
-            partner_id, f"Партнера знайдено! 🤫\nІнфо: {short_info(u)}", reply_markup=get_chat_keyboard()
-        )
-        if not ok_partner:
-            # співрозмовник заблокував бота — відкочуємо і ставимо користувача в чергу
-            end_chat(user_id)
-            queue.append(user_id)
-            queue_since[user_id] = time.time()
-            search_mode[user_id] = mode
-            await message.answer("Співрозмовник виявився недоступним. Шукаємо далі... ⏳")
-            return
-
-        u["total_chats"] = u.get("total_chats", 0) + 1
-        p["total_chats"] = p.get("total_chats", 0) + 1
-        on_chat_started(user_id, partner_id, mode)
-
-        await message.answer(
-            f"Партнера знайдено! 🤫\nІнфо: {short_info(p)}", reply_markup=get_chat_keyboard()
-        )
-        if mode == "flirt":
-            await message.answer(FLIRT_RULES)
-            await safe_send(partner_id, FLIRT_RULES)
-        elif mode.startswith("int:"):
-            topic_note = f"🧩 Ваша спільна тема: <b>{INTEREST_LABELS.get(mode[4:], mode[4:])}</b> — є з чого почати 😉"
-            await message.answer(topic_note)
-            await safe_send(partner_id, topic_note)
-        elif mode == "voice":
-            await message.answer(voice_chat_note(u))
-            await safe_send(partner_id, voice_chat_note(p))
-        if not mode.startswith("int:"):
-            await send_interest_notes(user_id, u, partner_id, p)
-        await send_vibe_notes(user_id, u, partner_id, p)
-        await send_match_safety(user_id, u)
-        await send_match_safety(partner_id, p)
-    else:
-        if has_perk(u, "priority") or is_premium(u):
-            queue.insert(0, user_id)
-        else:
-            queue.append(user_id)
-        queue_since[user_id] = time.time()
-        search_mode[user_id] = mode
-        bg_notified.pop(user_id, None)
-        for sid in stale:
-            await ask_still_here(sid)
-        if mode == "flirt":
-            looking_for = "дівчину" if u.get("gender") == "Хлопець" else "хлопця"
-            wait_text = f"❤️ Шукаємо {looking_for} для флірту... Зачекай ⏳"
-        elif mode == "voice":
-            wait_text = (
-                "🎙 Шукаємо співрозмовника для голосового чату... Зачекай ⏳\n"
-                f"Твій голос змінить маска: <b>{voice_mask_label(u, for_voice_chat=True)}</b> (змінити: /voice)"
-            )
-        elif mode.startswith("int:"):
-            wait_text = (
-                f"🧩 Шукаємо співрозмовника за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}... Зачекай ⏳\n"
-                f"Якщо довго нікого немає — натисни «{BTN_STOP}» і спробуй звичайний пошук."
-            )
-        else:
-            wait_text = "Шукаємо співрозмовника... Зачекай ⏳"
-            schedule_filter_nudge(user_id)
-        if not current_mood(u) and mode != "flirt":
-            wait_text += "\n\n🎭 Поки чекаєш — вкажи свій настрій: /mood. Бот спершу шукатиме когось на одній хвилі."
-        wait_text += "\n\n🔔 Можеш закрити бот — щойно хтось знайдеться, я напишу."
-        await message.answer(wait_text, reply_markup=get_main_keyboard())
-        await offer_rooms_while_waiting(user_id, mode)
-        await maybe_show_ad(user_id)
-        schedule_stuck_offer(user_id, mode)
-        schedule_wait_ping(user_id, mode)
-        schedule_admin_wait_alert(user_id, mode)
-
-
-@dp.message(F.text == BTN_STOP)
-@dp.message(F.text == BTN_SEARCHING)
-@dp.message(Command("stop"))
-async def stop_chat(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-
-    if user_id in queue:
-        queue.remove(user_id)
-        await message.answer("Пошук зупинено.", reply_markup=get_main_keyboard())
-        return
-
-    partner_id = end_chat(user_id)
-    if partner_id is None:
-        await message.answer("Ти зараз не в чаті.", reply_markup=get_main_keyboard())
-        return
-
-    await message.answer("Чат завершено.", reply_markup=get_main_keyboard())
-    await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
-    await send_post_chat_menu(user_id, partner_id)
-    await send_post_chat_menu(partner_id, user_id)
-    await auto_search_after_chat(user_id)
-    await auto_search_after_chat(partner_id)
-
-
-@dp.callback_query(F.data.startswith("rate_up_"))
-async def rate_up_handler(call: types.CallbackQuery):
-    target_id = int(call.data[len("rate_up_"):])
-    if pending_rating.get(call.from_user.id) != target_id:
-        await call.answer("Оцінку вже враховано 🙂")
-        return
-    pending_rating.pop(call.from_user.id, None)
-    u = init_user(target_id)
-    u["rating_up"] = u.get("rating_up", 0) + 1
-    if pending_top.pop(call.from_user.id, False):
-        top_record_vote(call.from_user.id, target_id, True)
-    task_event(call.from_user.id, "rate")
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await call.answer("Дякуємо за оцінку! 👍")
-
-
-@dp.callback_query(F.data.startswith("rate_down_"))
-async def rate_down_handler(call: types.CallbackQuery):
-    target_id = int(call.data[len("rate_down_"):])
-    if pending_rating.get(call.from_user.id) != target_id:
-        await call.answer("Оцінку вже враховано 🙂")
-        return
-    pending_rating.pop(call.from_user.id, None)
-    u = init_user(target_id)
-    u["rating_down"] = u.get("rating_down", 0) + 1
-    if pending_top.pop(call.from_user.id, False):
-        top_record_vote(call.from_user.id, target_id, False)
-    task_event(call.from_user.id, "rate")
-    await maybe_warn_low_rating(target_id, u)
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await call.answer("Дякуємо за оцінку! 👎")
-
-
-# ---------------------------------------------------------------------------
 # Реконнект з минулим співрозмовником і запрошення друзів у чат (за згодою)
 # ---------------------------------------------------------------------------
 async def try_send_chat_invite(requester_id: int, target_id: int | None) -> str:
@@ -741,57 +331,14 @@ async def top_handler(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == BTN_REPORT)
 async def report_handler(message: types.Message):
-    # Раніше ця кнопка не мала обробника, і текст "🚨 Поскаржитися" пересилався співрозмовнику.
-    global report_counter
+    """Скарга з чату: причина → (за бажанням) доказ → скарга адміну. Див. submit_report."""
     user_id = message.from_user.id
     partner_id = active_chats.get(user_id)
     if partner_id is None:
         await message.answer("Скарга можлива лише під час чату.", reply_markup=get_main_keyboard())
         return
-
-    report_counter += 1
-    reports.append(
-        {
-            "id": report_counter,
-            "from": user_id,
-            "on": partner_id,
-            "time": time.strftime("%d.%m.%Y %H:%M"),
-            "status": "нова",
-        }
-    )
-
-    p = init_user(partner_id)
-    p["reports_received"] = p.get("reports_received", 0) + 1
-    auto_banned = False
-    if p["reports_received"] >= AUTO_BAN_REPORTS and partner_id not in banned_users:
-        banned_users.add(partner_id)
-        register_auto_ban(p)
-        request_save()
-        auto_banned = True
-        if partner_id in queue:
-            queue.remove(partner_id)
-        remove_from_room(partner_id)
-        ban_text, ban_kb = banned_notice(partner_id)
-        await safe_send(partner_id, ban_text, reply_markup=ban_kb)
-
-    if ADMIN_ID:
-        extra = (
-            f"\n\n⛔ Автобан: досягнуто {AUTO_BAN_REPORTS} скарг, користувача заблоковано автоматично."
-            if auto_banned
-            else ""
-        )
-        await safe_send(
-            ADMIN_ID,
-            f"🚨 Нова скарга #{report_counter}\nВід: {admin_label(user_id)}\nНа: {admin_label(partner_id)}{extra}\n\n"
-            "Переглянути список: /admin",
-        )
-    end_chat(user_id)
-    await message.answer(
-        "🚨 Скаргу надіслано, чат завершено. Дякуємо!", reply_markup=get_main_keyboard()
-    )
-    await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
-    await auto_search_after_chat(user_id)
-    await auto_search_after_chat(partner_id)
+    report_pending[user_id] = {"on": partner_id, "msgs": list(recent_msgs.get(partner_id, [])), "ts": time.time()}
+    await message.answer("🚨 Що сталося? Обери причину — так модератор розбереться швидше:", reply_markup=report_reason_kb())
 
 
 # ---------------------------------------------------------------------------
@@ -942,7 +489,7 @@ async def admin_entry(message: types.Message, state: FSMContext):
         return
 
     if user_id in authorized_admins:
-        await message.answer("🔐 <b>Адмін-панель</b>", reply_markup=get_admin_keyboard())
+        await message.answer(f"🔐 <b>Адмін-панель</b> · версія {BOT_VERSION}", reply_markup=get_admin_keyboard())
         return
 
     await message.answer("🔐 Введіть пароль для доступу до адмін-панелі:")
@@ -957,7 +504,7 @@ async def admin_password(message: types.Message, state: FSMContext):
         await message.answer("❌ Невірний пароль.")
         return
     authorized_admins.add(user_id)
-    await message.answer("✅ Доступ надано.\n\n🔐 <b>Адмін-панель</b>", reply_markup=get_admin_keyboard())
+    await message.answer(f"✅ Доступ надано.\n\n🔐 <b>Адмін-панель</b> · версія {BOT_VERSION}", reply_markup=get_admin_keyboard())
 
 
 def admin_only(func):
@@ -1004,8 +551,9 @@ def _sum_stats(days: list[str]) -> dict:
             if key == "active":
                 total["active"] |= val
             elif isinstance(val, dict):
+                bucket = total.setdefault(key, {})
                 for sub, amount in val.items():
-                    total[key][sub] = total[key].get(sub, 0) + amount
+                    bucket[sub] = bucket.get(sub, 0) + amount
             else:
                 total[key] = total.get(key, 0) + val
     return total
@@ -1070,6 +618,9 @@ def admin_stats_text(period: str) -> str:
         f"     ❤️ флірт {t['flirt']} · 🧩 інтереси {t['interest']} · 👫 друзі {t['friends']}",
         f"✉️ Повідомлень: {t['msgs']}",
         f"👋 Покликано «хтось шукає»: {t.get('wait_pings', 0)}",
+        f"🧭 Кімнати: входів {t.get('room_join', 0)} · фоновий пошук {t.get('bg_search', 0)} · "
+        f"«Ми скучили» {t.get('comeback', 0)}" + (f" · 🎃 гарбузів {t.get('pumpkins', 0)}" if t.get('pumpkins') else ""),
+        "🚨 Скарги: " + (" ".join(f"{REPORT_REASONS.get(k, k).split(' ')[0]}{n}" for k, n in t.get("reports", {}).items()) or "0"),
         "",
         f"💰 Поповнення: <b>{_money(topup_total)} грн</b> ({t['topup_n']} {_plural(t['topup_n'], 'оплата', 'оплати', 'оплат')})",
     ]
@@ -1275,7 +826,11 @@ async def adm_reports(call: types.CallbackQuery):
     lines = ["🚨 <b>Скарги (нові):</b>\n"]
     buttons = []
     for r in chunk:
-        lines.append(f"#{r['id']} — {r['time']}\nВід {admin_label(r['from'])}\nНа {admin_label(r['on'])}\n")
+        why = REPORT_REASONS.get(r.get("reason"), "") if r.get("reason") else ""
+        lines.append(
+            f"#{r['id']} — {r['time']}" + (f" · <b>{why}</b>" if why else "")
+            + f"\nВід {admin_label(r['from'])}\nНа {admin_label(r['on'])}\n📊 {report_history(r['on'])}\n"
+        )
         buttons.append(
             [
                 InlineKeyboardButton(text=f"⛔ Бан #{r['id']} (на кого скарга)", callback_data=f"adm_banrep_{r['id']}"),
@@ -1829,6 +1384,368 @@ async def adm_payments(call: types.CallbackQuery):
         mark = "📸 є квитанція" if p.get("receipt") else "без квитанції"
         await call.message.answer(f"{_payment_caption(code, p)}\n({mark})", reply_markup=_payment_admin_kb(code))
     await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Переписка з друзями (окремо від анонімного чату)
+# ---------------------------------------------------------------------------
+@dp.message(FriendStates.write)
+async def friend_write_finish(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    target_id = data.get("friend_target")
+    await state.clear()
+    if not target_id:
+        await message.answer("Не вдалося визначити друга. Відкрий «👫 Друзі» ще раз.")
+        return
+    err = await deliver_friend_message(message.from_user.id, target_id, message)
+    if err:
+        await message.answer(f"❌ {err}")
+    else:
+        await message.answer("✅ Надіслано другу.")
+
+
+def _is_reply_to_friend(message: types.Message) -> bool:
+    r = message.reply_to_message
+    return r is not None and (message.chat.id, r.message_id) in friend_msg_map
+
+
+@dp.message(_is_reply_to_friend)
+async def friend_reply(message: types.Message):
+    target_id = friend_msg_map.get((message.chat.id, message.reply_to_message.message_id))
+    if not target_id:
+        return
+    err = await deliver_friend_message(message.from_user.id, target_id, message)
+    if err:
+        await message.answer(f"❌ {err}")
+    else:
+        await message.answer("✅ Надіслано другу.")
+
+
+# ---------------------------------------------------------------------------
+# Оплата через Банку monobank з автоматичним підтвердженням
+# (бот раз на хвилину читає виписку Банки і шукає код платежу в коментарі)
+# ---------------------------------------------------------------------------
+MONO_API = "https://api.monobank.ua"
+MONO_POLL_SECONDS = 65  # API дозволяє виписку не частіше ніж раз на 60 с
+MONO_SEEN_LIMIT = 2000
+MONO_CODE_REGEX = re.compile(r"[PР]\s?(\d{6})", re.IGNORECASE)  # латинська P або кирилична Р
+mono_state = {"jar": None, "last_poll": None, "last_error": None, "jars": []}
+
+
+def mono_jar_link() -> str:
+    if PAY_JAR_LINK:
+        return PAY_JAR_LINK
+    jar = mono_state.get("jar")
+    if jar and jar.get("sendId"):
+        send_id = jar["sendId"]
+        return send_id if send_id.startswith("http") else f"https://send.monobank.ua/{send_id}"
+    return ""
+
+
+async def _mono_get(path: str):
+    """GET до API monobank. Повертає (статус, json або None)."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{MONO_API}{path}", headers={"X-Token": MONO_TOKEN}, timeout=aiohttp.ClientTimeout(total=20)
+        ) as resp:
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:  # noqa: BLE001
+                data = None
+            return resp.status, data
+
+
+def _choose_jar(jars: list[dict]) -> dict | None:
+    if MONO_JAR_ID:
+        return next((j for j in jars if j.get("id") == MONO_JAR_ID), None)
+    if MONO_JAR_TITLE:
+        wanted = MONO_JAR_TITLE.lower()
+        matches = [j for j in jars if wanted in (j.get("title") or "").lower()]
+        return matches[0] if len(matches) == 1 else None
+    uah = [j for j in jars if j.get("currencyCode") in (980, None)]
+    return uah[0] if len(uah) == 1 else None
+
+
+async def mono_detect_jar() -> bool:
+    status, data = await _mono_get("/personal/client-info")
+    if status != 200 or not isinstance(data, dict):
+        desc = (data or {}).get("errorDescription") if isinstance(data, dict) else None
+        mono_state["last_error"] = f"client-info: HTTP {status} {desc or ''}".strip()
+        return False
+    jars = data.get("jars") or []
+    mono_state["jars"] = jars
+    jar = _choose_jar(jars)
+    if jar is None:
+        mono_state["last_error"] = (
+            f"Не вдалося вибрати Банку (знайдено: {len(jars)}). "
+            "Задай MONO_JAR_TITLE (частину назви) або MONO_JAR_ID — список: /mono"
+        )
+        return False
+    mono_state["jar"] = jar
+    mono_state["last_error"] = None
+    logging.info("Monobank: використовую Банку «%s».", jar.get("title"))
+    return True
+
+
+def find_payment_code(comment: str) -> str | None:
+    m = MONO_CODE_REGEX.search(comment or "")
+    return f"P{m.group(1)}" if m else None
+
+
+MONO_MATCH_WINDOW = 30 * 60  # оплата без коду: шукаємо заявку з тією ж сумою за останні 30 хв
+# Надходження без коду, які чекають вибору адміна (лише в пам'яті): ключ -> {"paid", "comment"}
+mono_unmatched: dict[str, dict] = {}
+_mono_unmatched_seq = [0]
+
+
+def _amount_candidates(paid, item_time: float) -> list[str]:
+    """Неоплачені заявки з точно такою ж сумою, створені незадовго до оплати."""
+    found = []
+    for code, p in manual_payments.items():
+        if p.get("status") != "pending" or not p.get("ts"):
+            continue
+        if abs(float(p["amount"]) - float(paid)) >= 0.01:
+            continue
+        if p["ts"] - 120 <= item_time <= p["ts"] + MONO_MATCH_WINDOW:
+            found.append(code)
+    return found
+
+
+def _recent_pending(item_time: float, limit: int = 5) -> list[str]:
+    recent = [
+        (p["ts"], code)
+        for code, p in manual_payments.items()
+        if p.get("status") == "pending" and p.get("ts") and 0 <= item_time - p["ts"] + 120 <= 86400
+    ]
+    return [code for _ts, code in sorted(recent, reverse=True)[:limit]]
+
+
+async def _credit_jar_payment(code: str, paid, how: str) -> str:
+    p = manual_payments[code]
+    expected = p["amount"]
+    if abs(float(paid) - float(expected)) >= 0.01:
+        p["expected_amount"] = expected
+        p["amount"] = paid  # зараховуємо фактично отриману суму
+    p["method"] = "jar"
+    result = await _resolve_payment(code, True)
+    if ADMIN_ID:
+        note = "" if abs(float(paid) - float(expected)) < 0.01 else f" (очікувалось {expected} грн)"
+        await safe_send(ADMIN_ID, f"🤖 {how}{note}:\n{result}")
+    return result
+
+
+async def process_jar_statement(items: list[dict]) -> int:
+    """Обробляє операції з виписки Банки. Повертає, скільки платежів зараховано."""
+    credited = 0
+    changed = False
+    seen = set(mono_seen_ids)
+    for item in sorted(items, key=lambda i: i.get("time", 0)):
+        item_id = str(item.get("id") or "")
+        amount_kop = item.get("amount") or 0
+        if not item_id or item_id in seen or amount_kop <= 0:
+            continue
+        seen.add(item_id)
+        mono_seen_ids.append(item_id)
+        changed = True
+        paid = round(amount_kop / 100, 2)
+        if float(paid).is_integer():
+            paid = int(paid)
+        item_time = float(item.get("time") or time.time())
+        comment = item.get("comment") or ""
+
+        # 1) код у коментарі
+        code = find_payment_code(comment)
+        p = manual_payments.get(code) if code else None
+        if p is not None and p.get("status") == "pending":
+            await _credit_jar_payment(code, paid, "Автоматично через Банку")
+            credited += 1
+            continue
+
+        # 2) коду немає — шукаємо заявку з тією ж сумою
+        candidates = _amount_candidates(paid, item_time)
+        if len(candidates) == 1:
+            await _credit_jar_payment(candidates[0], paid, "Зараховано за сумою (у коментарі не було коду)")
+            credited += 1
+            continue
+
+        # 3) кілька або жодної — питаємо адміна кнопками
+        if not ADMIN_ID:
+            continue
+        options = candidates or _recent_pending(item_time)
+        text = (
+            f"🫙 Надходження в Банку без коду: <b>{paid:g} грн</b>\n"
+            f"Коментар: «{esc(comment) or '—'}»\n"
+        )
+        kb = None
+        if options:
+            _mono_unmatched_seq[0] += 1
+            key = str(_mono_unmatched_seq[0])
+            mono_unmatched[key] = {"paid": paid, "comment": comment}
+            text += (
+                "Кілька заявок з такою сумою — обери, кому зарахувати:"
+                if candidates
+                else "Заявки з такою сумою немає. Ось останні неоплачені — обери, кому зарахувати:"
+            )
+            rows = []
+            for c in options:
+                cp = manual_payments[c]
+                cu = users_db.get(cp["user_id"]) or {}
+                label = f"✅ {c}: {cu.get('nickname', cp['user_id'])} ({cu.get('custom_id', '?')}), заявка {cp['amount']} грн"
+                rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"jp_{key}_{c}")])
+            kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        else:
+            text += "Неоплачених заявок немає. Якщо це оплата від користувача — зарахуй вручну (/addbalance)."
+        await safe_send(ADMIN_ID, text, reply_markup=kb)
+    if len(mono_seen_ids) > MONO_SEEN_LIMIT:
+        del mono_seen_ids[: len(mono_seen_ids) - MONO_SEEN_LIMIT]
+    if changed:
+        request_save()
+    return credited
+
+
+@dp.callback_query(F.data.startswith("jp_"))
+async def jar_pick(call: types.CallbackQuery):
+    """Адмін вибрав, кому зарахувати надходження без коду."""
+    if not _is_admin(call.from_user.id):
+        await call.answer("Доступ заборонено", show_alert=True)
+        return
+    try:
+        _prefix, key, code = call.data.split("_", 2)
+    except ValueError:
+        await call.answer()
+        return
+    entry = mono_unmatched.get(key)
+    if entry is None:
+        await call.answer(
+            "Це надходження вже оброблено або бот перезапускався. Зарахуй вручну: /addbalance", show_alert=True
+        )
+        return
+    p = manual_payments.get(code)
+    if p is None or p.get("status") != "pending":
+        await call.answer("Ця заявка вже оброблена. Обери іншу.", show_alert=True)
+        return
+    mono_unmatched.pop(key, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await _credit_jar_payment(code, entry["paid"], "Зараховано вручну з Банки")
+    await call.answer("Зараховано ✅")
+
+
+async def mono_poll_once():
+    now = int(time.time())
+    # стежимо лише за свіжими заявками (до 3 діб); старші можна підтвердити вручну
+    pending = [
+        p
+        for p in manual_payments.values()
+        if p.get("status") == "pending" and p.get("ts") and now - p["ts"] < 3 * 86400
+    ]
+    if not pending:
+        return
+    oldest = min(int(p["ts"]) for p in pending) - 300
+    frm = max(oldest, now - 2682000 + 60)  # не більше 31 доби + 1 год
+    status, data = await _mono_get(f"/personal/statement/{mono_state['jar']['id']}/{frm}/{now}")
+    mono_state["last_poll"] = time.strftime("%d.%m.%Y %H:%M:%S")
+    if status != 200 or not isinstance(data, list):
+        desc = data.get("errorDescription") if isinstance(data, dict) else ""
+        mono_state["last_error"] = f"statement: HTTP {status} {desc or ''}".strip()
+        logging.warning("Monobank: %s", mono_state["last_error"])
+        return
+    mono_state["last_error"] = None
+    await process_jar_statement(data)
+
+
+async def mono_poll_loop():
+    if not MONO_TOKEN:
+        return
+    await asyncio.sleep(10)
+    while True:
+        try:
+            if mono_state.get("jar") is None:
+                if not await mono_detect_jar():
+                    logging.warning("Monobank: %s", mono_state["last_error"])
+                    await asyncio.sleep(300)
+                    continue
+                await asyncio.sleep(MONO_POLL_SECONDS)  # окремий ліміт для client-info / statement
+            await mono_poll_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            mono_state["last_error"] = str(e)
+            logging.warning("Monobank: помилка перевірки Банки: %s", e)
+        await asyncio.sleep(MONO_POLL_SECONDS)
+
+
+@dp.callback_query(F.data.startswith("topup_jar_"))
+async def topup_pay_jar(call: types.CallbackQuery):
+    link = mono_jar_link()
+    if not link:
+        await call.answer("Цей спосіб оплати зараз недоступний", show_alert=True)
+        return
+    amount = _parse_topup_amount(call.data[len("topup_jar_"):])
+    if amount is None:
+        await call.answer("Недоступна сума.", show_alert=True)
+        return
+    code = new_payment_code()
+    manual_payments[code] = {
+        "user_id": call.from_user.id,
+        "amount": amount,
+        "created": time.strftime("%d.%m.%Y %H:%M"),
+        "ts": time.time(),
+        "status": "pending",
+        "receipt": False,
+        "method": "jar",
+    }
+    request_save()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🫙 Відкрити Банку і оплатити", url=link)],
+            [InlineKeyboardButton(text="📸 Не зарахувалось? Надіслати квитанцію", callback_data=f"bank_paid_{code}")],
+        ]
+    )
+    auto = bool(MONO_TOKEN and mono_state.get("jar"))
+    await call.message.answer(
+        "🫙 <b>Оплата через Банку monobank</b>\n\n"
+        f"1️⃣ Натисни «Відкрити Банку» і введи суму <b>{amount} грн</b>.\n"
+        f"2️⃣ У полі <b>коментар</b> обов'язково напиши код: <code>{code}</code>\n"
+        "3️⃣ Оплати будь-якою карткою.\n\n"
+        + (
+            "🤖 Баланс поповниться <b>автоматично</b> за 1–2 хвилини після оплати."
+            if auto
+            else "⏳ Платіж перевіряється вручну, зазвичай протягом кількох годин."
+        )
+        + f"\n\n⚠️ Без коду {code} у коментарі ми не зможемо знайти твій платіж.",
+        reply_markup=kb,
+    )
+    await call.answer()
+
+
+@dp.message(Command("mono"))
+async def mono_status(message: types.Message):
+    """Адмін: стан підключення до Банки monobank."""
+    if not _is_admin(message.from_user.id):
+        return
+    if not MONO_TOKEN:
+        await message.answer("🫙 MONO_TOKEN не задано в Render — автопідтвердження вимкнене.")
+        return
+    jar = mono_state.get("jar")
+    pending = sum(1 for p in manual_payments.values() if p.get("status") == "pending" and p.get("method") == "jar")
+    lines = ["🫙 <b>Банка monobank</b>"]
+    if jar:
+        lines.append(f"Банка: «{esc(jar.get('title'))}», баланс {jar.get('balance', 0) / 100:g} грн")
+        lines.append(f"Посилання: {esc(mono_jar_link())}")
+    else:
+        lines.append("Банку ще не вибрано.")
+    lines.append(f"Оплат через Банку на перевірці: {pending}")
+    lines.append(f"Остання перевірка виписки: {mono_state.get('last_poll') or '—'}")
+    if mono_state.get("last_error"):
+        lines.append(f"⚠️ Помилка: {esc(mono_state['last_error'])}")
+    if mono_state.get("jars"):
+        lines.append("\nУсі твої Банки (для MONO_JAR_TITLE / MONO_JAR_ID):")
+        for j in mono_state["jars"]:
+            lines.append(f"• «{esc(j.get('title'))}» — <code>{esc(j.get('id'))}</code>")
+    await message.answer("\n".join(lines))
 
 
 
