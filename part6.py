@@ -1925,6 +1925,7 @@ async def main():
     runner = await start_web_server()
     # Дані з бази завантажуємо ДО того, як бот почне приймати повідомлення.
     await load_state_from_db()
+    await chat_log.start()
     poll_task = asyncio.create_task(crypto_poll_loop())
     save_task = asyncio.create_task(persistence_loop())
     lease_task = asyncio.create_task(lease_heartbeat_loop())
