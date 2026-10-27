@@ -1,413 +1,4 @@
 # ---------------------------------------------------------------------------
-# База даних (Postgres): збереження балансів, профілів, друзів тощо між перезапусками.
-# Весь важливий стан зберігається одним "знімком". Якщо DATABASE_URL не задано —
-# бот працює як раніше, лише в пам'яті.
-# ---------------------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-SAVE_INTERVAL = int(os.getenv("SAVE_INTERVAL", "60"))  # секунд між автозбереженнями
-
-_db_ready = False  # True лише після успішного завантаження — щоб не затерти базу порожнім станом
-_last_saved_blob: bytes | None = None
-_save_event = asyncio.Event()
-
-# "Естафета" між копіями бота під час деплою: працює і пише в базу лише власник.
-# Нова копія чекає, поки стара збереже дані й віддасть естафету, — тоді нічого не губиться.
-INSTANCE_ID = os.urandom(6).hex()
-LEASE_HEARTBEAT_SECONDS = 10  # як часто власник відмічається в базі
-LEASE_STALE_SECONDS = 45  # без відмітки стільки секунд — копія вважається мертвою
-LEASE_MAX_WAIT = int(os.getenv("LEASE_MAX_WAIT", "180"))  # макс. очікування старої копії, сек
-_lease_held = False
-_background_tasks: set = set()
-
-
-def request_save():
-    """Попросити зберегти стан якнайшвидше (напр. одразу після оплати)."""
-    _save_event.set()
-
-
-def _db_connect():
-    import ssl
-    from urllib.parse import parse_qs, unquote, urlparse
-
-    import pg8000.native
-
-    url = urlparse(DATABASE_URL)
-    sslmode = (parse_qs(url.query).get("sslmode") or ["require"])[0]
-    host = url.hostname or "localhost"
-    port = url.port or 5432
-    if sslmode == "disable":
-        ssl_context = None
-    elif sslmode in ("verify-ca", "verify-full"):
-        ssl_context = ssl.create_default_context()
-    else:
-        # як sslmode=require: з'єднання шифроване, сертифікат не перевіряється
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-
-    if sslmode not in ("verify-ca", "verify-full"):
-        # Перетворюємо назву сервера на IP-адресу (спершу IPv4): бібліотека на Render
-        # падала з "... does not appear to be an IPv4 or IPv6 address" на назві сервера.
-        import socket
-
-        try:
-            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-        except socket.gaierror:
-            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-        if not infos:
-            raise ConnectionError(f"Не вдалося знайти IP-адресу сервера бази {host}")
-        host = infos[0][4][0]
-
-    return pg8000.native.Connection(
-        user=unquote(url.username or ""),
-        password=unquote(url.password or ""),
-        host=host,
-        port=port,
-        database=(url.path or "/postgres").lstrip("/") or "postgres",
-        ssl_context=ssl_context,
-        timeout=30,
-    )
-
-
-def _db_init_tables():
-    con = _db_connect()
-    try:
-        con.run(
-            "CREATE TABLE IF NOT EXISTS bot_state ("
-            " id INTEGER PRIMARY KEY,"
-            " data BYTEA NOT NULL,"
-            " prev_data BYTEA,"
-            " updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-        )
-        con.run(
-            "CREATE TABLE IF NOT EXISTS bot_lease ("
-            " id INTEGER PRIMARY KEY,"
-            " owner TEXT,"
-            " heartbeat TIMESTAMPTZ NOT NULL DEFAULT now())"
-        )
-    finally:
-        con.close()
-
-
-def _db_try_acquire(force: bool = False) -> bool:
-    """Забрати естафету: якщо вона вільна, наша, прострочена — або примусово."""
-    con = _db_connect()
-    try:
-        rows = con.run(
-            "INSERT INTO bot_lease (id, owner, heartbeat) VALUES (1, :me, now()) "
-            "ON CONFLICT (id) DO UPDATE SET owner = EXCLUDED.owner, heartbeat = now() "
-            "WHERE bot_lease.owner IS NULL OR bot_lease.owner = EXCLUDED.owner "
-            f"OR bot_lease.heartbeat < now() - interval '{LEASE_STALE_SECONDS} seconds' OR :force "
-            "RETURNING owner",
-            me=INSTANCE_ID,
-            force=bool(force),
-        )
-        return bool(rows)
-    finally:
-        con.close()
-
-
-def _db_heartbeat() -> bool:
-    """Відмітка "я живий". False — естафету в нас забрали."""
-    con = _db_connect()
-    try:
-        rows = con.run(
-            "UPDATE bot_lease SET heartbeat = now() WHERE id = 1 AND owner = :me RETURNING id",
-            me=INSTANCE_ID,
-        )
-        return bool(rows)
-    finally:
-        con.close()
-
-
-def _db_release():
-    con = _db_connect()
-    try:
-        con.run("UPDATE bot_lease SET owner = NULL WHERE id = 1 AND owner = :me", me=INSTANCE_ID)
-    finally:
-        con.close()
-
-
-def _db_load_blob() -> bytes | None:
-    con = _db_connect()
-    try:
-        rows = con.run("SELECT data FROM bot_state WHERE id = 1")
-        return bytes(rows[0][0]) if rows else None
-    finally:
-        con.close()
-
-
-def _db_load_prev_blob() -> bytes | None:
-    con = _db_connect()
-    try:
-        rows = con.run("SELECT prev_data FROM bot_state WHERE id = 1")
-        return bytes(rows[0][0]) if rows and rows[0][0] is not None else None
-    finally:
-        con.close()
-
-
-def _db_save_blob(blob: bytes) -> bool:
-    """Записує дані, ЛИШЕ якщо естафета наша (одним запитом, з блокуванням). False — не наша."""
-    con = _db_connect()
-    try:
-        # попередню версію зберігаємо в prev_data — запасна копія
-        rows = con.run(
-            "WITH lease AS (SELECT 1 FROM bot_lease WHERE id = 1 AND owner = :me FOR UPDATE) "
-            "INSERT INTO bot_state (id, data) SELECT 1, :d FROM lease "
-            "ON CONFLICT (id) DO UPDATE SET prev_data = bot_state.data, data = EXCLUDED.data, updated_at = now() "
-            "RETURNING id",
-            d=blob,
-            me=INSTANCE_ID,
-        )
-        return bool(rows)
-    finally:
-        con.close()
-
-
-def _make_snapshot() -> bytes:
-    import pickle
-
-    return pickle.dumps(
-        {
-            "version": 1,
-            "users_db": users_db,
-            "user_counter": user_counter,
-            "banned_users": banned_users,
-            "reports": reports,
-            "report_counter": report_counter,
-            "pending_crypto_invoices": pending_crypto_invoices,
-            "manual_payments": manual_payments,
-            "mono_seen_ids": mono_seen_ids,
-            "gift_revenue_total": gift_revenue_total,
-            "lottery_revenue_total": lottery_revenue_total,
-            "ads": ads,
-            "ad_counter": ad_counter,
-            "stats_days": stats_days,
-            "banners": banners,
-            "ref_contest": ref_contest,
-            "top_week": top_week,
-            "meet_hour": meet_hour,
-            "launch_state": launch_state,
-            "confess_db": confess_db,
-            "letters_db": letters_db,
-            "withdraw_db": withdraw_db,
-        },
-        protocol=4,
-    )
-
-
-def _apply_snapshot(blob: bytes):
-    import copy
-    import pickle
-
-    global user_counter, report_counter, gift_revenue_total, lottery_revenue_total, ad_counter
-    data = pickle.loads(blob)
-
-    users_db.clear()
-    users_db.update(data.get("users_db", {}))
-    banned_users.clear()
-    banned_users.update(data.get("banned_users", set()))
-    reports.clear()
-    reports.extend(data.get("reports", []))
-    pending_crypto_invoices.clear()
-    pending_crypto_invoices.update(data.get("pending_crypto_invoices", {}))
-    manual_payments.clear()
-    manual_payments.update(data.get("manual_payments", {}))
-    mono_seen_ids.clear()
-    mono_seen_ids.extend(data.get("mono_seen_ids", []))
-    user_counter = data.get("user_counter", user_counter)
-    report_counter = data.get("report_counter", report_counter)
-    gift_revenue_total = data.get("gift_revenue_total", gift_revenue_total)
-    lottery_revenue_total = data.get("lottery_revenue_total", lottery_revenue_total)
-    ads.clear()
-    ads.extend(data.get("ads", []))
-    ad_counter = data.get("ad_counter", ad_counter)
-    stats_days.clear()
-    stats_days.update(data.get("stats_days", {}))
-    banners.clear()
-    banners.update(data.get("banners", {}))
-    ref_contest.clear()
-    ref_contest.update(data.get("ref_contest") or {"week": None, "counts": {}, "awarded": [], "history": []})
-    top_week.clear()
-    top_week.update(data.get("top_week") or {"week": None, "votes": {}, "pairs": set(), "published": [], "history": []})
-    meet_hour.clear()
-    meet_hour.update(data.get("meet_hour") or {"reminded": None, "summary": None, "chats_start": None, "peak": 0, "sent": 0})
-    launch_state.clear()
-    launch_state.update(data.get("launch_state") or {"done": False, "sent": 0})
-    confess_db.clear()
-    confess_db.update(data.get("confess_db") or {"next_id": 1, "pub_no": 0, "items": {}, "last_by": {}})
-    letters_db.clear()
-    letters_db.update(data.get("letters_db") or {"items": [], "delivered_day": None})
-    withdraw_db.clear()
-    withdraw_db.update(data.get("withdraw_db") or {"next": 1, "items": {}})
-
-    # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
-    saved_counter = user_counter
-    template = init_user(-1)
-    users_db.pop(-1, None)
-    user_counter = saved_counter
-    old_chatters = sorted(
-        (uid for uid, u in users_db.items() if "founder_no" not in u and u.get("total_chats") and uid != ADMIN_ID),
-        key=lambda uid: int(re.sub(r"\D", "", str(users_db[uid].get("custom_id", ""))) or 0),
-    )
-    for u in users_db.values():
-        if "ref_qualified" not in u:
-            # ті, хто вже спілкувався до запуску конкурсу, не зараховуються в нього заднім числом
-            u["ref_qualified"] = bool(u.get("total_chats"))
-        for key, value in template.items():
-            if key not in u:
-                u[key] = copy.deepcopy(value)
-        refresh_default_nick(u)  # «Користувач_N» → «Незнайомець_N» / «Незнайомка_N»
-        if u.get("country") not in (None, "", "Не вказано"):
-            u["country"] = normalize_country(u["country"])  # «Львів» → «Україна»
-    # 👑 ті, хто спілкувався ще до появи значка, стають першими засновниками (за порядком приходу)
-    next_no = max((u.get("founder_no") or 0 for u in users_db.values()), default=0) + 1
-    for uid in old_chatters:
-        if next_no > FOUNDERS_LIMIT:
-            break
-        if uid not in banned_users and not users_db[uid].get("founder_no"):
-            users_db[uid]["founder_no"] = next_no
-            next_no += 1
-
-
-async def load_state_from_db():
-    """Завантажує стан з бази при старті. Без успішного завантаження збереження вимкнене."""
-    global _db_ready, _last_saved_blob, _lease_held
-    if not DATABASE_URL:
-        logging.warning("DATABASE_URL не задано — дані зберігаються лише в пам'яті і зникнуть після перезапуску.")
-        return
-
-    last_error = None
-    for attempt in range(1, 6):
-        try:
-            await asyncio.to_thread(_db_init_tables)
-            break
-        except Exception as e:  # noqa: BLE001
-            last_error = e
-            logging.warning("База даних недоступна (спроба %s/5): %s", attempt, e)
-            await asyncio.sleep(3 * attempt)
-    else:
-        # Краще не запускатись, ніж запуститись з порожніми даними і затерти ними базу.
-        raise SystemExit(f"❌ Не вдалося підключитися до бази даних: {last_error}")
-
-    # Чекаємо, поки попередня копія бота (під час деплою) збереже дані й віддасть естафету.
-    waited = 0.0
-    announced = False
-    while True:
-        force = waited >= LEASE_MAX_WAIT
-        if force:
-            logging.warning("Стара копія бота не віддає естафету %s с — перебираю її примусово.", LEASE_MAX_WAIT)
-        try:
-            if await asyncio.to_thread(_db_try_acquire, force):
-                break
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Помилка при отриманні естафети: %s", e)
-        if not announced:
-            logging.info("Чекаю, поки попередня копія бота збереже дані і вимкнеться...")
-            announced = True
-        await asyncio.sleep(3)
-        waited += 3
-    _lease_held = True
-    logging.info("Естафету отримано (копія %s).", INSTANCE_ID)
-
-    last_error = None
-    for attempt in range(1, 6):
-        try:
-            blob = await asyncio.to_thread(_db_load_blob)
-            break
-        except Exception as e:  # noqa: BLE001
-            last_error = e
-            logging.warning("Не вдалося прочитати дані (спроба %s/5): %s", attempt, e)
-            await asyncio.sleep(3 * attempt)
-    else:
-        raise SystemExit(f"❌ Не вдалося прочитати дані з бази: {last_error}")
-
-    if blob is None:
-        logging.info("База даних порожня — починаємо з нуля.")
-    else:
-        try:
-            _apply_snapshot(blob)
-        except Exception as e:  # noqa: BLE001
-            logging.error("Основна копія даних пошкоджена (%s) — пробую запасну.", e)
-            prev = await asyncio.to_thread(_db_load_prev_blob)
-            if prev is None:
-                raise SystemExit("❌ Дані в базі пошкоджені, а запасної копії немає.")
-            _apply_snapshot(prev)
-        logging.info("Дані завантажено з бази: %s користувачів.", len(users_db))
-        _last_saved_blob = blob
-
-    _db_ready = True
-
-
-async def save_state_to_db():
-    global _last_saved_blob
-    if not _db_ready:
-        return
-    try:
-        blob = _make_snapshot()  # знімок робимо в основному потоці — дані не змінюються посередині
-        if blob == _last_saved_blob:
-            return  # нічого не змінилось
-        if await asyncio.to_thread(_db_save_blob, blob):
-            _last_saved_blob = blob
-        else:
-            _on_lease_lost()
-    except Exception as e:  # noqa: BLE001
-        logging.error("Не вдалося зберегти дані в базу: %s", e)
-
-
-def _on_lease_lost():
-    """Естафету забрала інша (новіша) копія бота — ця копія більше не пише в базу і зупиняється."""
-    global _db_ready, _lease_held
-    if not _lease_held and not _db_ready:
-        return
-    _db_ready = False
-    _lease_held = False
-    logging.error("Естафету забрала інша копія бота — ця копія зупиняється, щоб не зіпсувати дані.")
-    try:
-        # тримаємо посилання на задачу, щоб її не прибрав збирач сміття до виконання
-        _background_tasks.add(asyncio.get_running_loop().create_task(dp.stop_polling()))
-    except Exception as e:  # noqa: BLE001
-        logging.warning("Не вдалося зупинити polling: %s", e)
-
-
-async def lease_heartbeat_loop():
-    while True:
-        await asyncio.sleep(LEASE_HEARTBEAT_SECONDS)
-        if not _lease_held:
-            continue
-        try:
-            still_mine = await asyncio.to_thread(_db_heartbeat)
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Не вдалося відмітитись у базі: %s", e)
-            continue
-        if not still_mine:
-            _on_lease_lost()
-
-
-async def release_lease():
-    """При зупинці (вже після фінального збереження) віддаємо естафету новій копії."""
-    global _lease_held
-    if not _lease_held:
-        return
-    try:
-        await asyncio.to_thread(_db_release)
-        logging.info("Естафету віддано.")
-    except Exception as e:  # noqa: BLE001
-        logging.warning("Не вдалося віддати естафету (нова копія перебере її за %s с): %s", LEASE_STALE_SECONDS, e)
-    _lease_held = False
-
-
-async def persistence_loop():
-    while True:
-        try:
-            await asyncio.wait_for(_save_event.wait(), timeout=SAVE_INTERVAL)
-        except asyncio.TimeoutError:
-            pass
-        _save_event.clear()
-        await save_state_to_db()
-
-
-# ---------------------------------------------------------------------------
 # Мітки джерел: t.me/<бот>?start=tt — щоб бачити, звідки приходять люди
 # ---------------------------------------------------------------------------
 SOURCE_LABELS = {
@@ -646,7 +237,10 @@ async def profile_handler(message: types.Message, state: FSMContext):
         f"• <b>Серія входів:</b> {u.get('checkin_streak', 0)} 🔥\n"
         f"• <b>Рейтинг:</b> {rating_line(u)}\n"
         f"• <b>Інтереси:</b> {interests_line(u)}\n"
-        f"• <b>Настрій:</b> {mood_line(u)}\n\n"
+        f"• <b>Настрій:</b> {mood_line(u)}\n"
+        + (f"• <b>Значок:</b> 🎃 Хелловін 2026\n" if u.get("hw2026") else "")
+        + (f"• <b>Гарбузи:</b> 🎃 {u.get('hw_pumpkins', 0)}/{HW_PUMPKINS_NEED}\n" if halloween_active() else "")
+        + "\n"
         f"🏆 <b>Досягнення:</b> {achievements_text}\n\n"
         f"🎒 <b>Інвентар подарунків:</b> {gifts_text}\n\n"
         f"📜 <b>Архів останніх змін профілю:</b>\n{archive_text}\n\n"
@@ -1834,6 +1428,417 @@ async def lottery_spin_handler(call: types.CallbackQuery):
     text += f"\n\n💰 Баланс: {u['balance']:.2f} грн."
     await call.message.answer(text, reply_markup=get_lottery_keyboard())
     await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Групові кімнати за інтересами
+# ---------------------------------------------------------------------------
+@dp.message(F.text.startswith(BTN_ROOMS))
+@dp.message(Command("rooms"))
+async def rooms_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+
+    if user_id in banned_users:
+        ban_text, ban_kb = banned_notice(user_id)
+        await message.answer(ban_text, reply_markup=ban_kb)
+        return
+    if user_id in user_room:
+        await message.answer("Ти вже в кімнаті. Спочатку вийди з неї.", reply_markup=get_room_keyboard())
+        return
+    if user_id in active_chats:
+        await message.answer("Спочатку заверши приватний чат.", reply_markup=get_chat_keyboard())
+        return
+
+    await send_banner(user_id, "rooms")
+    await message.answer(rooms_intro_text(user_id), reply_markup=get_room_topics_keyboard())
+
+
+@dp.callback_query(F.data.startswith("room_join_"))
+async def room_join(call: types.CallbackQuery):
+    user_id = call.from_user.id
+
+    if user_id in banned_users:
+        await call.answer("⛔ Вас заблоковано в цьому боті.", show_alert=True)
+        return
+    if user_id in user_room:
+        await call.answer("Ти вже в кімнаті. Спочатку вийди з неї.", show_alert=True)
+        return
+    if user_id in active_chats:
+        await call.answer("Спочатку заверши приватний чат.", show_alert=True)
+        return
+
+    topic_key = call.data[len("room_join_"):]
+    if topic_key not in room_topics_now():
+        await call.answer("Невідома тема", show_alert=True)
+        return
+
+    global room_counter
+    target_room_id = None
+    lang = (users_db.get(user_id) or {}).get("lang", "uk")
+    for rid, r in rooms.items():
+        if r["topic"] == topic_key and r.get("lang", "uk") == lang and len(r["members"]) < ROOM_CAPACITY:
+            target_room_id = rid
+            break
+    if target_room_id is None:
+        room_counter += 1
+        target_room_id = f"room_{room_counter}"
+        rooms[target_room_id] = {"topic": topic_key, "members": set(), "lang": lang}
+
+    room = rooms[target_room_id]
+    u = init_user(user_id)
+
+    for member_id in room["members"]:
+        await safe_send(member_id, f"🆕 <b>{esc(u['nickname'])}</b> приєднався до кімнати!")
+
+    room["members"].add(user_id)
+    user_room[user_id] = target_room_id
+
+    room.setdefault("last_msg", time.time())
+    stat_add("room_join")
+    searching = user_id in queue
+    await call.message.answer(
+        f"✅ Ти приєднався до кімнати: <b>{esc(room_topics_now().get(topic_key, topic_key))}</b> "
+        f"({len(room['members'])}/{ROOM_CAPACITY} 👥)\n\n"
+        "Просто пиши текстом — повідомлення побачать усі учасники кімнати."
+        + ("\n\n🔔 Пошук співрозмовника триває — щойно когось знайду, покличу тебе в приватний чат." if searching else ""),
+        reply_markup=get_room_keyboard(),
+    )
+    await call.answer()
+
+
+@dp.message(F.text == BTN_ROOM_LEAVE)
+async def room_leave(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    room_id = user_room.get(user_id)
+    if room_id is None:
+        await message.answer("Ти зараз не в кімнаті.", reply_markup=get_main_keyboard())
+        return
+
+    room = rooms.get(room_id)
+    u = init_user(user_id)
+    remove_from_room(user_id)
+
+    if room:
+        for member_id in room["members"]:
+            await safe_send(member_id, f"🚪 <b>{esc(u['nickname'])}</b> покинув кімнату.")
+
+    await message.answer("Ти вийшов з кімнати.", reply_markup=get_main_keyboard())
+
+
+@dp.message(F.text == BTN_ROOM_REPORT)
+async def room_report_start(message: types.Message):
+    user_id = message.from_user.id
+    room_id = user_room.get(user_id)
+    if room_id is None:
+        await message.answer("Ти зараз не в кімнаті.", reply_markup=get_main_keyboard())
+        return
+    room = rooms.get(room_id)
+    others = [uid for uid in room["members"] if uid != user_id] if room else []
+    if not others:
+        await message.answer("У кімнаті, крім тебе, нікого немає.")
+        return
+
+    rows = [
+        [InlineKeyboardButton(text=users_db[uid]["nickname"], callback_data=f"roomrep_{uid}")]
+        for uid in others
+    ]
+    await message.answer(
+        "🚨 На кого з учасників кімнати поскаржитись?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("roomrep_"))
+async def room_report_submit(call: types.CallbackQuery):
+    global report_counter
+    target_id = int(call.data[len("roomrep_"):])
+    user_id = call.from_user.id
+
+    report_counter += 1
+    reports.append(
+        {
+            "id": report_counter,
+            "from": user_id,
+            "on": target_id,
+            "time": time.strftime("%d.%m.%Y %H:%M"),
+            "status": "нова",
+        }
+    )
+
+    p = init_user(target_id)
+    p["reports_received"] = p.get("reports_received", 0) + 1
+    auto_banned = False
+    if p["reports_received"] >= AUTO_BAN_REPORTS and target_id not in banned_users:
+        banned_users.add(target_id)
+        register_auto_ban(p)
+        request_save()
+        auto_banned = True
+        if target_id in queue:
+            queue.remove(target_id)
+        remove_from_room(target_id)
+        end_chat(target_id)
+        ban_text, ban_kb = banned_notice(target_id)
+        await safe_send(target_id, ban_text, reply_markup=ban_kb)
+
+    if ADMIN_ID:
+        extra = (
+            f"\n\n⛔ Автобан: досягнуто {AUTO_BAN_REPORTS} скарг, користувача заблоковано автоматично."
+            if auto_banned
+            else ""
+        )
+        await safe_send(
+            ADMIN_ID,
+            f"🚨 Скарга з кімнати #{report_counter}\nВід: {admin_label(user_id)}\nНа: {admin_label(target_id)}{extra}",
+        )
+
+    await call.message.answer("🚨 Скаргу надіслано, дякуємо!")
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Пошук та чат
+# ---------------------------------------------------------------------------
+@dp.message(F.text == BTN_SEARCH)
+async def search_partner(message: types.Message, state: FSMContext):
+    await run_search(message, state, "normal")
+
+
+FLIRT_MIN_AGE = 18
+FLIRT_RULES = (
+    "❤️ <b>Флірт-чат</b>\n"
+    "• Повага і згода — понад усе. «Ні» означає «ні».\n"
+    "• Жодних інтимних фото без явної згоди співрозмовника.\n"
+    "• Не тиснемо і не просимо грошей чи контактів.\n"
+    f"• Порушують — тисни «{BTN_REPORT}»."
+)
+
+
+def min_age_ever(u: dict) -> int | None:
+    """Найменший вік, який будь-коли був у профілі (поточний, архів, онбординг)."""
+    ages = []
+    cur = get_age_int(u)
+    if cur is not None:
+        ages.append(cur)
+    if u.get("min_age_seen") is not None:
+        ages.append(int(u["min_age_seen"]))
+    for line in u.get("archive") or []:
+        m = re.search(r"Вік:\s*(\d+)", line)
+        if m:
+            ages.append(int(m.group(1)))
+    return min(ages) if ages else None
+
+
+def flirt_block_reason(u: dict) -> str | None:
+    """Чому людині не можна у флірт-пошук (або None — можна)."""
+    age = get_age_int(u)
+    if age is None or u.get("gender") not in ("Хлопець", "Дівчина"):
+        return "❤️ Щоб увімкнути флірт-пошук, вкажи у профілі стать і вік: /edit_profile"
+    if age < FLIRT_MIN_AGE:
+        return f"❤️ Флірт-пошук доступний лише з {FLIRT_MIN_AGE} років."
+    # Перевірку історії віку (min_age_ever) вимкнено за рішенням власника.
+    # Щоб увімкнути: якщо min_age_ever(u) < FLIRT_MIN_AGE — повертати відмову.
+    return None
+
+
+@dp.message(F.text == BTN_FLIRT)
+@dp.message(Command("flirt"))
+async def flirt_search(message: types.Message, state: FSMContext):
+    u = init_user(message.from_user.id)
+    reason = flirt_block_reason(u)
+    if reason and message.from_user.id not in banned_users:
+        await state.clear()
+        await message.answer(reason)
+        return
+    await send_banner(message.from_user.id, "flirt")
+    await run_search(message, state, "flirt")
+
+
+async def run_search(message: types.Message, state: FSMContext, mode: str = "normal", user_id: int | None = None):
+    await state.clear()
+    user_id = user_id or message.from_user.id
+
+    if user_id in banned_users:
+        ban_text, ban_kb = banned_notice(user_id)
+        await message.answer(ban_text, reply_markup=ban_kb)
+        return
+
+    u = init_user(user_id)
+
+    if user_id in active_chats:
+        await message.answer("Ти вже перебуваєш у чаті!", reply_markup=get_chat_keyboard())
+        return
+    if user_id in queue:
+        await message.answer("Ти вже в черзі пошуку. Зачекай трохи... ⏳")
+        return
+    if user_id in user_room:
+        await message.answer("Спочатку вийди з групової кімнати.", reply_markup=get_room_keyboard())
+        return
+
+    best = None  # (бали, позиція в черзі)
+    stale = []  # давно чекають — спершу питаємо «ти тут?», а не з'єднуємо наосліп
+    now_ts = time.time()
+    for i, candidate_id in enumerate(queue):
+        if search_mode.get(candidate_id, "normal") != mode:
+            continue  # флірт шукає лише флірт, звичайний — лише звичайний
+        p_candidate = init_user(candidate_id)
+        if is_blacklisted(u, user_id, p_candidate, candidate_id):
+            continue
+        if mode == "flirt" and p_candidate.get("gender") == u.get("gender"):
+            continue  # у флірті з'єднуємо лише хлопця з дівчиною
+        if not passes_filters(u, p_candidate) or not passes_filters(p_candidate, u):
+            continue
+        if now_ts - queue_since.get(candidate_id, now_ts) > QUEUE_STALE_AFTER and candidate_id not in user_room:
+            stale.append(candidate_id)  # хто в кімнаті — точно поруч, його не перепитуємо
+            continue
+        score = match_score(u, p_candidate, mode)
+        if best is None or score > best[0]:
+            best = (score, i)
+            if score >= MATCH_SCORE_MAX:
+                break
+    match_index = best[1] if best else None
+
+    if match_index is not None:
+        partner_id = queue.pop(match_index)
+        await pull_from_room(partner_id)
+        active_chats[user_id] = partner_id
+        active_chats[partner_id] = user_id
+        p = init_user(partner_id)
+
+        ok_partner = await safe_send(
+            partner_id, f"Партнера знайдено! 🤫\nІнфо: {short_info(u)}", reply_markup=get_chat_keyboard()
+        )
+        if not ok_partner:
+            # співрозмовник заблокував бота — відкочуємо і ставимо користувача в чергу
+            end_chat(user_id)
+            queue.append(user_id)
+            queue_since[user_id] = time.time()
+            search_mode[user_id] = mode
+            await message.answer("Співрозмовник виявився недоступним. Шукаємо далі... ⏳")
+            return
+
+        u["total_chats"] = u.get("total_chats", 0) + 1
+        p["total_chats"] = p.get("total_chats", 0) + 1
+        on_chat_started(user_id, partner_id, mode)
+
+        await message.answer(
+            f"Партнера знайдено! 🤫\nІнфо: {short_info(p)}", reply_markup=get_chat_keyboard()
+        )
+        if mode == "flirt":
+            await message.answer(FLIRT_RULES)
+            await safe_send(partner_id, FLIRT_RULES)
+        elif mode.startswith("int:"):
+            topic_note = f"🧩 Ваша спільна тема: <b>{INTEREST_LABELS.get(mode[4:], mode[4:])}</b> — є з чого почати 😉"
+            await message.answer(topic_note)
+            await safe_send(partner_id, topic_note)
+        elif mode == "voice":
+            await message.answer(voice_chat_note(u))
+            await safe_send(partner_id, voice_chat_note(p))
+        if not mode.startswith("int:"):
+            await send_interest_notes(user_id, u, partner_id, p)
+        await send_vibe_notes(user_id, u, partner_id, p)
+        await send_match_safety(user_id, u)
+        await send_match_safety(partner_id, p)
+    else:
+        if has_perk(u, "priority") or is_premium(u):
+            queue.insert(0, user_id)
+        else:
+            queue.append(user_id)
+        queue_since[user_id] = time.time()
+        search_mode[user_id] = mode
+        bg_notified.pop(user_id, None)
+        for sid in stale:
+            await ask_still_here(sid)
+        if mode == "flirt":
+            looking_for = "дівчину" if u.get("gender") == "Хлопець" else "хлопця"
+            wait_text = f"❤️ Шукаємо {looking_for} для флірту... Зачекай ⏳"
+        elif mode == "voice":
+            wait_text = (
+                "🎙 Шукаємо співрозмовника для голосового чату... Зачекай ⏳\n"
+                f"Твій голос змінить маска: <b>{voice_mask_label(u, for_voice_chat=True)}</b> (змінити: /voice)"
+            )
+        elif mode.startswith("int:"):
+            wait_text = (
+                f"🧩 Шукаємо співрозмовника за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}... Зачекай ⏳\n"
+                f"Якщо довго нікого немає — натисни «{BTN_STOP}» і спробуй звичайний пошук."
+            )
+        else:
+            wait_text = "Шукаємо співрозмовника... Зачекай ⏳"
+            schedule_filter_nudge(user_id)
+        if not current_mood(u) and mode != "flirt":
+            wait_text += "\n\n🎭 Поки чекаєш — вкажи свій настрій: /mood. Бот спершу шукатиме когось на одній хвилі."
+        wait_text += "\n\n🔔 Можеш закрити бот — щойно хтось знайдеться, я напишу."
+        await message.answer(wait_text, reply_markup=get_main_keyboard())
+        await offer_rooms_while_waiting(user_id, mode)
+        await maybe_show_ad(user_id)
+        schedule_stuck_offer(user_id, mode)
+        schedule_wait_ping(user_id, mode)
+        schedule_admin_wait_alert(user_id, mode)
+
+
+@dp.message(F.text == BTN_STOP)
+@dp.message(F.text == BTN_SEARCHING)
+@dp.message(Command("stop"))
+async def stop_chat(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+
+    if user_id in queue:
+        queue.remove(user_id)
+        await message.answer("Пошук зупинено.", reply_markup=get_main_keyboard())
+        return
+
+    partner_id = end_chat(user_id)
+    if partner_id is None:
+        await message.answer("Ти зараз не в чаті.", reply_markup=get_main_keyboard())
+        return
+
+    await message.answer("Чат завершено.", reply_markup=get_main_keyboard())
+    await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+    await send_post_chat_menu(user_id, partner_id)
+    await send_post_chat_menu(partner_id, user_id)
+    await auto_search_after_chat(user_id)
+    await auto_search_after_chat(partner_id)
+
+
+@dp.callback_query(F.data.startswith("rate_up_"))
+async def rate_up_handler(call: types.CallbackQuery):
+    target_id = int(call.data[len("rate_up_"):])
+    if pending_rating.get(call.from_user.id) != target_id:
+        await call.answer("Оцінку вже враховано 🙂")
+        return
+    pending_rating.pop(call.from_user.id, None)
+    u = init_user(target_id)
+    u["rating_up"] = u.get("rating_up", 0) + 1
+    if pending_top.pop(call.from_user.id, False):
+        top_record_vote(call.from_user.id, target_id, True)
+    task_event(call.from_user.id, "rate")
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer("Дякуємо за оцінку! 👍")
+
+
+@dp.callback_query(F.data.startswith("rate_down_"))
+async def rate_down_handler(call: types.CallbackQuery):
+    target_id = int(call.data[len("rate_down_"):])
+    if pending_rating.get(call.from_user.id) != target_id:
+        await call.answer("Оцінку вже враховано 🙂")
+        return
+    pending_rating.pop(call.from_user.id, None)
+    u = init_user(target_id)
+    u["rating_down"] = u.get("rating_down", 0) + 1
+    if pending_top.pop(call.from_user.id, False):
+        top_record_vote(call.from_user.id, target_id, False)
+    task_event(call.from_user.id, "rate")
+    await maybe_warn_low_rating(target_id, u)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer("Дякуємо за оцінку! 👎")
 
 
 
