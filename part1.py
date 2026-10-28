@@ -10,7 +10,6 @@ import re
 import time
 from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, types
@@ -37,7 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
-BOT_VERSION = "27.10-b"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
+BOT_VERSION = "28.10-f"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -85,8 +84,10 @@ async def track_last_seen(handler, event, data):
 # ---------------------------------------------------------------------------
 import contextvars
 
-LANG_RU_ENABLED = os.getenv("LANG_RU", "0") == "1"
-LANG_LABELS = {"uk": "🇺🇦 Українська", "ru": "🌐 Русский"}
+LANG_RU_ENABLED = os.getenv("LANG_RU", "0") == "1"  # вмикає вибір мови взагалі (російська + англійська)
+LANG_EN_ENABLED = os.getenv("LANG_EN", "1") == "1"  # англійська — можна вимкнути LANG_EN=0
+LANG_LABELS = {"uk": "🇺🇦 Українська", "ru": "🌐 Русский", "en": "🇬🇧 English"}
+TR_LANGS = ("ru", "en")  # мови, на які бот перекладає свої тексти
 CUR_LANG: contextvars.ContextVar = contextvars.ContextVar("cur_lang", default="uk")
 CUR_UID: contextvars.ContextVar = contextvars.ContextVar("cur_uid", default=None)
 # Чия стать визначає закінчення (напр. завдання в грі адресоване співрозмовнику, а не отримувачу)
@@ -100,19 +101,24 @@ if "RU_PAIRS" not in globals():
         RU_PAIRS = {}
         if LANG_RU_ENABLED:
             logging.warning("🌐 LANG_RU=1, але файл lang_ru.py не знайдено поруч із ботом — переклад вимкнено")
+if "EN_PAIRS" not in globals():
+    try:
+        from lang_en import EN_PAIRS
+    except ImportError:
+        EN_PAIRS = {}
+        if LANG_RU_ENABLED and LANG_EN_ENABLED:
+            logging.warning("🌐 Файл lang_en.py не знайдено поруч із ботом — англійська вимкнена")
 
 _CYR = "а-яіїєґёА-ЯІЇЄҐЁ'ʼ"
 _GRN_RX = re.compile(f"(?<![{_CYR}\u2060])грн(?![{_CYR}])")  # «200\u2060грн» — гривні для виводу, лишаються гривнями
-_tr_rx = None
-_tr_map: dict = {}
-_tr_back: dict = {}
+_TR: dict = {}  # мова -> (регулярка, словник, зворотний словник)
 
 
-def _tr_build():
-    global _tr_rx, _tr_map, _tr_back
-    _tr_map = {k: v for k, v in RU_PAIRS.items() if k and k != v}
+def _tr_build(lang: str = "ru"):
+    pairs = RU_PAIRS if lang == "ru" else EN_PAIRS
+    tmap = {k: v for k, v in pairs.items() if k and k != v}
     parts = []
-    for k in sorted(_tr_map, key=len, reverse=True):
+    for k in sorted(tmap, key=len, reverse=True):
         if len(k.strip()) < 3:
             continue  # короткі шматки («з», «Ні») — лише як цілий текст, не всередині речень
         pat = re.escape(k)
@@ -121,9 +127,19 @@ def _tr_build():
         if re.match(f"[{_CYR}]", k[-1]):
             pat += f"(?![{_CYR}])"
         parts.append(pat)
-    _tr_rx = re.compile("|".join(parts)) if parts else None
+    rx = re.compile("|".join(parts)) if parts else None
     # зворотний словник лише для цілих фраз (кнопки, короткі відповіді)
-    _tr_back = {v.strip(): k.strip() for k, v in _tr_map.items() if "\n" not in k and len(k) <= 64}
+    back = {v.strip(): k.strip() for k, v in tmap.items() if "\n" not in k and len(k) <= 64}
+    _TR[lang] = (rx, tmap, back)
+    return _TR[lang]
+
+
+def _tr_get(lang: str):
+    return _TR.get(lang) or _tr_build(lang)
+
+
+def tr_back(lang: str) -> dict:
+    return _tr_get(lang)[2]
 
 
 def protect_text(text) -> str:
@@ -131,17 +147,20 @@ def protect_text(text) -> str:
     return f"{_P0}{text}{_P1}"
 
 
-def tr_ru(text: str) -> str:
-    if _tr_rx is None:
-        _tr_build()
-    if not text or _tr_rx is None:
+def tr_lang(text: str, lang: str) -> str:
+    rx, tmap, _back = _tr_get(lang)
+    if not text or rx is None:
         return text
-    if text in _tr_map:
-        out = _tr_map[text]
+    if text in tmap:
+        out = tmap[text]
     else:
-        out = _tr_rx.sub(lambda m: _tr_map.get(m.group(0), m.group(0)), text)
-    # для російськомовних ціни показуємо в зірках Telegram: 1 грн балансу = 1 ⭐
+        out = rx.sub(lambda m: tmap.get(m.group(0), m.group(0)), text)
+    # для російськомовних і англомовних ціни показуємо в зірках Telegram: 1 грн балансу = 1 ⭐
     return _GRN_RX.sub("⭐", out)
+
+
+def tr_ru(text: str) -> str:
+    return tr_lang(text, "ru")
 
 
 # ⚧ Закінчення за статтю: «поїхав(-ла)» → «поїхав» / «поїхала». Стать не вказана — лишаємо як є.
@@ -188,13 +207,13 @@ def translate_out(text, lang: str, gender=None):
     if not isinstance(text, str):
         return text
     if _P0 not in text:
-        return apply_gender(tr_ru(text) if lang == "ru" else text, gender)
+        return apply_gender(tr_lang(text, lang) if lang in TR_LANGS else text, gender)
     out = []
     for i, chunk in enumerate(re.split(f"({_P0}.*?{_P1})", text, flags=re.S)):
         if chunk.startswith(_P0) and chunk.endswith(_P1):
             out.append(chunk[1:-1])
         else:
-            out.append(apply_gender(tr_ru(chunk) if lang == "ru" else chunk, gender))
+            out.append(apply_gender(tr_lang(chunk, lang) if lang in TR_LANGS else chunk, gender))
     return "".join(out)
 
 
@@ -207,11 +226,11 @@ async def apply_lang_commands(user_id: int, lang: str):
         return  # у адміна свій список команд — не чіпаємо
     try:
         scope = types.BotCommandScopeChat(chat_id=user_id)
-        if lang == "ru":
-            cmds = [types.BotCommand(command=c.command, description=tr_ru(c.description)) for c in DEFAULT_COMMANDS]
+        if lang in TR_LANGS:
+            cmds = [types.BotCommand(command=c.command, description=tr_lang(c.description, lang)) for c in DEFAULT_COMMANDS]
             await bot.set_my_commands(cmds, scope=scope)
         else:
-            await bot.delete_my_commands(scope=scope)
+            await bot.set_my_commands(list(DEFAULT_COMMANDS), scope=scope)
     except Exception as e:  # noqa: BLE001
         logging.warning("Команди для мови: %s", e)
 
@@ -280,7 +299,7 @@ async def i18n_request_middleware(make_request, bot_, method):
         upd = {}
         for name in ("text", "caption", "title", "description"):
             val = getattr(method, name, None)
-            if isinstance(val, str) and (lang == "ru" or _P0 in val or (gender and "(" in val)):
+            if isinstance(val, str) and (lang in TR_LANGS or _P0 in val or (gender and "(" in val)):
                 upd[name] = translate_out(val, lang, gender)
         if isinstance(chat_id, int) and hasattr(method, "disable_notification") and is_quiet_for(chat_id):
             upd["disable_notification"] = True  # 🌙 тихі години: приходить без звуку
@@ -290,7 +309,7 @@ async def i18n_request_middleware(make_request, bot_, method):
             if marked is not markup:
                 markup = marked
                 upd["reply_markup"] = marked
-        if lang == "ru" and markup is not None:
+        if lang in TR_LANGS and markup is not None:
             upd["reply_markup"] = _tr_markup(markup, lang)
         if upd:
             method = method.model_copy(update=upd)
@@ -311,12 +330,12 @@ async def i18n_incoming(handler, event, data):
     try:
         uid = event.from_user.id if event.from_user else None
         text = event.text
-        if text and user_lang(uid) == "ru":
-            if _tr_rx is None:
-                _tr_build()
-            back = _tr_back.get(text.strip())
+        lang_in = user_lang(uid) if text else "uk"
+        if text and lang_in in TR_LANGS:
+            backmap = tr_back(lang_in)
+            back = backmap.get(text.strip())
             if not back and " · " in text:  # кнопки з лічильником: «👥 Комнаты по интересам · сейчас 5»
-                head = _tr_back.get(text.split(" · ")[0].strip())
+                head = backmap.get(text.split(" · ")[0].strip())
                 back = head and head + " · " + text.split(" · ", 1)[1]
             in_talk = uid in active_chats or uid in user_room
             # у чаті перекладаємо лише кнопки (починаються з емодзі), а не слова, які людина пише співрозмовнику
@@ -621,8 +640,9 @@ AGE_RANGES = [
     ("23-27", "23-27", lambda a: 23 <= a <= 27),
     ("28-32", "28-32", lambda a: 28 <= a <= 32),
     ("32-36", "32-36", lambda a: 32 <= a <= 36),
-    ("gt36", "Понад 36", lambda a: a > 36),
+    ("gt36", "36+", lambda a: a > 36),
 ]
+FILTER_COUNTRIES = [("🇺🇦", "Україна"), ("🇵🇱", "Польща"), ("🇩🇪", "Німеччина"), ("🇨🇿", "Чехія")]
 
 # ---------------------------------------------------------------------------
 # Щоденний бонус: кожен день — трохи грн, кожен 5-й день поспіль — подарунок
@@ -701,19 +721,23 @@ def yesterday_str() -> str:
 BTN_SEARCH = "🔍 Шукати співрозмовника"
 BTN_SHOP = "🏪 Магазин"
 BTN_WALLET = "👛 Гаманець"
-BTN_PROFILE = "👤 Мій профіль / Архів"
+BTN_PROFILE = "👤 Профіль"
+BTN_PROFILE_OLD = "👤 Мій профіль / Архів"  # стара назва — для старих клавіатур
 BTN_SETTINGS = "⚙️ Налаштування"
 BTN_STOP = "❌ Завершити чат"
 BTN_REPORT = "🚨 Поскаржитися"
 BTN_GIFT = "🎁 Подарувати"
-BTN_DAILY = "🎁 Щоденний бонус"
+BTN_DAILY = "🎁 Бонус"
+BTN_DAILY_OLD = "🎁 Щоденний бонус"  # стара назва — для старих клавіатур
 BTN_TASKS = "📋 Завдання"
 BTN_LOTTERY = "🎰 Рулетка"
 BTN_TOP = "🏆 Топ дарувальників"
-BTN_FILTERS = "🎯 Фільтри пошуку"
+BTN_FILTERS = "🎯 Фільтри"
+BTN_FILTERS_OLD = "🎯 Фільтри пошуку"  # стара назва — для старих клавіатур
 BTN_BLACKLIST_ADD = "🚫 Чорний список"
 BTN_UNMASK = "🎭 Зняти маску"
-BTN_ROOMS = "👥 Кімнати за інтересами"
+BTN_ROOMS = "👥 Кімнати"
+BTN_ROOMS_OLD = "👥 Кімнати за інтересами"  # стара назва
 BTN_ROOM_LEAVE = "🚪 Вийти з кімнати"
 BTN_ROOM_REPORT = "🚨 Поскаржитися на учасника"
 BTN_HELP = "🆘 Допомога"
@@ -729,11 +753,14 @@ BTN_HALLOWEEN = "🎃 Хелловін"
 BTN_MENU_BACK = "⬅️ Головне меню"
 BTN_BACK_ROOM = "👥 Ти в кімнаті — повернутися"
 BTN_FRIENDS = "👫 Друзі"
-BTN_TOPUP = "💳 Поповнити баланс"
+BTN_TOPUP = "💳 Поповнити"
+BTN_TOPUP_OLD = "💳 Поповнити баланс"  # стара назва — для старих клавіатур
 BTN_ONLINE = "👥 Онлайн"
 BTN_PREMIUM = "💎 Premium"
-BTN_FLIRT = "❤️ Флірт-пошук"
-BTN_INTERESTS = "🧩 За інтересами"
+BTN_FLIRT = "❤️ Флірт"
+BTN_FLIRT_OLD = "❤️ Флірт-пошук"  # стара назва — для старих клавіатур
+BTN_INTERESTS = "🧩 Інтереси"
+BTN_INTERESTS_OLD = "🧩 За інтересами"  # стара назва — для старих клавіатур
 BTN_ADD_FRIEND = "🤝 Додати в друзі"
 
 
@@ -803,9 +830,8 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [K(text=BTN_SEARCH)],
-            [K(text=BTN_VOICE_SEARCH)],
-            [K(text=rooms_button_label())],
-            [K(text=BTN_FLIRT), K(text=BTN_INTERESTS)],
+            [K(text=BTN_VOICE_SEARCH), K(text=rooms_button_label())],
+            [K(text=BTN_FLIRT), K(text=BTN_FILTERS), K(text=BTN_INTERESTS)],
             [K(text=BTN_PREMIUM), K(text=BTN_TOPUP), K(text=BTN_DAILY)],
             [K(text=BTN_PROFILE), K(text=BTN_WALLET), K(text=BTN_MORE)],
         ],
@@ -820,7 +846,7 @@ def get_more_keyboard():
         keyboard=[
             [K(text=BTN_FUN), K(text=BTN_CONFESS), K(text=BTN_LETTER)],
             [K(text=BTN_SHOP), K(text=BTN_TASKS), K(text=BTN_LOTTERY)],
-            [K(text=BTN_FRIENDS), K(text=BTN_FILTERS)],
+            [K(text=BTN_FRIENDS)],
             [K(text=BTN_ONLINE), K(text=BTN_TOP), K(text=BTN_SETTINGS)],
             [K(text=BTN_HELP), K(text=BTN_MENU_BACK)],
         ] + ([[K(text=BTN_HALLOWEEN)]] if halloween_active() else []),
@@ -933,7 +959,8 @@ def get_gender_keyboard():
 
 def get_shop_keyboard():
     rows = []
-    for i, (key, (title, price, _, _)) in enumerate(SHOP.items(), start=1):
+    items = [(k, v) for k, v in SHOP.items() if v[2] not in FREE_FILTERS]  # безкоштовне не продаємо
+    for i, (key, (title, price, _, _)) in enumerate(items, start=1):
         rows.append(
             [InlineKeyboardButton(text=f"{i}. {title} — {price} грн", callback_data=f"buy_{key}")]
         )
@@ -982,8 +1009,10 @@ def get_settings_keyboard(u: dict | None = None):
             ],
             [InlineKeyboardButton(text="🏆 Конкурс запрошень", callback_data="contest_open")],
             [InlineKeyboardButton(text="📋 Чорний список", callback_data="bl_view")],
-            *([[InlineKeyboardButton(text=f"🌐 Мова / Язык: {LANG_LABELS.get(u.get('lang', 'uk'), '')}", callback_data="lang_menu")]]
+            *([[InlineKeyboardButton(text=f"🌐 Мова / Language: {LANG_LABELS.get(u.get('lang', 'uk'), '')}", callback_data="lang_menu")]]
               if LANG_RU_ENABLED else []),
+            *([[InlineKeyboardButton(text=f"🇬🇧 Говорю англійською: {_onoff(u.get('speaks_en'))}", callback_data="set_speaks_en")]]
+              if en_available() and u.get("lang", "uk") != "en" else []),
             [
                 InlineKeyboardButton(
                     text=f"🔒 Захист моїх медіа: {'увімк ✅' if u.get('protect_media') else 'вимк'} (💎)",
@@ -994,69 +1023,104 @@ def get_settings_keyboard(u: dict | None = None):
     )
 
 
+FREE_FILTERS = {"country_filter"}  # фільтр за країною — безкоштовно для всіх; стать і вік — Premium/перк
+
+
 def filter_active(u: dict, perk: str) -> bool:
-    """Чи доступний юзеру цей фільтр (куплений перк або Premium)."""
-    return is_premium(u) or has_perk(u, perk)
+    """Чи доступний юзеру цей фільтр (безкоштовний, куплений перк або Premium)."""
+    return perk in FREE_FILTERS or is_premium(u) or has_perk(u, perk)
+
+
+def age_ranges_for(u: dict) -> list:
+    """Які вікові діапазони можна обирати: дорослим — лише 18+, неповнолітнім фільтр віку не потрібен."""
+    age = get_age_int(u)
+    if age is not None and age < 18:
+        return []
+    return [r for r in AGE_RANGES if r[0] != "lt18"]
+
+
+def clean_age_filter(u: dict):
+    allowed = {r[0] for r in age_ranges_for(u)}
+    sel = u.get("filter_age_ranges") or set()
+    if sel - allowed:
+        u["filter_age_ranges"] = set(sel) & allowed
+
+
+def filters_matching_now(user_id: int) -> int:
+    """Скільки людей у звичайному пошуку зараз підходять під фільтри (і навпаки)."""
+    u = init_user(user_id)
+    n = 0
+    for cid in queue:
+        if cid == user_id or search_mode.get(cid, "normal") != "normal":
+            continue
+        c = users_db.get(cid)
+        if c is None or is_blacklisted(u, user_id, c, cid):
+            continue
+        if passes_filters(u, c) and passes_filters(c, u):
+            n += 1
+    return n
+
+
+def filters_summary(u: dict) -> str:
+    parts = []
+    if filter_active(u, "gender_filter") and u.get("filter_gender"):
+        parts.append("👦 Хлопці" if u["filter_gender"] == "Хлопець" else "👧 Дівчата")
+    if filter_active(u, "age_filter") and u.get("filter_age_ranges"):
+        parts.append("🎂 " + ", ".join(lbl for k, lbl, _ in AGE_RANGES if k in u["filter_age_ranges"]))
+    if u.get("filter_country"):
+        parts.append("🌍 " + esc(u["filter_country"]))
+    return " · ".join(parts) if parts else "без фільтрів — шукаємо всіх"
+
+
+def filters_text(user_id: int) -> str:
+    u = init_user(user_id)
+    clean_age_filter(u)
+    text = (
+        "🎯 <b>Фільтри пошуку</b>\n\n"
+        f"Твої фільтри: <b>{filters_summary(u)}</b>\n"
+        f"🔍 Під них зараз шукають співрозмовника: <b>{filters_matching_now(user_id)}</b>\n\n"
+        "<i>Натискай кнопки — зміни зберігаються одразу.</i>"
+    )
+    if not (filter_active(u, "gender_filter") and filter_active(u, "age_filter")):
+        text += "\n💎 Стать і вік — у Premium. Країна — безкоштовно для всіх."
+    return text
 
 
 def get_filters_menu_keyboard(u: dict):
-    gender_on = filter_active(u, "gender_filter")
-    age_on = filter_active(u, "age_filter")
-    country_on = filter_active(u, "country_filter")
+    g_on, a_on = filter_active(u, "gender_filter"), filter_active(u, "age_filter")
+    lock_g = "" if g_on else "🔒 "
+    lock_a = "" if a_on else "🔒 "
+    cur_g = u.get("filter_gender") if g_on else None
 
-    gender_val = u.get("filter_gender") or "будь-яка"
-    ranges = u.get("filter_age_ranges") or set()
-    age_val = (
-        ", ".join(label for key, label, _ in AGE_RANGES if key in ranges) if ranges else "будь-який"
-    )
-    country_val = u.get("filter_country") or "будь-яка"
+    def gb(label, val, cb):
+        mark = "✅ " if cur_g == val else ""
+        return InlineKeyboardButton(text=f"{mark}{lock_g if not mark else ''}{label}", callback_data=cb if g_on else "f_locked")
 
     rows = [
-        [
-            InlineKeyboardButton(
-                text=f"{'👫' if gender_on else '🔒'} Стать: {gender_val if gender_on else 'куплено в магазині'}",
-                callback_data="f_gender_menu" if gender_on else "buy_gender_filter",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"{'🎂' if age_on else '🔒'} Вік: {age_val if age_on else 'куплено в магазині'}",
-                callback_data="f_age_menu" if age_on else "buy_age_filter",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"{'🌍' if country_on else '🔒'} Країна: {country_val if country_on else 'куплено в магазині'}",
-                callback_data="f_country_menu" if country_on else "buy_country_filter",
-            )
-        ],
-        [InlineKeyboardButton(text="🔄 Скинути всі фільтри", callback_data="f_reset")],
+        [InlineKeyboardButton(text="— 👫 Стать 💎 —", callback_data="f_info_gender")],
+        [gb("👦 Хлопці", "Хлопець", "fg_Хлопець"), gb("👧 Дівчата", "Дівчина", "fg_Дівчина"), gb("Усі", None, "fg_reset")],
     ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def get_filter_gender_keyboard(u: dict):
-    current = u.get("filter_gender")
-    def mark(v):
-        return "✅ " if current == v else ""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"{mark('Хлопець')}Хлопець", callback_data="fg_Хлопець")],
-            [InlineKeyboardButton(text=f"{mark('Дівчина')}Дівчина", callback_data="fg_Дівчина")],
-            [InlineKeyboardButton(text="🔄 Будь-яка (скинути)", callback_data="fg_reset")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="filters_menu")],
+    ranges = age_ranges_for(u)
+    if ranges:
+        rows.append([InlineKeyboardButton(text="— 🎂 Вік 💎 —", callback_data="f_info_age")])
+        sel = (u.get("filter_age_ranges") or set()) if a_on else set()
+        btns = [
+            InlineKeyboardButton(text=f"{'✅ ' if k in sel else lock_a}{lbl}", callback_data=f"fa_{k}" if a_on else "f_locked")
+            for k, lbl, _ in ranges
         ]
-    )
-
-
-def get_filter_age_keyboard(u: dict):
-    selected = u.get("filter_age_ranges") or set()
-    rows = []
-    for key, label, _ in AGE_RANGES:
-        mark = "✅ " if key in selected else ""
-        rows.append([InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"fa_{key}")])
-    rows.append([InlineKeyboardButton(text="🔄 Скинути", callback_data="fa_reset")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="filters_menu")])
+        rows += [btns[i:i + 3] for i in range(0, len(btns), 3)]
+    rows.append([InlineKeyboardButton(text="— 🌍 Країна (безкоштовно) —", callback_data="f_info_country")])
+    cur_c = u.get("filter_country")
+    known = [name for _f, name in FILTER_COUNTRIES]
+    crow = [
+        InlineKeyboardButton(text=f"{'✅' if cur_c == name else ''}{flag}", callback_data=f"fc_{i}")
+        for i, (flag, name) in enumerate(FILTER_COUNTRIES)
+    ]
+    crow.append(InlineKeyboardButton(text=f"{'✅ ' if not cur_c else ''}🌍 Будь-яка", callback_data="fc_any"))
+    rows.append(crow)
+    other = f"✅ ✏️ {cur_c}" if cur_c and cur_c not in known else "✏️ Інша країна"
+    rows.append([InlineKeyboardButton(text=other, callback_data="f_country_menu")])
+    rows.append([InlineKeyboardButton(text="🔄 Скинути все", callback_data="f_reset")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1090,7 +1154,6 @@ def get_admin_keyboard():
             [InlineKeyboardButton(text="📣 Реклама в пошуку", callback_data="adm_ads")],
             [InlineKeyboardButton(text="🏦 Оплати на перевірці", callback_data="adm_payments")],
             [InlineKeyboardButton(text="🖼 Банери", callback_data="adm_banners")],
-            [InlineKeyboardButton(text="💬 Чати", callback_data="chatlog:list:0")],
             [
                 InlineKeyboardButton(text="💸 Виводи", callback_data="adm_wd"),
                 InlineKeyboardButton(text="💰 Топ балансів", callback_data="adm_topbal"),
@@ -1172,7 +1235,7 @@ def init_user(user_id: int) -> dict:
             "joined_at": None,  # коли вперше зайшов у бот (час); у старих користувачів невідомо
             "tg_username": None,  # @username у Telegram (для списку новачків в адмінці)
             "tg_name": None,  # ім'я в Telegram
-            "lang": "uk",  # мова інтерфейсу: "uk" або "ru"
+            "lang": "uk",  # мова інтерфейсу: "uk", "ru" або "en"
             "top_week_count": 0,  # скільки разів потрапляв у топ-3 тижня
             "founder_no": None,  # 👑 номер засновника (перші FOUNDERS_LIMIT, хто справді поспілкувався)
             "source": None,  # звідки прийшов: tt / yt / ig / ref / direct / власна мітка (з посилання ?start=...)
@@ -1222,16 +1285,28 @@ def age_in_ranges(age: int, range_keys: set) -> bool:
     return False
 
 
+def langs_compatible(a: dict, b: dict) -> bool:
+    """Однакова мова — так. Англомовний + той, хто позначив «🇬🇧 Говорю англійською», — теж так."""
+    la, lb = a.get("lang", "uk"), b.get("lang", "uk")
+    if la == lb:
+        return True
+    if la == "en":
+        return bool(b.get("speaks_en"))
+    if lb == "en":
+        return bool(a.get("speaks_en"))
+    return False
+
+
 def passes_filters(viewer: dict, candidate: dict) -> bool:
     """Чи підходить candidate під активні фільтри пошуку viewer (стать/вік/країна)."""
-    if viewer.get("lang", "uk") != candidate.get("lang", "uk"):
-        return False  # люди з різною мовою інтерфейсу не з'єднуються
+    if not langs_compatible(viewer, candidate):
+        return False  # люди без спільної мови не з'єднуються
     if filter_active(viewer, "gender_filter"):
         want = viewer.get("filter_gender")
         if want and candidate.get("gender") != want:
             return False
     if filter_active(viewer, "age_filter"):
-        wanted_ranges = viewer.get("filter_age_ranges") or set()
+        wanted_ranges = (viewer.get("filter_age_ranges") or set()) & {r[0] for r in age_ranges_for(viewer)}
         if wanted_ranges:
             c_age = get_age_int(candidate)
             if c_age is None or not age_in_ranges(c_age, wanted_ranges):

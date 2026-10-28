@@ -942,7 +942,7 @@ def rooms_online() -> int:
 
 def rooms_button_label() -> str:
     n = rooms_online()
-    return f"{BTN_ROOMS} · зараз {n}" if n >= 2 else BTN_ROOMS
+    return f"{BTN_ROOMS} · {n}" if n >= 2 else BTN_ROOMS
 
 
 def rooms_intro_text(user_id: int) -> str:
@@ -1610,7 +1610,6 @@ async def relay_messages(message: types.Message):
         )
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, msg_mark(message))
-        chat_log_message(user_id, message, partner_id, getattr(sent, "message_id", None))
         on_chat_message(user_id)
     except TelegramAPIError:
         end_chat(user_id)
@@ -1679,8 +1678,11 @@ async def setup_bot_commands():
         try:  # меню команд російською — для тих, у кого Telegram російською
             ru_commands = [types.BotCommand(command=c.command, description=tr_ru(c.description)) for c in default_commands]
             await bot.set_my_commands(ru_commands, scope=types.BotCommandScopeDefault(), language_code="ru")
+            if en_available():
+                en_commands = [types.BotCommand(command=c.command, description=tr_lang(c.description, "en")) for c in default_commands]
+                await bot.set_my_commands(en_commands, scope=types.BotCommandScopeDefault(), language_code="en")
         except Exception as e:  # noqa: BLE001
-            logging.warning("Команди російською: %s", e)
+            logging.warning("Команди російською/англійською: %s", e)
 
     if ADMIN_ID:
         admin_commands = default_commands + [
@@ -1709,7 +1711,6 @@ async def main():
     lease_task = asyncio.create_task(lease_heartbeat_loop())
     mono_task = asyncio.create_task(mono_poll_loop())
     contest_task = asyncio.create_task(contest_loop())
-    chatlog_reset_task = asyncio.create_task(chatlog_reset_loop())
     try:
         # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
         # Telegram API не вбивала весь процес (і "Application exited early" на Render).
@@ -1746,7 +1747,6 @@ async def main():
         lease_task.cancel()
         mono_task.cancel()
         contest_task.cancel()
-        chatlog_reset_task.cancel()
         await save_state_to_db()  # фінальне збереження при зупинці (деплой/перезапуск)
         await release_lease()  # тепер нова копія може забрати свіжі дані
         await bot.session.close()

@@ -83,11 +83,8 @@ async def start_handler(message: types.Message, state: FSMContext):
     code = (getattr(message.from_user, "language_code", None) or "uk").lower()
     if LANG_RU_ENABLED and is_new_user and not code.startswith("uk"):
         await message.answer(
-            "🌐 Обери мову / Выбери язык:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text=LANG_LABELS["uk"], callback_data="lang_new_uk"),
-                InlineKeyboardButton(text=LANG_LABELS["ru"], callback_data="lang_new_ru"),
-            ]]),
+            "🌐 Обери мову / Выбери язык / Choose your language:",
+            reply_markup=lang_pick_kb("lang_new_"),
         )
         return
     await send_welcome(message.chat.id, message.from_user.first_name, u, state, message)
@@ -112,10 +109,32 @@ async def send_welcome(chat_id: int, first_name, u: dict, state: FSMContext, mes
         await start_onboarding(chat_id, state)
 
 
-@dp.callback_query(F.data.in_({"lang_new_uk", "lang_new_ru"}))
+def en_available() -> bool:
+    return LANG_RU_ENABLED and LANG_EN_ENABLED and bool(EN_PAIRS)
+
+
+def lang_pick_kb(prefix: str):
+    row = [
+        InlineKeyboardButton(text=LANG_LABELS["uk"], callback_data=f"{prefix}uk"),
+        InlineKeyboardButton(text=LANG_LABELS["ru"], callback_data=f"{prefix}ru"),
+    ]
+    rows = [row]
+    if en_available():
+        rows.append([InlineKeyboardButton(text=LANG_LABELS["en"], callback_data=f"{prefix}en")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def lang_from_cb(data: str) -> str:
+    code = data.rsplit("_", 1)[-1]
+    if code == "en" and not en_available():
+        return "uk"
+    return code if code in LANG_LABELS else "uk"
+
+
+@dp.callback_query(F.data.in_({"lang_new_uk", "lang_new_ru", "lang_new_en"}))
 async def lang_new_pick(call: types.CallbackQuery, state: FSMContext):
     u = init_user(call.from_user.id)
-    u["lang"] = "ru" if call.data == "lang_new_ru" else "uk"
+    u["lang"] = lang_from_cb(call.data)
     request_save()
     CUR_LANG.set(u["lang"])
     try:
@@ -130,20 +149,17 @@ async def lang_new_pick(call: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "lang_menu")
 async def lang_menu(call: types.CallbackQuery):
     await call.message.answer(
-        "🌐 Обери мову / Выбери язык:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=LANG_LABELS["uk"], callback_data="lang_set_uk"),
-            InlineKeyboardButton(text=LANG_LABELS["ru"], callback_data="lang_set_ru"),
-        ]]),
+        "🌐 Обери мову / Выбери язык / Choose your language:",
+        reply_markup=lang_pick_kb("lang_set_"),
     )
     await call.answer()
 
 
-@dp.callback_query(F.data.in_({"lang_set_uk", "lang_set_ru"}))
+@dp.callback_query(F.data.in_({"lang_set_uk", "lang_set_ru", "lang_set_en"}))
 async def lang_set(call: types.CallbackQuery):
     uid = call.from_user.id
     u = init_user(uid)
-    new = "ru" if call.data == "lang_set_ru" else "uk"
+    new = lang_from_cb(call.data)
     if uid in active_chats or uid in queue or uid in user_room:
         await call.answer("Спочатку заверши чат або пошук.", show_alert=True)
         return
@@ -156,8 +172,10 @@ async def lang_set(call: types.CallbackQuery):
         pass
     await call.answer()
     await apply_lang_commands(uid, new)
-    await safe_send(uid, "✅ Мову змінено: українська." if new == "uk" else "✅ Язык изменён: русский.",
-                    reply_markup=get_main_keyboard())
+    done = {"uk": "✅ Мову змінено: українська.", "ru": "✅ Язык изменён: русский.", "en": "✅ Language changed: English."}
+    await safe_send(uid, protect_text(done.get(new, done["uk"])), reply_markup=get_main_keyboard())
+    if new == "en":
+        await safe_send(uid, EN_WELCOME_NOTE)
 
 
 @dp.message(Command("cancel"))
@@ -209,7 +227,7 @@ async def more_back(message: types.Message, state: FSMContext):
 # ---------------------------------------------------------------------------
 # Профіль та архів
 # ---------------------------------------------------------------------------
-@dp.message(F.text == BTN_PROFILE)
+@dp.message(F.text.in_({BTN_PROFILE, BTN_PROFILE_OLD}))
 async def profile_handler(message: types.Message, state: FSMContext):
     await state.clear()
     u = init_user(message.from_user.id)
@@ -334,17 +352,23 @@ async def settings_handler(message: types.Message, state: FSMContext):
 # ---------------------------------------------------------------------------
 # Фільтри пошуку (стать / вік / країна)
 # ---------------------------------------------------------------------------
-@dp.message(F.text == BTN_FILTERS)
+@dp.message(F.text.in_({BTN_FILTERS, BTN_FILTERS_OLD}))
 @dp.message(Command("filters"))
 async def filters_command(message: types.Message, state: FSMContext):
     await state.clear()
-    u = init_user(message.from_user.id)
-    await message.answer(
-        "🎯 <b>Фільтри пошуку</b>\n\n"
-        "Обери, яких співрозмовників шукати. Фільтри, позначені 🔒, "
-        "потрібно спочатку розблокувати в магазині (або купити Premium — тоді доступні всі).",
-        reply_markup=get_filters_menu_keyboard(u),
-    )
+    init_user(message.from_user.id)
+    await message.answer(filters_text(message.from_user.id), reply_markup=get_filters_menu_keyboard(users_db[message.from_user.id]))
+
+
+async def refresh_filters(call: types.CallbackQuery, note: str | None = None):
+    uid = call.from_user.id
+    u = init_user(uid)
+    request_save()
+    try:
+        await call.message.edit_text(filters_text(uid), reply_markup=get_filters_menu_keyboard(u))
+    except TelegramAPIError:
+        pass  # той самий вміст — Telegram не дає «змінити» на ідентичне
+    await call.answer(note or "Збережено ✅")
 
 
 @dp.callback_query(F.data == "filters_menu")
@@ -352,87 +376,92 @@ async def filters_menu_cb(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     u = init_user(call.from_user.id)
     try:
-        await call.message.edit_text(
-            "🎯 <b>Фільтри пошуку</b>\n\nОбери, яких співрозмовників шукати:",
-            reply_markup=get_filters_menu_keyboard(u),
-        )
+        await call.message.edit_text(filters_text(call.from_user.id), reply_markup=get_filters_menu_keyboard(u))
     except TelegramAPIError:
-        await call.message.answer(
-            "🎯 <b>Фільтри пошуку</b>\n\nОбери, яких співрозмовників шукати:",
-            reply_markup=get_filters_menu_keyboard(u),
-        )
+        await call.message.answer(filters_text(call.from_user.id), reply_markup=get_filters_menu_keyboard(u))
     await call.answer()
+
+
+@dp.callback_query(F.data.in_({"f_info_gender", "f_info_age", "f_info_country"}))
+async def filters_info(call: types.CallbackQuery):
+    tips = {
+        "f_info_gender": "👫 Обери, кого шукати: хлопців, дівчат чи всіх. Доступно з 💎 Premium.",
+        "f_info_age": "🎂 Можна обрати кілька діапазонів віку. Доступно з 💎 Premium.",
+        "f_info_country": "🌍 Країна — безкоштовно. Обери прапор або «✏️ Інша країна».",
+    }
+    await call.answer(tips[call.data], show_alert=True)
+
+
+@dp.callback_query(F.data == "f_locked")
+async def filters_locked(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    price = SHOP["gender_filter"][1]
+    await call.answer()
+    await call.message.answer(
+        "💎 <b>Фільтр за статтю й віком</b> — у Premium.\n\n"
+        "З ним бот з'єднуватиме лише з тими, кого ти обереш. Або купи фільтр за статтю окремо на тиждень.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Premium", callback_data="prem_open")],
+            [InlineKeyboardButton(text=f"🎯 Фільтр на тиждень — {price} грн", callback_data="buy_gender_filter")],
+        ]),
+    )
 
 
 @dp.callback_query(F.data == "f_gender_menu")
-async def f_gender_menu(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    if not filter_active(u, "gender_filter"):
-        await call.answer("Спочатку розблокуй цей фільтр у магазині", show_alert=True)
-        return
-    await call.message.edit_text(
-        "👫 Яку стать співрозмовника шукати?", reply_markup=get_filter_gender_keyboard(u)
-    )
-    await call.answer()
+@dp.callback_query(F.data == "f_age_menu")
+async def f_old_submenu(call: types.CallbackQuery):
+    await refresh_filters(call, " ")
 
 
 @dp.callback_query(F.data.startswith("fg_"))
 async def fg_set(call: types.CallbackQuery):
     u = init_user(call.from_user.id)
     if not filter_active(u, "gender_filter"):
-        await call.answer("Спочатку розблокуй цей фільтр у магазині", show_alert=True)
+        await filters_locked(call)
         return
     value = call.data[len("fg_"):]
-    u["filter_gender"] = None if value == "reset" else value
-    await call.message.edit_text(
-        "👫 Яку стать співрозмовника шукати?", reply_markup=get_filter_gender_keyboard(u)
-    )
-    await call.answer("Збережено ✅")
-
-
-@dp.callback_query(F.data == "f_age_menu")
-async def f_age_menu(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    if not filter_active(u, "age_filter"):
-        await call.answer("Спочатку розблокуй цей фільтр у магазині", show_alert=True)
-        return
-    await call.message.edit_text(
-        "🎂 Обери бажані діапазони віку (можна декілька):", reply_markup=get_filter_age_keyboard(u)
-    )
-    await call.answer()
+    u["filter_gender"] = value if value in ("Хлопець", "Дівчина") else None
+    await refresh_filters(call)
 
 
 @dp.callback_query(F.data.startswith("fa_"))
 async def fa_toggle(call: types.CallbackQuery):
     u = init_user(call.from_user.id)
     if not filter_active(u, "age_filter"):
-        await call.answer("Спочатку розблокуй цей фільтр у магазині", show_alert=True)
+        await filters_locked(call)
         return
     value = call.data[len("fa_"):]
-    u.setdefault("filter_age_ranges", set())
+    allowed = {r[0] for r in age_ranges_for(u)}
+    u["filter_age_ranges"] = set(u.get("filter_age_ranges") or set())
     if value == "reset":
         u["filter_age_ranges"] = set()
+    elif value not in allowed:
+        await call.answer("Цей діапазон недоступний", show_alert=True)
+        return
     elif value in u["filter_age_ranges"]:
         u["filter_age_ranges"].discard(value)
     else:
         u["filter_age_ranges"].add(value)
-    await call.message.edit_text(
-        "🎂 Обери бажані діапазони віку (можна декілька):", reply_markup=get_filter_age_keyboard(u)
-    )
-    await call.answer("Збережено ✅")
+    await refresh_filters(call)
+
+
+@dp.callback_query(F.data.startswith("fc_"))
+async def fc_set(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    value = call.data[len("fc_"):]
+    if value == "any":
+        u["filter_country"] = None
+    elif value.isdigit() and int(value) < len(FILTER_COUNTRIES):
+        name = FILTER_COUNTRIES[int(value)][1]
+        u["filter_country"] = None if u.get("filter_country") == name else name
+    await refresh_filters(call)
 
 
 @dp.callback_query(F.data == "f_country_menu")
 async def f_country_menu(call: types.CallbackQuery, state: FSMContext):
-    u = init_user(call.from_user.id)
-    if not filter_active(u, "country_filter"):
-        await call.answer("Спочатку розблокуй цей фільтр у магазині", show_alert=True)
-        return
-    current = u.get("filter_country") or "будь-яка"
     await call.message.answer(
-        f"🌍 Поточний фільтр країни: <b>{esc(current)}</b>\n\n"
-        "Введи назву країни (як у профілі), яку шукати, або /cancel.\n"
-        "Щоб скинути — напиши «скинути»."
+        "🌍 Напиши країну, з якої шукати співрозмовника (наприклад: Франція, США, Канада).\n"
+        "Щоб скинути — напиши «скинути». Скасувати: /cancel"
     )
     await state.set_state(FilterStates.country)
     await call.answer()
@@ -445,12 +474,10 @@ async def f_country_set(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text.lower() in ("скинути", "/reset"):
         u["filter_country"] = None
-        await message.answer("🔄 Фільтр країни скинуто.", reply_markup=get_main_keyboard())
-        return
-    u["filter_country"] = text[:50]
-    await message.answer(
-        f"✅ Фільтр країни встановлено: <b>{esc(u['filter_country'])}</b>", reply_markup=get_main_keyboard()
-    )
+    else:
+        u["filter_country"] = normalize_country(text)[:50]
+    request_save()
+    await message.answer(filters_text(message.from_user.id), reply_markup=get_filters_menu_keyboard(u))
 
 
 @dp.callback_query(F.data == "f_reset")
@@ -459,11 +486,7 @@ async def f_reset(call: types.CallbackQuery):
     u["filter_gender"] = None
     u["filter_age_ranges"] = set()
     u["filter_country"] = None
-    await call.message.edit_text(
-        "🎯 <b>Фільтри пошуку</b>\n\nВсі фільтри скинуто. Обери, яких співрозмовників шукати:",
-        reply_markup=get_filters_menu_keyboard(u),
-    )
-    await call.answer("Скинуто ✅")
+    await refresh_filters(call, "Скинуто ✅")
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +624,7 @@ async def support_finish(message: types.Message, state: FSMContext):
 # ---------------------------------------------------------------------------
 # Щоденний бонус
 # ---------------------------------------------------------------------------
-@dp.message(F.text == BTN_DAILY)
+@dp.message(F.text.in_({BTN_DAILY, BTN_DAILY_OLD}))
 async def daily_checkin(message: types.Message, state: FSMContext):
     await state.clear()
     u = init_user(message.from_user.id)
@@ -859,6 +882,9 @@ async def buy_item(call: types.CallbackQuery, state: FSMContext):
         return
 
     title, price, perk, seconds = item
+    if perk in FREE_FILTERS:
+        await call.answer("Цей фільтр тепер безкоштовний — налаштуй у «🎯 Фільтри» 🙂", show_alert=True)
+        return
     u = init_user(call.from_user.id)
 
     if u["balance"] < price:
@@ -882,10 +908,8 @@ async def buy_item(call: types.CallbackQuery, state: FSMContext):
         u["perks"][perk] = start + seconds
 
     await call.message.answer(f"🎉 Куплено: <b>{esc(title)}</b>. Списано {price} грн.")
-    if key == "gender_filter":
-        await call.message.answer(
-            "👫 Яку стать співрозмовника шукати?", reply_markup=get_filter_gender_keyboard(u)
-        )
+    if key in ("gender_filter", "age_filter"):
+        await call.message.answer(filters_text(call.from_user.id), reply_markup=get_filters_menu_keyboard(u))
     await call.answer()
 
 
@@ -1042,7 +1066,7 @@ async def topup_show_methods(message: types.Message, user_id: int, amount: int):
         buttons.append(
             [InlineKeyboardButton(text=f"💎 Крипта (~{usdt} USDT)", callback_data=f"topup_crypto_{amount}")]
         )
-    ua_only = user_lang(user_id) != "ru"  # Банка й переказ на картку — лише для українців (гривня)
+    ua_only = user_lang(user_id) == "uk"  # Банка й переказ на картку — лише для українців (гривня)
     if mono_jar_link() and ua_only:
         buttons.append(
             [InlineKeyboardButton(text="🫙 Оплатити через Банку monobank", callback_data=f"topup_jar_{amount}")]
@@ -1064,7 +1088,7 @@ def _parse_topup_amount(raw: str) -> int | None:
     return amount
 
 
-@dp.message(F.text == BTN_TOPUP)
+@dp.message(F.text.in_({BTN_TOPUP, BTN_TOPUP_OLD}))
 @dp.message(Command("topup"))
 async def topup_start(message: types.Message, state: FSMContext):
     await send_banner(message.from_user.id, "topup")
@@ -1433,7 +1457,7 @@ async def lottery_spin_handler(call: types.CallbackQuery):
 # ---------------------------------------------------------------------------
 # Групові кімнати за інтересами
 # ---------------------------------------------------------------------------
-@dp.message(F.text.startswith(BTN_ROOMS))
+@dp.message(F.text.startswith(BTN_ROOMS) | (F.text == BTN_ROOMS_OLD))
 @dp.message(Command("rooms"))
 async def rooms_menu(message: types.Message, state: FSMContext):
     await state.clear()
@@ -1642,7 +1666,7 @@ def flirt_block_reason(u: dict) -> str | None:
     return None
 
 
-@dp.message(F.text == BTN_FLIRT)
+@dp.message(F.text.in_({BTN_FLIRT, BTN_FLIRT_OLD}))
 @dp.message(Command("flirt"))
 async def flirt_search(message: types.Message, state: FSMContext):
     u = init_user(message.from_user.id)
@@ -1765,7 +1789,10 @@ async def run_search(message: types.Message, state: FSMContext, mode: str = "nor
             )
         else:
             wait_text = "Шукаємо співрозмовника... Зачекай ⏳"
-            schedule_filter_nudge(user_id)
+            if is_newbie(u):
+                wait_text += NEWBIE_WAIT_LINE
+            else:
+                schedule_filter_nudge(user_id)
         if not current_mood(u) and mode != "flirt":
             wait_text += "\n\n🎭 Поки чекаєш — вкажи свій настрій: /mood. Бот спершу шукатиме когось на одній хвилі."
         wait_text += "\n\n🔔 Можеш закрити бот — щойно хтось знайдеться, я напишу."

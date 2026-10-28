@@ -148,7 +148,6 @@ def task_event(user_id: int, event: str, n: int = 1):
 
 
 def on_chat_started(a: int, b: int, mode: str):
-    chat_log_start(a, b, mode)
     hw_mark_badge(a, b)
     now = time.time()
     for x in (a, b):
@@ -236,7 +235,6 @@ async def founders_cmd(message: types.Message):
 
 
 def on_chat_ended(a: int, b: int):
-    chat_log_end(a, b)
     try:
         ma, mb = chat_meta.pop(a, None), chat_meta.pop(b, None)
         if ma is None or mb is None:
@@ -312,7 +310,17 @@ async def tasks_menu(message: types.Message, state: FSMContext):
 # Рейтинг і інтереси профілю: кого кому підбирати першим
 # ---------------------------------------------------------------------------
 MAX_PROFILE_INTERESTS = 3
-MATCH_SCORE_MAX = 4  # 2 — однаковий «рівень» рейтингу, +1 — є спільний інтерес, +1 — однаковий настрій
+MATCH_SCORE_MAX = 5  # 2 — однаковий «рівень» рейтингу, +1 — спільний інтерес, +1 — настрій, +1 — новачку «теплий» співрозмовник
+
+
+def is_newbie(u: dict) -> bool:
+    """Ще жодного разу ні з ким не з'єднувався."""
+    return not u.get("total_chats")
+
+
+def is_warm(u: dict) -> bool:
+    """Досвідчений і привітний: кілька чатів, рейтинг не низький."""
+    return u.get("total_chats", 0) >= 3 and not is_low_rated(u)
 
 
 def match_score(u: dict, p: dict, mode: str) -> int:
@@ -322,6 +330,8 @@ def match_score(u: dict, p: dict, mode: str) -> int:
         score += 1
     if current_mood(u) and current_mood(u) == current_mood(p):
         score += 1  # 🎭 на одній хвилі
+    if (is_newbie(u) and is_warm(p)) or (is_newbie(p) and is_warm(u)):
+        score += 1  # 🆕 новачку — досвідченого привітного співрозмовника, щоб перший чат вдався
     return score
 
 
@@ -859,6 +869,10 @@ async def prem_open(call: types.CallbackQuery):
 # «Хтось шукає співрозмовника»: якщо людина довго чекає — кличемо тих, хто зараз не в чаті
 # ---------------------------------------------------------------------------
 WAIT_PING_DELAY = int(os.getenv("WAIT_PING_DELAY", "30"))  # секунд очікування до виклику
+WAIT_PING_DELAY_NEWBIE = int(os.getenv("WAIT_PING_DELAY_NEWBIE", "15"))  # новачка не змушуємо чекати
+NEWBIE_WAIT_LINE = (
+    "\n\n👋 Ти тут уперше — я вже кличу людей, які зараз онлайн. Зазвичай це хвилина-дві."
+)
 WAIT_PING_USER_COOLDOWN = int(os.getenv("WAIT_PING_USER_COOLDOWN", str(3 * 3600)))  # одну людину кличемо не частіше
 WAIT_PING_SEEKER_COOLDOWN = 10 * 60  # за одного й того самого шукача кличемо не частіше
 WAIT_PING_MAX = int(os.getenv("WAIT_PING_MAX", "40"))  # скільки людей кличемо за раз
@@ -906,7 +920,10 @@ def wait_ping_recipients(seeker_id: int, mode: str) -> list[int]:
         if mode == "flirt" and (u.get("gender") == s.get("gender") or flirt_block_reason(u) is not None):
             continue
         result.append(uid)
-    result.sort(key=lambda x: last_seen.get(x, 0), reverse=True)  # спершу ті, хто нещодавно заходив
+    if is_newbie(s):  # новачку кличемо спершу привітних досвідчених, далі — хто нещодавно заходив
+        result.sort(key=lambda x: (is_warm(users_db[x]), last_seen.get(x, 0)), reverse=True)
+    else:
+        result.sort(key=lambda x: last_seen.get(x, 0), reverse=True)  # спершу ті, хто нещодавно заходив
     return result[:WAIT_PING_MAX]
 
 
@@ -926,7 +943,7 @@ def wait_ping_text(mode: str) -> str:
 
 async def wait_ping_after_wait(user_id: int, mode: str):
     try:
-        await asyncio.sleep(WAIT_PING_DELAY)
+        await asyncio.sleep(WAIT_PING_DELAY_NEWBIE if is_newbie(init_user(user_id)) else WAIT_PING_DELAY)
         if user_id not in queue or search_mode.get(user_id, "normal") != mode:
             return  # уже знайшов співрозмовника або вийшов з пошуку
         if time.time() - wait_ping_seeker_last.get(user_id, 0) < WAIT_PING_SEEKER_COOLDOWN:
@@ -965,6 +982,8 @@ async def wait_ping_after_wait(user_id: int, mode: str):
 # ---------------------------------------------------------------------------
 ADMIN_WAIT_ALERT_DELAY = int(os.getenv("ADMIN_WAIT_ALERT_DELAY", "60"))
 ADMIN_WAIT_ALERT_COOLDOWN = 120  # не частіше ніж раз на 2 хв
+ADMIN_WAIT_ALERT_DELAY_NEWBIE = int(os.getenv("ADMIN_WAIT_ALERT_DELAY_NEWBIE", "20"))
+admin_newbie_alerted: set = set()  # про кожного новачка кажемо адміну один раз
 admin_wait_alert_last = 0.0
 admin_alerts_enabled = True
 
@@ -978,20 +997,31 @@ def schedule_admin_wait_alert(user_id: int, mode: str):
 async def admin_wait_alert_after(user_id: int, mode: str):
     global admin_wait_alert_last
     try:
-        await asyncio.sleep(ADMIN_WAIT_ALERT_DELAY)
+        u = init_user(user_id)
+        newbie = is_newbie(u) and user_id not in admin_newbie_alerted
+        await asyncio.sleep(ADMIN_WAIT_ALERT_DELAY_NEWBIE if newbie else ADMIN_WAIT_ALERT_DELAY)
         if not admin_alerts_enabled or user_id not in queue or search_mode.get(user_id, "normal") != mode:
             return
         if ADMIN_ID in active_chats or ADMIN_ID in queue or ADMIN_ID in user_room:
             return  # адмін уже спілкується
-        if time.time() - admin_wait_alert_last < ADMIN_WAIT_ALERT_COOLDOWN:
+        if not newbie and time.time() - admin_wait_alert_last < ADMIN_WAIT_ALERT_COOLDOWN:
             return
         admin_wait_alert_last = time.time()
         what = {"normal": "звичайний пошук", "flirt": "флірт"}.get(mode) or (
             f"тема {INTEREST_LABELS.get(mode[4:], mode[4:])}" if mode.startswith("int:") else mode
         )
+        if newbie:
+            admin_newbie_alerted.add(user_id)
+            head = (
+                f"🆕 <b>Новачок</b> уже {ADMIN_WAIT_ALERT_DELAY_NEWBIE} с шукає співрозмовника ({what}) — "
+                f"це його перший пошук! Звідки: {source_label(u.get('source'))}.\n"
+                "Підключишся, щоб перший чат вдався?"
+            )
+        else:
+            head = f"👀 Хтось уже хвилину шукає співрозмовника ({what}).\nПідключишся, щоб людина не пішла?"
         await safe_send(
             ADMIN_ID,
-            f"👀 Хтось уже хвилину шукає співрозмовника ({what}).\nПідключишся, щоб людина не пішла?",
+            head,
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="💬 Підключитися", callback_data=f"wp_go:{mode}")],
@@ -1079,7 +1109,7 @@ async def interests_tab(call: types.CallbackQuery):
     await call.answer("🎯 Захоплення" if tab == "hobby" else "🧩 Інтереси")
 
 
-@dp.message(F.text == BTN_INTERESTS)
+@dp.message(F.text.in_({BTN_INTERESTS, BTN_INTERESTS_OLD}))
 @dp.message(Command("interests"))
 async def interests_menu(message: types.Message, state: FSMContext):
     await state.clear()
@@ -1141,9 +1171,21 @@ def normalize_country(text: str) -> str:
     for _k, _label, name in ONBOARD_COUNTRIES:
         if low == name.lower():
             return name
+    if low in EN_COUNTRY_NAMES:
+        return EN_COUNTRY_NAMES[low]
     if any(p in low for p in UA_PLACES):
         return "Україна"
     return t
+
+
+# Країни англійською → як у профілях (щоб фільтр за країною працював для всіх мов)
+EN_COUNTRY_NAMES = {
+    "ukraine": "Україна", "poland": "Польща", "germany": "Німеччина", "czechia": "Чехія",
+    "czech republic": "Чехія", "spain": "Іспанія", "italy": "Італія", "uk": "Велика Британія",
+    "united kingdom": "Велика Британія", "great britain": "Велика Британія", "england": "Велика Британія",
+    "netherlands": "Нідерланди", "holland": "Нідерланди", "usa": "США", "us": "США", "united states": "США",
+    "america": "США", "canada": "Канада", "france": "Франція",
+}
 ONBOARD_AGE_REGEX = re.compile(r"^\s*(\d{1,3})\s*$")
 
 
@@ -1392,6 +1434,28 @@ async def set_auto(call: types.CallbackQuery):
     await _set_markup(call, get_settings_keyboard(u))
     await call.answer(
         "🔁 Після кожного чату бот одразу шукатиме наступного" if u["auto_search"] else "Автопошук вимкнено"
+    )
+
+
+EN_WELCOME_NOTE = protect_text(
+    "🇬🇧 Most people in the bot speak Ukrainian, so there are fewer English-speaking partners for now. "
+    "We connect you with those who also chose English or marked «🇬🇧 I speak English». "
+    "If no one is around, the search keeps going in the background and the bot will message you as soon as someone appears. "
+    "Invite your friends — the more of you, the faster the search 🙂"
+)
+
+
+@dp.callback_query(F.data == "set_speaks_en")
+async def set_speaks_en(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    u["speaks_en"] = not u.get("speaks_en")
+    request_save()
+    await _set_markup(call, get_settings_keyboard(u))
+    await call.answer(
+        "🇬🇧 Тепер тебе можуть з'єднати і з англомовними співрозмовниками (наприклад, з друзями наших людей за кордоном). "
+        "Чудова практика англійської!"
+        if u["speaks_en"] else "Тепер лише співрозмовники з твоєю мовою інтерфейсу, як раніше.",
+        show_alert=True,
     )
 
 
