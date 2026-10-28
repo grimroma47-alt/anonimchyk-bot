@@ -1614,8 +1614,8 @@ async def relay_masked_voice(message: types.Message, user_id: int, partner_id: i
         )
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, "[голосове з маскою]")
-        chat_log_message(user_id, message, partner_id, getattr(sent, "message_id", None), text_override="[голосове з маскою]")
         on_chat_message(user_id)
+        chat_log_message(user_id, message, partner_id, getattr(sent, "message_id", None), text_override="[голосове з маскою]")
         stat_add("voice_mask")
     except TelegramAPIError:
         end_chat(user_id)
@@ -1723,7 +1723,6 @@ async def voice_mask_pitch(call: types.CallbackQuery):
 
 
 
-
 # ---------------------------------------------------------------------------
 # 💬 Журнал анонімних чатів — лише RAM, без запису тексту в логи/БД/файли
 # ---------------------------------------------------------------------------
@@ -1732,7 +1731,7 @@ CHATLOG_MAX_MESSAGES_PER_CHAT = 100
 CHATLOG_MAX_MESSAGES_TOTAL = 10000
 CHATLOG_MAX_MEDIA_PER_CHAT = 100
 CHATLOG_PAGE_SIZE = 5
-CHATLOG_TZ = ZoneInfo("Europe/Kyiv")
+CHATLOG_TZ = KYIV_TZ
 chatlog_chats: dict[int, dict] = {}
 chatlog_user_chat: dict[int, int] = {}
 chatlog_next_id = 1
