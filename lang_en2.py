@@ -717,6 +717,8 @@ EN_PAIRS2 = {
     "👫 Обери, кого шукати: хлопців, дівчат чи всіх. Доступно з 💎 Premium.": "👫 Choose who to look for: guys, girls or everyone. Available with 💎 Premium.",
     "💎 <b>Фільтр за статтю й віком</b> — у Premium.\n\nЗ ним бот з'єднуватиме лише з тими, кого ти обереш. Або купи фільтр за статтю окремо на тиждень.": "💎 <b>Gender and age filter</b> — in Premium.\n\nWith it the bot will connect you only with those you choose. Or buy the gender filter separately for a week.",
     "🔄 Скинути все": "🔄 Reset all",
+    "↩️ <b>Ви зупинились тут</b> ☝️ — співрозмовник чекає на твою відповідь 💬": "↩️ <b>You stopped here</b> ☝️ — your partner is waiting for your reply 💬",
+    "↩️ <b>Ви зупинились тут</b> ☝️ — останнім писав(-ла) ти, чекаємо відповідь 🙂": "↩️ <b>You stopped here</b> ☝️ — you wrote last, waiting for a reply 🙂",
 }
 
 # === КІНЕЦЬ lang_en2.py ===
