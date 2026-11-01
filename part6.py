@@ -1496,6 +1496,27 @@ def remember_pair_msg(user_id: int, my_id, partner_id: int, their_id) -> None:
         pair_msgs.pop(next(iter(pair_msgs)), None)
     pair_msgs[(user_id, my_id)] = (partner_id, their_id)
     pair_msgs[(partner_id, their_id)] = (user_id, my_id)
+    # ↩️ «Ви зупинились тут»: пам'ятаємо лише id останнього повідомлення (не текст)
+    last_chat_msg[user_id] = (partner_id, my_id, "me")
+    last_chat_msg[partner_id] = (user_id, their_id, "them")
+
+
+# user_id -> (partner_id, message_id у чаті user_id, хто писав: "me"/"them") — лише в пам'яті
+last_chat_msg: dict[int, tuple[int, int, str]] = {}
+
+
+def resume_kwargs(user_id: int) -> tuple[dict, str]:
+    """Цитата останнього повідомлення поточного чату + підпис «Ви зупинились тут»."""
+    hit = last_chat_msg.get(user_id)
+    partner_id = active_chats.get(user_id)
+    if not hit or partner_id is None or hit[0] != partner_id:
+        return {}, ""
+    line = (
+        "↩️ <b>Ви зупинились тут</b> ☝️ — співрозмовник чекає на твою відповідь 💬"
+        if hit[2] == "them" else
+        "↩️ <b>Ви зупинились тут</b> ☝️ — останнім писав(-ла) ти, чекаємо відповідь 🙂"
+    )
+    return {"reply_parameters": types.ReplyParameters(message_id=hit[1], allow_sending_without_reply=False)}, line
 
 
 def reply_kwargs(message, partner_id: int) -> dict:
@@ -1611,7 +1632,6 @@ async def relay_messages(message: types.Message):
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, msg_mark(message))
         on_chat_message(user_id)
-        chat_log_message(user_id, message, partner_id, getattr(sent, "message_id", None))
     except TelegramAPIError:
         end_chat(user_id)
         await message.answer(
@@ -1712,7 +1732,6 @@ async def main():
     lease_task = asyncio.create_task(lease_heartbeat_loop())
     mono_task = asyncio.create_task(mono_poll_loop())
     contest_task = asyncio.create_task(contest_loop())
-    chatlog_reset_task = asyncio.create_task(chatlog_reset_loop())
     try:
         # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
         # Telegram API не вбивала весь процес (і "Application exited early" на Render).
@@ -1749,7 +1768,6 @@ async def main():
         lease_task.cancel()
         mono_task.cancel()
         contest_task.cancel()
-        chatlog_reset_task.cancel()
         await save_state_to_db()  # фінальне збереження при зупинці (деплой/перезапуск)
         await release_lease()  # тепер нова копія може забрати свіжі дані
         await bot.session.close()
