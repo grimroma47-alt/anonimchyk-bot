@@ -42,6 +42,21 @@ def source_breakdown(ids: list[int]) -> list[tuple[str, int, int]]:
 
 
 # ---------------------------------------------------------------------------
+# 💜 Повідомлення в кімнаті друга (тема в чаті з ботом) — йдуть одразу цьому другу.
+# Стоїть перед усіма обробниками, щоб текст не сприймався як дія меню.
+# ---------------------------------------------------------------------------
+@dp.message(lambda m: _in_friend_topic(m))
+async def friend_topic_message(message: types.Message):
+    uid = message.from_user.id
+    fid = friend_by_topic(uid, message.message_thread_id)
+    if fid is None:
+        return
+    err = await deliver_friend_message(uid, fid, message)
+    if err:
+        await message.answer(f"❌ {err}")
+
+
+# ---------------------------------------------------------------------------
 # Команди
 # ---------------------------------------------------------------------------
 @dp.message(CommandStart())

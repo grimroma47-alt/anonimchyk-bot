@@ -109,18 +109,6 @@ if "EN_PAIRS" not in globals():
         if LANG_RU_ENABLED and LANG_EN_ENABLED:
             logging.warning("🌐 Файл lang_en.py не знайдено поруч із ботом — англійська вимкнена")
 
-# Додаткові словники перекладу (друга частина) — якщо файли є поруч із ботом.
-try:
-    from lang_ru2 import RU_PAIRS2
-    RU_PAIRS.update(RU_PAIRS2)
-except (ImportError, NameError):
-    pass
-try:
-    from lang_en2 import EN_PAIRS2
-    EN_PAIRS.update(EN_PAIRS2)
-except (ImportError, NameError):
-    pass
-
 _CYR = "а-яіїєґёА-ЯІЇЄҐЁ'ʼ"
 _GRN_RX = re.compile(f"(?<![{_CYR}\u2060])грн(?![{_CYR}])")  # «200\u2060грн» — гривні для виводу, лишаються гривнями
 _TR: dict = {}  # мова -> (регулярка, словник, зворотний словник)

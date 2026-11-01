@@ -719,6 +719,11 @@ EN_PAIRS2 = {
     "🔄 Скинути все": "🔄 Reset all",
     "↩️ <b>Ви зупинились тут</b> ☝️ — співрозмовник чекає на твою відповідь 💬": "↩️ <b>You stopped here</b> ☝️ — your partner is waiting for your reply 💬",
     "↩️ <b>Ви зупинились тут</b> ☝️ — останнім писав(-ла) ти, чекаємо відповідь 🙂": "↩️ <b>You stopped here</b> ☝️ — you wrote last, waiting for a reply 🙂",
+    "👫 <b>Твої друзі</b>\n\nНатисни «✍️» біля імені, щоб написати другу, або «❌», щоб прибрати з друзів.\n\n💜 У кожного друга — своя кімната (тема) в цьому чаті: відкрий її й просто пиши. Анонімний чат при цьому не переривається.": "👫 <b>Your friends</b>\n\nTap «✍️» next to a name to message a friend, or «❌» to remove them.\n\n💜 Each friend has their own room (topic) in this chat: open it and just write. Your anonymous chat isn't interrupted.",
+    "💜 Це ваша кімната з <b>": "💜 This is your room with <b>",
+    "</b>.\nПиши сюди — повідомлення побачить лише цей друг. Анонімний чат і меню — в основному чаті.": "</b>.\nWrite here — only this friend will see your messages. The anonymous chat and menu are in the main chat.",
+    "✍️ Пиши сюди 👇": "✍️ Write here 👇",
+    "💜 Кімната з другом — у списку тем цього чату": "💜 Your room with this friend is in this chat's topic list",
 }
 
 # === КІНЕЦЬ lang_en2.py ===
