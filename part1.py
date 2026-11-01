@@ -36,7 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
-BOT_VERSION = "28.10-f"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
+BOT_VERSION = "01.11-a"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -1142,7 +1142,6 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
-            [InlineKeyboardButton(text="💬 Чати", callback_data="chatlog:list:0")],
             [InlineKeyboardButton(text="🔗 Посилання з мітками", callback_data="adm_links")],
             [InlineKeyboardButton(text="🎁 Подарувати подарунок", callback_data="adm_gift")],
             [InlineKeyboardButton(text="🚨 Скарги", callback_data="adm_reports_0")],
@@ -1474,6 +1473,8 @@ def end_chat(user_id: int):
         unmask_requests.pop(partner_id, None)
         unmask_done.discard(frozenset((user_id, partner_id)))
         game_state.pop(frozenset((user_id, partner_id)), None)
+        last_chat_msg.pop(user_id, None)
+        last_chat_msg.pop(partner_id, None)
         forget_recent(user_id, partner_id)
         on_chat_ended(user_id, partner_id)
         if user_id in users_db:
