@@ -1677,7 +1677,6 @@ async def relay_messages(message: types.Message):
         return
     if getattr(message, "voice", None) and (in_voice_chat or voice_mask_active(users_db.get(user_id) or {})):
         await relay_masked_voice(message, user_id, partner_id, force=in_voice_chat)
-        chatlog_record(user_id, message)
         return
 
     try:
@@ -1686,8 +1685,8 @@ async def relay_messages(message: types.Message):
         )
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, msg_mark(message))
-        chatlog_record(user_id, message)
         on_chat_message(user_id)
+        chatlog_record(user_id, message)
     except TelegramAPIError:
         end_chat(user_id)
         await message.answer(

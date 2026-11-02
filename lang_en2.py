@@ -748,8 +748,11 @@ EN_PAIRS2 = {
     "Скасовано ✅": "Undone ✅",
     "🔥 <b>Зараз Година знайомств</b> — у боті <b>": "🔥 <b>It's Meeting Hour now</b> — there are <b>",
     "</b> людей онлайн.\n\nТи ще ні з ким не поговорив(-ла) — саме час: натисни, і за кілька секунд я з'єднаю тебе з кимось анонімно 💬": "</b> people online in the bot.\n\nYou haven't talked to anyone yet — now's the time: tap, and in a few seconds I'll connect you with someone anonymously 💬",
-    "📅 Сьогодні заходили: <b>": "📅 Visited today: <b>",
     "\n\n<i>Онлайн — ті, хто був активний за останні ": "\n\n<i>Online — those active in the last ",
+    "🔥 За 7 днів у боті було: <b>": "🔥 In the last 7 days the bot had: <b>",
+    "</b> людина\n\n": "</b> person\n\n",
+    "</b> людини\n\n": "</b> people\n\n",
+    "</b> людей\n\n": "</b> people\n\n",
 }
 
 # === КІНЕЦЬ lang_en2.py ===

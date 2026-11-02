@@ -236,6 +236,7 @@ async def founders_cmd(message: types.Message):
 
 
 def on_chat_ended(a: int, b: int):
+    chatlog_end(a, b)
     try:
         ma, mb = chat_meta.pop(a, None), chat_meta.pop(b, None)
         if ma is None or mb is None:

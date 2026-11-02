@@ -213,12 +213,26 @@ def meet_is_live(now: datetime | None = None) -> bool:
     return now.hour == MEET_HOUR
 
 
-def today_visitors() -> int:
-    """Скільки різних людей заходило в бот сьогодні (за Києвом, з опівночі)."""
+def week_visitors() -> int:
+    """Скільки різних людей заходило в бот за останні 7 днів (з сьогоднішнім, за Києвом).
+    Кожна людина рахується один раз, скільки б разів не заходила."""
     try:
-        return max(1, len(stats_day().get("active") or ()))
+        today = kyiv_today()
+        seen: set = set()
+        for i in range(7):
+            seen |= set((stats_days.get((today - timedelta(days=i)).isoformat()) or {}).get("active") or ())
+        seen |= set(stats_day().get("active") or ())
+        return max(1, len(seen))
     except Exception:  # noqa: BLE001
         return 1
+
+
+def people_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "людина"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "людини"
+    return "людей"
 
 
 def online_now() -> int:
@@ -1633,6 +1647,7 @@ async def relay_masked_voice(message: types.Message, user_id: int, partner_id: i
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, "[голосове з маскою]")
         on_chat_message(user_id)
+        chatlog_record(user_id, sent)
         stat_add("voice_mask")
     except TelegramAPIError:
         end_chat(user_id)

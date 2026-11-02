@@ -1392,7 +1392,7 @@ async def online_stats(message: types.Message, state: FSMContext):
         f"💬 Спілкуються в чатах: <b>{in_chats}</b>\n"
         f"🔍 Шукають співрозмовника: <b>{searching}</b> (з них ❤️ флірт: {flirt_note})\n"
         f"🏠 У кімнатах: <b>{in_rooms}</b>\n"
-        f"📅 Сьогодні заходили: <b>{today_visitors()}</b>\n\n"
+        f"🔥 За 7 днів у боті було: <b>{week_visitors()}</b> {people_word(week_visitors())}\n\n"
         f"{meet_status_line()}\n\n"
         f"<i>Онлайн — ті, хто був активний за останні {ONLINE_WINDOW // 60} хв.</i>"
     )

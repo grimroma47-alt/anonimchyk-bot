@@ -884,78 +884,91 @@ async def adm_links(call: types.CallbackQuery):
     await call.answer()
 
 
-def admin_chatlog_keyboard(page: int = 0):
-    rows = []
-    keys = list(chatlog.keys())
-    per_page = 8
-    pages = max(1, (len(keys) + per_page - 1) // per_page)
-    page = max(0, min(page, pages - 1))
-    for idx, key in enumerate(keys[page * per_page:(page + 1) * per_page], start=page * per_page + 1):
-        row = chatlog[key]
-        a, b = row["users"]
-        ua, ub = users_db.get(a) or {}, users_db.get(b) or {}
-        la = ua.get("custom_id") or str(a)
-        lb = ub.get("custom_id") or str(b)
-        rows.append([InlineKeyboardButton(
-            text=f"#{idx} {la} ↔ {lb} · {len(row['messages'])} пов.",
-            callback_data=f"adm_chat_{a}_{b}",
-        )])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_chats_{page-1}"))
-    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="adm_chats_0"))
-    if page + 1 < pages:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_chats_{page+1}"))
-    rows.append(nav)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.callback_query(F.data.startswith("adm_chats_"))
+@dp.callback_query(F.data.startswith("adm_chats:"))
 @admin_only
 async def adm_chats(call: types.CallbackQuery):
     chatlog_reset_if_new_day()
-    page = int(call.data.rsplit("_", 1)[-1])
-    if not chatlog:
-        await call.message.answer("💬 Збережених чатів поки немає. Журнал зберігається лише в пам'яті та очищується щодня.")
-    else:
-        await call.message.answer(
-            f"💬 <b>Останні анонімні чати</b> · {len(chatlog)}/{CHATLOG_MAX_CHATS}",
-            reply_markup=admin_chatlog_keyboard(page),
-        )
+    page = max(0, int(call.data.split(":", 1)[1]))
+    per_page = 5
+    items = list(chatlog.values())[::-1]
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    if page >= total_pages:
+        page = total_pages - 1
+    chunk = items[page * per_page:(page + 1) * per_page]
+    lines = [f"💬 <b>Історія анонімних чатів</b> · {len(items)}/{CHATLOG_MAX_CHATS}",
+             f"Сторінка {page + 1}/{total_pages} · до {CHATLOG_MAX_MESSAGES} повідомлень і {CHATLOG_MAX_MEDIA} медіа на чат", ""]
+    buttons = []
+    for item in chunk:
+        a, b = item["a"], item["b"]
+        status = "🟢 активний" if item.get("ended") is None else "⚪ завершений"
+        stamp = datetime.fromtimestamp(item["started"], KYIV_TZ).strftime("%d.%m %H:%M")
+        count = len(item.get("messages", []))
+        lines.append(f"<b>Чат #{item['id']}</b> · {stamp} · {status} · {count} повід.\n{admin_label(a)} ↔ {admin_label(b)}")
+        buttons.append([InlineKeyboardButton(text=f"Відкрити чат #{item['id']}",
+                                             callback_data=f"adm_chat_view:{item['id']}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_chats:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_chats:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    if not chunk:
+        lines.append("Історія поки порожня. Нові анонімні чати з'являться тут.")
+    buttons.append([InlineKeyboardButton(text="🔐 Адмін-панель", callback_data="adm_back")])
+    await call.message.answer("\n\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await call.answer()
 
 
-@dp.callback_query(F.data.startswith("adm_chat_"))
+@dp.callback_query(F.data.startswith("adm_chat_view:"))
 @admin_only
-async def adm_chat_detail(call: types.CallbackQuery):
+async def adm_chat_view(call: types.CallbackQuery):
     chatlog_reset_if_new_day()
     try:
-        _, _, a, b = call.data.split("_", 3)
-        key = tuple(sorted((int(a), int(b))))
-    except (ValueError, TypeError):
-        await call.answer("Чат не знайдено.", show_alert=True)
+        cid = int(call.data.split(":", 1)[1])
+    except ValueError:
+        await call.answer("Невірний номер чату.", show_alert=True)
         return
-    row = chatlog.get(key)
-    if row is None:
-        await call.answer("Цей чат уже відсутній у журналі.", show_alert=True)
+    item = chatlog.get(cid)
+    if item is None:
+        await call.answer("Цей запис уже очищено.", show_alert=True)
         return
-    lines = [f"💬 <b>Чат</b> · {chat_mode_label(row['mode'])}",
-             f"Повідомлень: {len(row['messages'])}",
-             "────────────────"]
-    omitted = 0
-    for item in row["messages"]:
-        stamp = datetime.fromtimestamp(item["time"]).strftime("%H:%M:%S")
-        line = f"<b>{esc(item['from'])}</b> [{stamp}]: {esc(item['text'])}"
-        if sum(len(x) for x in lines) + len(line) + 1 > 3700:
-            omitted += 1
-            continue
-        lines.append(line)
-    if omitted:
-        lines.append(f"… ще {omitted} повідомлень не вмістилися в одне повідомлення.")
-    await call.message.answer("\\n".join(lines),
-                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                                  [InlineKeyboardButton(text="⬅️ До списку чатів", callback_data="adm_chats_0")]
-                              ]))
+    started = datetime.fromtimestamp(item["started"], KYIV_TZ).strftime("%d.%m.%Y %H:%M:%S")
+    ended = datetime.fromtimestamp(item["ended"], KYIV_TZ).strftime("%d.%m.%Y %H:%M:%S") if item.get("ended") else "ще триває"
+    header = [f"💬 <b>Чат #{cid}</b>", f"{admin_label(item['a'])} ↔ {admin_label(item['b'])}",
+              f"Режим: {esc(item.get('mode', 'normal'))}", f"Початок: {started}", f"Завершення: {ended}", "", "<b>Повідомлення:</b>"]
+    messages = item.get("messages", [])
+    blocks = []
+    for m in messages:
+        stamp = datetime.fromtimestamp(m["at"], KYIV_TZ).strftime("%H:%M:%S")
+        media = f" 📎 <i>{esc(m['media_type'])}</i>" if m.get("media_type") else ""
+        blocks.append(f"<b>{stamp} · {admin_label(m['sender'])}</b>{media}\n{esc(m['text'])}")
+    if not blocks:
+        blocks.append("Повідомлень поки немає.")
+    # Розбиваємо між повідомленнями, не посеред HTML-тегів; кожен блок обмежений 2000 символами.
+    chunks = []
+    current = "\n\n".join(header)
+    for block in blocks:
+        candidate = current + "\n\n" + block
+        if len(candidate) > 3800 and current:
+            chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    for part in chunks:
+        await call.message.answer(part)
+    await call.message.answer("Історія чату · повернутися до списку:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="⬅️ До списку чатів", callback_data="adm_chats:0")]]))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_back")
+@admin_only
+async def adm_back(call: types.CallbackQuery):
+    await call.message.answer(f"🔐 <b>Адмін-панель</b> · версія {BOT_VERSION}", reply_markup=get_admin_keyboard())
     await call.answer()
 
 
