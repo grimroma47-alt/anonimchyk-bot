@@ -21,4 +21,4 @@ for _name in PARTS:
         )
     _code += _text.rstrip("\n") + "\n\n"
 
-exec(compile(_code, "bot.py", "exec"))
+exec(compile(_code, "bot_full.py", "exec"))

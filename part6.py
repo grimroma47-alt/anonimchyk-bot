@@ -1723,7 +1723,7 @@ async def setup_bot_commands():
 
 
 async def main():
-    global BOT_USERNAME
+    global BOT_USERNAME, TOPICS_ON
     logging.basicConfig(level=logging.INFO)
     runner = await start_web_server()
     # Дані з бази завантажуємо ДО того, як бот почне приймати повідомлення.
@@ -1750,6 +1750,8 @@ async def main():
         try:
             me = await bot.get_me()
             BOT_USERNAME = me.username or ""
+            TOPICS_ON = FRIEND_TOPICS and bool(getattr(me, "has_topics_enabled", False))
+            logging.info("💜 Кімнати з друзями: %s", "увімкнено" if TOPICS_ON else "вимкнено")
         except Exception as e:  # noqa: BLE001
             logging.warning("Не вдалося отримати інформацію про бота (get_me): %s", e)
 

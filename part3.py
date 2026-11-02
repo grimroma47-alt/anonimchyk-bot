@@ -169,6 +169,8 @@ async def friend_accept(call: types.CallbackQuery):
     )
     await safe_send(requester_id, f"🤝 <b>{esc(u['nickname'])}</b> прийняв твій запит у друзі!")
     await call.answer()
+    await ensure_friend_topic(acceptor_id, requester_id)
+    await ensure_friend_topic(requester_id, acceptor_id)
 
 
 @dp.callback_query(F.data == "friend_decline")
@@ -201,10 +203,103 @@ async def friends_list(message: types.Message, state: FSMContext):
     await message.answer(
         "👫 <b>Твої друзі</b>\n\n"
         "Натисни «✍️» біля імені, щоб написати другу, або «❌», щоб прибрати з друзів.\n\n"
-        "💡 Переписка з друзями працює завжди — навіть коли ти в анонімному чаті чи шукаєш нового "
-        "співрозмовника. Щоб відповісти другу, просто зроби свайп (Reply) на його повідомлення.",
+        + (
+            "💜 У кожного друга — своя кімната (тема) в цьому чаті: відкрий її й просто пиши. "
+            "Анонімний чат при цьому не переривається."
+            if TOPICS_ON else
+            "💡 Переписка з друзями працює завжди — навіть коли ти в анонімному чаті чи шукаєш нового "
+            "співрозмовника. Щоб відповісти другу, просто зроби свайп (Reply) на його повідомлення."
+        ),
         reply_markup=kb,
     )
+
+
+# ---------------------------------------------------------------------------
+# 💜 Кімнати з друзями: кожен друг — окрема тема в чаті з ботом (Bot API 9.4).
+# Вмикається змінною FRIEND_TOPICS=1 на Render і лише якщо в @BotFather увімкнено теми.
+# Якщо теми недоступні — все працює по-старому (повідомлення в основному чаті).
+# У базі зберігаємо лише номер теми для кожного друга, тексти — ні.
+# ---------------------------------------------------------------------------
+FRIEND_TOPICS = os.getenv("FRIEND_TOPICS", "0") == "1"
+TOPICS_ON = False  # стає True при старті, якщо FRIEND_TOPICS=1 і бот має увімкнені теми
+TOPIC_RETRY_SEC = 6 * 3600  # якщо тему не вдалося створити — повторна спроба не раніше
+
+
+def friend_by_topic(owner_id: int, thread_id) -> int | None:
+    u = users_db.get(owner_id) or {}
+    for fid, tid in (u.get("friend_topics") or {}).items():
+        if tid == thread_id:
+            return fid
+    return None
+
+
+_MENU_TEXTS: set = set()
+
+
+def _menu_texts() -> set:
+    if not _MENU_TEXTS:
+        _MENU_TEXTS.update(v for k, v in globals().items() if k.startswith("BTN_") and isinstance(v, str))
+    return _MENU_TEXTS
+
+
+def _in_friend_topic(message) -> bool:
+    if not TOPICS_ON:
+        return False
+    tid = getattr(message, "message_thread_id", None)
+    chat = getattr(message, "chat", None)
+    if not tid or getattr(chat, "type", "private") != "private" or not getattr(message, "from_user", None):
+        return False
+    t = getattr(message, "text", None) or ""
+    if t.startswith("/") or t in _menu_texts():
+        return False
+    return friend_by_topic(message.from_user.id, tid) is not None
+
+
+def friend_topic_title(friend_id: int) -> str:
+    f = users_db.get(friend_id) or {}
+    return f"💜 {f.get('nickname') or friend_id}"[:120]
+
+
+async def ensure_friend_topic(owner_id: int, friend_id: int) -> int | None:
+    """Номер теми-кімнати з другом у чаті owner_id; створює, якщо ще немає. None — тем немає."""
+    if not TOPICS_ON:
+        return None
+    u = users_db.get(owner_id)
+    if not u or friend_id not in (u.get("friends") or set()):
+        return None
+    tid = (u.get("friend_topics") or {}).get(friend_id)
+    if tid:
+        return tid
+    if time.time() < u.get("topics_fail_until", 0):
+        return None
+    try:
+        topic = await bot.create_forum_topic(chat_id=owner_id, name=friend_topic_title(friend_id))
+    except TelegramAPIError as e:
+        u["topics_fail_until"] = time.time() + TOPIC_RETRY_SEC
+        logging.info("Тему для друга не створено (%s): %s", owner_id, e)
+        return None
+    tid = topic.message_thread_id
+    u.setdefault("friend_topics", {})[friend_id] = tid
+    u.pop("topics_fail_until", None)
+    request_save()
+    f = users_db.get(friend_id) or {}
+    await safe_send(
+        owner_id,
+        f"💜 Це ваша кімната з <b>{esc(f.get('nickname') or '')}</b>.\n"
+        "Пиши сюди — повідомлення побачить лише цей друг. Анонімний чат і меню — в основному чаті.",
+        message_thread_id=tid,
+    )
+    return tid
+
+
+async def drop_friend_topic(owner_id: int, friend_id: int):
+    u = users_db.get(owner_id) or {}
+    tid = (u.get("friend_topics") or {}).pop(friend_id, None)
+    if tid and TOPICS_ON:
+        try:
+            await bot.delete_forum_topic(chat_id=owner_id, message_thread_id=tid)
+        except TelegramAPIError as e:
+            logging.info("Тему друга не видалено: %s", e)
 
 
 def _remember_friend_msg(recipient_id: int, message_id: int, sender_id: int):
@@ -233,11 +328,25 @@ async def deliver_friend_message(sender_id: int, target_id: int, message: types.
     if text_to_check and LINK_REGEX.search(text_to_check):
         return "🚫 Посилання та контакти заборонені — спілкуйтесь у боті."
 
+    protect = should_protect(u)
+    tid = await ensure_friend_topic(target_id, sender_id)
+    if tid:
+        try:
+            if message.text:
+                await bot.send_message(
+                    target_id, protect_text(esc(message.text)), message_thread_id=tid, protect_content=protect
+                )
+            else:
+                await message.copy_to(chat_id=target_id, message_thread_id=tid, protect_content=protect)
+            return None
+        except TelegramAPIError as e:  # тему видалили — наступного разу створимо нову, зараз по-старому
+            logging.info("Кімната друга недоступна: %s", e)
+            (p.get("friend_topics") or {}).pop(sender_id, None)
+
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="↩️ Відповісти", callback_data=f"fmsg_{sender_id}")]]
     )
     header = f"💌 <b>{esc(u['nickname'])}</b> (друг):"
-    protect = should_protect(u)
     try:
         if message.text:
             sent = await bot.send_message(
@@ -269,6 +378,10 @@ async def friend_write_start(call: types.CallbackQuery, state: FSMContext):
 
     f = users_db.get(target_id)
     name = f["nickname"] if f else str(target_id)
+    tid = await ensure_friend_topic(call.from_user.id, target_id)
+    if tid and await safe_send(call.from_user.id, "✍️ Пиши сюди 👇", message_thread_id=tid):
+        await call.answer("💜 Кімната з другом — у списку тем цього чату")
+        return
     await state.set_state(FriendStates.write)
     await state.update_data(friend_target=target_id)
     await call.message.answer(
@@ -286,6 +399,8 @@ async def friend_remove(call: types.CallbackQuery):
     p = users_db.get(target_id)
     if p:
         p.get("friends", set()).discard(call.from_user.id)
+    await drop_friend_topic(call.from_user.id, target_id)
+    await drop_friend_topic(target_id, call.from_user.id)
 
     kb = get_friends_keyboard(u)
     if kb is None:
