@@ -42,18 +42,19 @@ def source_breakdown(ids: list[int]) -> list[tuple[str, int, int]]:
 
 
 # ---------------------------------------------------------------------------
-# 💜 Повідомлення в кімнаті друга (тема в чаті з ботом) — йдуть одразу цьому другу.
-# Стоїть перед усіма обробниками, щоб текст не сприймався як дія меню.
+# 💬 Переписка з другом: поки відкрита, усе, що людина пише, йде цьому другу.
+# Стоїть перед усіма обробниками. Команда чи кнопка меню — автоматично закривають переписку.
 # ---------------------------------------------------------------------------
-@dp.message(lambda m: _in_friend_topic(m))
-async def friend_topic_message(message: types.Message):
+@dp.message(lambda m: _in_friend_mode(m))
+async def friend_mode_message(message: types.Message):
     uid = message.from_user.id
-    fid = friend_by_topic(uid, message.message_thread_id)
+    fid = friend_mode.get(uid)
     if fid is None:
         return
     err = await deliver_friend_message(uid, fid, message)
     if err:
-        await message.answer(f"❌ {err}")
+        friend_mode.pop(uid, None)
+        await message.answer(f"❌ {err}", reply_markup=_after_friend_kb(uid))
 
 
 # ---------------------------------------------------------------------------
@@ -549,23 +550,96 @@ async def blacklist_add_in_chat(message: types.Message, state: FSMContext):
         return
 
     u = init_user(user_id)
+    is_friend = partner_id in (u.get("friends") or set())
+    await message.answer(
+        "🚫 <b>Додати співрозмовника в чорний список?</b>\n\n"
+        "Чат завершиться, і ви більше не зустрінетесь у пошуку."
+        + ("\n⚠️ Це твій друг — переписка з ним теж стане недоступною." if is_friend else ""),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🚫 Так, заблокувати", callback_data=f"bl_yes_{partner_id}"),
+            InlineKeyboardButton(text="↩️ Ні", callback_data="bl_no"),
+        ]]),
+    )
+
+
+BL_UNDO_SECONDS = 120  # скільки часу після блокування можна натиснути «↩️ Скасувати»
+
+
+@dp.callback_query(F.data == "bl_no")
+async def bl_no(call: types.CallbackQuery):
+    try:
+        await call.message.edit_text("👌 Гаразд, нікого не блокуємо. Чат триває.")
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("bl_yes_"))
+async def bl_yes(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    try:
+        target_id = int(call.data[len("bl_yes_"):])
+    except ValueError:
+        await call.answer()
+        return
+    u = init_user(user_id)
+    in_chat = active_chats.get(user_id) == target_id
+    if not in_chat and u.get("last_partner_id") != target_id:
+        await call.answer("Цей чат уже неактуальний.", show_alert=True)
+        return
     u.setdefault("blacklist", set())
     limit = BLACKLIST_LIMIT_PLUS if (is_premium(u) or has_perk(u, "blacklist")) else BLACKLIST_LIMIT_FREE
-    if partner_id not in u["blacklist"] and len(u["blacklist"]) >= limit:
-        await message.answer(
-            f"❌ Чорний список заповнено ({limit}). Розшир його в магазині або онови Premium."
-        )
+    if target_id not in u["blacklist"] and len(u["blacklist"]) >= limit:
+        await call.answer(f"❌ Чорний список заповнено ({limit}). Розшир його в магазині або онови Premium.", show_alert=True)
         return
-
-    u["blacklist"].add(partner_id)
-    end_chat(user_id)
-    await message.answer(
-        "🚫 Користувача додано в чорний список — більше не з'явиться в пошуку. Чат завершено.",
-        reply_markup=get_main_keyboard(),
+    u["blacklist"].add(target_id)
+    u["bl_undo"] = (target_id, time.time())
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+    await call.message.answer(
+        "🚫 Користувача додано в чорний список — більше не з'явиться в пошуку."
+        + (" Чат завершено." if in_chat else "")
+        + f"\n<i>Помилився? Скасувати можна протягом {BL_UNDO_SECONDS // 60} хв.</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="↩️ Скасувати", callback_data=f"bl_undo_{target_id}")
+        ]]),
     )
-    await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
-    await auto_search_after_chat(user_id)
-    await auto_search_after_chat(partner_id)
+    if in_chat:
+        end_chat(user_id)
+        await call.message.answer("🏠 Головне меню", reply_markup=get_main_keyboard())
+        await safe_send(target_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+        await auto_search_after_chat(user_id)
+        await auto_search_after_chat(target_id)
+
+
+@dp.callback_query(F.data.startswith("bl_undo_"))
+async def bl_undo(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    try:
+        target_id = int(call.data[len("bl_undo_"):])
+    except ValueError:
+        await call.answer()
+        return
+    undo = u.get("bl_undo") or (None, 0)
+    if undo[0] != target_id or time.time() - undo[1] > BL_UNDO_SECONDS:
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            pass
+        await call.answer("Час на скасування минув — прибрати можна в ⚙️ Налаштування → 📋 Чорний список.", show_alert=True)
+        return
+    u.get("blacklist", set()).discard(target_id)
+    u.pop("bl_undo", None)
+    request_save()
+    try:
+        await call.message.edit_text("↩️ Скасовано — користувача прибрано з чорного списку.")
+    except TelegramAPIError:
+        pass
+    await call.answer("Скасовано ✅")
 
 
 # ---------------------------------------------------------------------------
@@ -1317,7 +1391,8 @@ async def online_stats(message: types.Message, state: FSMContext):
         f"🟢 Онлайн: <b>{online}</b>\n"
         f"💬 Спілкуються в чатах: <b>{in_chats}</b>\n"
         f"🔍 Шукають співрозмовника: <b>{searching}</b> (з них ❤️ флірт: {flirt_note})\n"
-        f"🏠 У кімнатах: <b>{in_rooms}</b>\n\n"
+        f"🏠 У кімнатах: <b>{in_rooms}</b>\n"
+        f"📅 Сьогодні заходили: <b>{today_visitors()}</b>\n\n"
         f"{meet_status_line()}\n\n"
         f"<i>Онлайн — ті, хто був активний за останні {ONLINE_WINDOW // 60} хв.</i>"
     )

@@ -10,6 +10,7 @@ import re
 import time
 from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, types
@@ -36,7 +37,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
-BOT_VERSION = "02.11-a"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
+BOT_VERSION = "02.11-b"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -367,6 +368,105 @@ banned_users: set[int] = set()
 stats_days: dict[str, dict] = {}
 # Поточні чати: user_id -> {"start": час, "mode": режим, "msgs": скільки написав} (лише в пам'яті)
 chat_meta: dict[int, dict] = {}
+# Журнал приватних анонімних чатів для адміна. Лише RAM: після перезапуску порожній.
+# Не записуємо переписки з друзями та групові/тематичні кімнати.
+CHATLOG_MAX_CHATS = 150
+CHATLOG_MAX_PER_CHAT = 200
+CHATLOG_MAX_TOTAL = CHATLOG_MAX_CHATS * CHATLOG_MAX_PER_CHAT
+CHATLOG_MAX_MEDIA_PER_CHAT = 100
+chatlog: dict[tuple[int, int], dict] = {}
+chatlog_day = kyiv_today().isoformat() if "kyiv_today" in globals() else None
+
+
+def chatlog_reset_if_new_day():
+    global chatlog_day
+    today = kyiv_today().isoformat()
+    if chatlog_day != today:
+        chatlog.clear()
+        chatlog_day = today
+
+
+def chatlog_start(a: int, b: int, mode: str):
+    chatlog_reset_if_new_day()
+    if mode == "friend":
+        return
+    key = tuple(sorted((a, b)))
+    chatlog[key] = {"users": key, "mode": mode, "started": time.time(),
+                    "last_activity": time.time(), "messages": [], "media": 0}
+    while len(chatlog) > CHATLOG_MAX_CHATS:
+        oldest = min(chatlog, key=lambda k: chatlog[k].get("last_activity", chatlog[k]["started"]))
+        chatlog.pop(oldest, None)
+
+
+def _chatlog_remove_message(row, index):
+    removed = row["messages"].pop(index)
+    if removed.get("is_media"):
+        row["media"] = max(0, row.get("media", 0) - 1)
+
+
+def chatlog_record(user_id: int, message):
+    chatlog_reset_if_new_day()
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        return
+    key = tuple(sorted((user_id, partner_id)))
+    row = chatlog.get(key)
+    if row is None or row["mode"] == "friend":
+        return
+    body = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    media = None
+    for attr, label in (("photo", "Фото"), ("video", "Відео"), ("voice", "Голосове"), ("audio", "Аудіо"),
+                        ("video_note", "Відеоповідомлення"), ("document", "Файл"), ("sticker", "Стікер"),
+                        ("animation", "GIF")):
+        if getattr(message, attr, None):
+            media = label
+            break
+    is_media = bool(media)
+    if media:
+        body = (body + " " if body else "") + f"[{media}]"
+    if not body:
+        body = "[Повідомлення]"
+    u = users_db.get(user_id) or {}
+    row["messages"].append({"time": time.time(), "from": u.get("custom_id") or str(user_id),
+                            "text": body[:1000], "is_media": is_media})
+    row["last_activity"] = time.time()
+    if is_media:
+        row["media"] = row.get("media", 0) + 1
+
+    # Кільцевий буфер: при переповненні видаляємо найстаріше, нове повідомлення лишається.
+    while len(row["messages"]) > CHATLOG_MAX_PER_CHAT:
+        _chatlog_remove_message(row, 0)
+
+    # Не більше 100 медіаповідомлень на чат: витісняємо найстаріше медіа.
+    while row.get("media", 0) > CHATLOG_MAX_MEDIA_PER_CHAT:
+        oldest_media = next((i for i, item in enumerate(row["messages"]) if item.get("is_media")), None)
+        if oldest_media is None:
+            row["media"] = 0
+            break
+        _chatlog_remove_message(row, oldest_media)
+
+    # Загальний ліміт відповідає місткості 150 чатів по 200 повідомлень.
+    while sum(len(x["messages"]) for x in chatlog.values()) > CHATLOG_MAX_TOTAL:
+        oldest_key = None
+        oldest_time = None
+        for candidate_key, candidate_row in chatlog.items():
+            if candidate_row["messages"]:
+                stamp = candidate_row["messages"][0]["time"]
+                if oldest_time is None or stamp < oldest_time:
+                    oldest_key, oldest_time = candidate_key, stamp
+        if oldest_key is None:
+            break
+        _chatlog_remove_message(chatlog[oldest_key], 0)
+
+
+async def chatlog_reset_loop():
+    global chatlog_day
+    while True:
+        now = datetime.now(ZoneInfo("Europe/Kyiv"))
+        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        await asyncio.sleep(max(1, (tomorrow - now).total_seconds()))
+        chatlog.clear()
+        chatlog_day = kyiv_today().isoformat()
 compat_last: dict[int, str] = {}  # 💯 сумісність щойно завершеного чату
 game_state: dict[frozenset, dict] = {}  # 🎲 ігри в чаті
 last_chat_mode: dict[int, str] = {}  # у якому режимі був останній чат (для автопошуку)
@@ -762,6 +862,7 @@ BTN_FLIRT_OLD = "❤️ Флірт-пошук"  # стара назва — дл
 BTN_INTERESTS = "🧩 Інтереси"
 BTN_INTERESTS_OLD = "🧩 За інтересами"  # стара назва — для старих клавіатур
 BTN_ADD_FRIEND = "🤝 Додати в друзі"
+BTN_FRIEND_EXIT = "🚪 Вийти з переписки"
 
 
 # ---------------------------------------------------------------------------
@@ -898,12 +999,16 @@ def get_friends_keyboard(u: dict):
     if not friends:
         return None
     rows = []
-    for fid in sorted(friends):
+    unread = u.get("friend_unread") or {}
+    now = time.time()
+    for fid in sorted(friends, key=lambda x: (-(unread.get(x) or 0), -last_seen.get(x, 0))):
         f = users_db.get(fid)
         name = f["nickname"] if f else str(fid)
+        dot = " 🟢" if now - last_seen.get(fid, 0) <= ONLINE_WINDOW else ""
+        new = f" · {unread[fid]} нов." if unread.get(fid) else ""
         rows.append(
             [
-                InlineKeyboardButton(text=f"✍️ {name}", callback_data=f"fmsg_{fid}"),
+                InlineKeyboardButton(text=f"💬 {name}{dot}{new}", callback_data=f"fmsg_{fid}"),
                 InlineKeyboardButton(text="❌", callback_data=f"friend_remove_{fid}"),
             ]
         )
@@ -1142,6 +1247,7 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
+            [InlineKeyboardButton(text="💬 Чати", callback_data="adm_chats_0")],
             [InlineKeyboardButton(text="🔗 Посилання з мітками", callback_data="adm_links")],
             [InlineKeyboardButton(text="🎁 Подарувати подарунок", callback_data="adm_gift")],
             [InlineKeyboardButton(text="🚨 Скарги", callback_data="adm_reports_0")],

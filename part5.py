@@ -125,6 +125,10 @@ async def contest_loop():
         except Exception as e:  # noqa: BLE001
             logging.warning("«Ми скучили»: %s", e)
         try:
+            await warm_start_tick()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Теплий старт: %s", e)
+        try:
             await hw_night_tick()
         except Exception as e:  # noqa: BLE001
             logging.warning("Ніч страшилок: %s", e)
@@ -207,6 +211,14 @@ MEET_REMIND_MINUTES = 5  # за скільки хвилин до початку 
 def meet_is_live(now: datetime | None = None) -> bool:
     now = now or datetime.now(KYIV_TZ)
     return now.hour == MEET_HOUR
+
+
+def today_visitors() -> int:
+    """Скільки різних людей заходило в бот сьогодні (за Києвом, з опівночі)."""
+    try:
+        return max(1, len(stats_day().get("active") or ()))
+    except Exception:  # noqa: BLE001
+        return 1
 
 
 def online_now() -> int:

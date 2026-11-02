@@ -169,8 +169,6 @@ async def friend_accept(call: types.CallbackQuery):
     )
     await safe_send(requester_id, f"🤝 <b>{esc(u['nickname'])}</b> прийняв твій запит у друзі!")
     await call.answer()
-    await ensure_friend_topic(acceptor_id, requester_id)
-    await ensure_friend_topic(requester_id, acceptor_id)
 
 
 @dp.callback_query(F.data == "friend_decline")
@@ -202,37 +200,18 @@ async def friends_list(message: types.Message, state: FSMContext):
         return
     await message.answer(
         "👫 <b>Твої друзі</b>\n\n"
-        "Натисни «✍️» біля імені, щоб написати другу, або «❌», щоб прибрати з друзів.\n\n"
-        + (
-            "💜 У кожного друга — своя кімната (тема) в цьому чаті: відкрий її й просто пиши. "
-            "Анонімний чат при цьому не переривається."
-            if TOPICS_ON else
-            "💡 Переписка з друзями працює завжди — навіть коли ти в анонімному чаті чи шукаєш нового "
-            "співрозмовника. Щоб відповісти другу, просто зроби свайп (Reply) на його повідомлення."
-        ),
+        "Натисни на друга, щоб відкрити переписку, або «❌», щоб прибрати з друзів.\n\n"
+        "💡 Переписка з друзями працює завжди — навіть коли ти в анонімному чаті чи шукаєш нового "
+        "співрозмовника. 🟢 — друг зараз онлайн, «нов.» — непрочитані повідомлення.",
         reply_markup=kb,
     )
 
 
 # ---------------------------------------------------------------------------
-# 💜 Кімнати з друзями: кожен друг — окрема тема в чаті з ботом (Bot API 9.4).
-# Вмикається змінною FRIEND_TOPICS=1 на Render і лише якщо в @BotFather увімкнено теми.
-# Якщо теми недоступні — все працює по-старому (повідомлення в основному чаті).
-# У базі зберігаємо лише номер теми для кожного друга, тексти — ні.
+# 💬 Переписка з другом (без тем Telegram): режим «пишу другу», 🟢 онлайн і лічильник нових.
+# Зберігаємо лише лічильник нових і номер останнього повідомлення друга — тексти не зберігаються.
 # ---------------------------------------------------------------------------
-FRIEND_TOPICS = os.getenv("FRIEND_TOPICS", "0") == "1"
-TOPICS_ON = False  # стає True при старті, якщо FRIEND_TOPICS=1 і бот має увімкнені теми
-TOPIC_RETRY_SEC = 6 * 3600  # якщо тему не вдалося створити — повторна спроба не раніше
-
-
-def friend_by_topic(owner_id: int, thread_id) -> int | None:
-    u = users_db.get(owner_id) or {}
-    for fid, tid in (u.get("friend_topics") or {}).items():
-        if tid == thread_id:
-            return fid
-    return None
-
-
+friend_mode: dict[int, int] = {}  # user_id -> друг, з яким зараз відкрита переписка (лише в пам'яті)
 _MENU_TEXTS: set = set()
 
 
@@ -242,64 +221,38 @@ def _menu_texts() -> set:
     return _MENU_TEXTS
 
 
-def _in_friend_topic(message) -> bool:
-    if not TOPICS_ON:
-        return False
-    tid = getattr(message, "message_thread_id", None)
-    chat = getattr(message, "chat", None)
-    if not tid or getattr(chat, "type", "private") != "private" or not getattr(message, "from_user", None):
+def _in_friend_mode(message) -> bool:
+    user = getattr(message, "from_user", None)
+    if user is None or user.id not in friend_mode:
         return False
     t = getattr(message, "text", None) or ""
-    if t.startswith("/") or t in _menu_texts():
+    if t == BTN_FRIEND_EXIT:
         return False
-    return friend_by_topic(message.from_user.id, tid) is not None
+    if t.startswith("/") or t in _menu_texts():
+        friend_mode.pop(user.id, None)  # пішов у меню — переписку закрито, далі звичайна обробка
+        return False
+    return True
 
 
-def friend_topic_title(friend_id: int) -> str:
-    f = users_db.get(friend_id) or {}
-    return f"💜 {f.get('nickname') or friend_id}"[:120]
+def get_friend_mode_keyboard():
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_FRIEND_EXIT)]], resize_keyboard=True)
 
 
-async def ensure_friend_topic(owner_id: int, friend_id: int) -> int | None:
-    """Номер теми-кімнати з другом у чаті owner_id; створює, якщо ще немає. None — тем немає."""
-    if not TOPICS_ON:
-        return None
-    u = users_db.get(owner_id)
-    if not u or friend_id not in (u.get("friends") or set()):
-        return None
-    tid = (u.get("friend_topics") or {}).get(friend_id)
-    if tid:
-        return tid
-    if time.time() < u.get("topics_fail_until", 0):
-        return None
-    try:
-        topic = await bot.create_forum_topic(chat_id=owner_id, name=friend_topic_title(friend_id))
-    except TelegramAPIError as e:
-        u["topics_fail_until"] = time.time() + TOPIC_RETRY_SEC
-        logging.info("Тему для друга не створено (%s): %s", owner_id, e)
-        return None
-    tid = topic.message_thread_id
-    u.setdefault("friend_topics", {})[friend_id] = tid
-    u.pop("topics_fail_until", None)
-    request_save()
-    f = users_db.get(friend_id) or {}
-    await safe_send(
-        owner_id,
-        f"💜 Це ваша кімната з <b>{esc(f.get('nickname') or '')}</b>.\n"
-        "Пиши сюди — повідомлення побачить лише цей друг. Анонімний чат і меню — в основному чаті.",
-        message_thread_id=tid,
-    )
-    return tid
+def _after_friend_kb(uid: int):
+    if uid in active_chats:
+        return get_chat_keyboard()
+    if uid in user_room:
+        return get_room_keyboard()
+    return get_main_keyboard()
 
 
-async def drop_friend_topic(owner_id: int, friend_id: int):
-    u = users_db.get(owner_id) or {}
-    tid = (u.get("friend_topics") or {}).pop(friend_id, None)
-    if tid and TOPICS_ON:
-        try:
-            await bot.delete_forum_topic(chat_id=owner_id, message_thread_id=tid)
-        except TelegramAPIError as e:
-            logging.info("Тему друга не видалено: %s", e)
+def friend_seen_text(fid: int) -> str:
+    ago = time.time() - last_seen.get(fid, 0)
+    if ago <= ONLINE_WINDOW:
+        return "🟢 зараз онлайн"
+    if ago < 3600:
+        return f"був(-ла) {int(ago // 60)} хв тому"
+    return ""
 
 
 def _remember_friend_msg(recipient_id: int, message_id: int, sender_id: int):
@@ -329,22 +282,21 @@ async def deliver_friend_message(sender_id: int, target_id: int, message: types.
         return "🚫 Посилання та контакти заборонені — спілкуйтесь у боті."
 
     protect = should_protect(u)
-    tid = await ensure_friend_topic(target_id, sender_id)
-    if tid:
+    if friend_mode.get(target_id) == sender_id:
+        # друг саме в переписці з тобою — як у звичайному чаті, без підписів
         try:
             if message.text:
-                await bot.send_message(
-                    target_id, protect_text(esc(message.text)), message_thread_id=tid, protect_content=protect
-                )
+                sent = await bot.send_message(target_id, protect_text(esc(message.text)), protect_content=protect)
             else:
-                await message.copy_to(chat_id=target_id, message_thread_id=tid, protect_content=protect)
-            return None
-        except TelegramAPIError as e:  # тему видалили — наступного разу створимо нову, зараз по-старому
-            logging.info("Кімната друга недоступна: %s", e)
-            (p.get("friend_topics") or {}).pop(sender_id, None)
+                sent = await message.copy_to(chat_id=target_id, protect_content=protect)
+        except TelegramAPIError:
+            return "Не вдалося доставити — друг зараз недоступний."
+        _remember_friend_msg(target_id, sent.message_id, sender_id)
+        p.setdefault("friend_last", {})[sender_id] = sent.message_id
+        return None
 
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="↩️ Відповісти", callback_data=f"fmsg_{sender_id}")]]
+        inline_keyboard=[[InlineKeyboardButton(text="💬 Відкрити переписку", callback_data=f"fmsg_{sender_id}")]]
     )
     header = f"💌 <b>{esc(u['nickname'])}</b> (друг):"
     try:
@@ -356,10 +308,13 @@ async def deliver_friend_message(sender_id: int, target_id: int, message: types.
         else:
             head = await bot.send_message(target_id, header)
             _remember_friend_msg(target_id, head.message_id, sender_id)
-            copied = await message.copy_to(chat_id=target_id, reply_markup=kb, protect_content=protect)
-            _remember_friend_msg(target_id, copied.message_id, sender_id)
+            sent = await message.copy_to(chat_id=target_id, reply_markup=kb, protect_content=protect)
+            _remember_friend_msg(target_id, sent.message_id, sender_id)
     except TelegramAPIError:
         return "Не вдалося доставити — друг зараз недоступний."
+    p.setdefault("friend_last", {})[sender_id] = sent.message_id
+    unread = p.setdefault("friend_unread", {})
+    unread[sender_id] = min(99, (unread.get(sender_id) or 0) + 1)
     return None
 
 
@@ -376,19 +331,43 @@ async def friend_write_start(call: types.CallbackQuery, state: FSMContext):
         await call.answer("Ця людина більше не у твоїх друзях.", show_alert=True)
         return
 
-    f = users_db.get(target_id)
-    name = f["nickname"] if f else str(target_id)
-    tid = await ensure_friend_topic(call.from_user.id, target_id)
-    if tid and await safe_send(call.from_user.id, "✍️ Пиши сюди 👇", message_thread_id=tid):
-        await call.answer("💜 Кімната з другом — у списку тем цього чату")
-        return
-    await state.set_state(FriendStates.write)
-    await state.update_data(friend_target=target_id)
-    await call.message.answer(
-        f"✍️ Напиши повідомлення для <b>{esc(name)}</b> (або /cancel).\n"
-        "Анонімний чат при цьому не переривається."
-    )
+    await state.clear()
     await call.answer()
+    await open_friend_chat(call.from_user.id, target_id)
+
+
+async def open_friend_chat(uid: int, fid: int):
+    u = init_user(uid)
+    f = users_db.get(fid) or {}
+    friend_mode[uid] = fid
+    (u.get("friend_unread") or {}).pop(fid, None)
+    seen = friend_seen_text(fid)
+    text = (
+        f"💬 <b>Переписка з {esc(f.get('nickname') or '')}</b>" + (f" · {seen}" if seen else "") + "\n\n"
+        "Пиши — усі повідомлення йдуть лише цьому другу."
+        + (" Анонімний чат не переривається — повернешся до нього кнопкою нижче." if uid in active_chats else "")
+        + "\nЗакінчити: «🚪 Вийти з переписки»."
+    )
+    last = (u.get("friend_last") or {}).get(fid)
+    if last:
+        try:
+            await bot.send_message(
+                uid, text + "\n\n↩️ Останнє повідомлення друга ☝️", reply_markup=get_friend_mode_keyboard(),
+                reply_parameters=types.ReplyParameters(message_id=last, allow_sending_without_reply=False),
+            )
+            return
+        except TelegramAPIError:
+            (u.get("friend_last") or {}).pop(fid, None)
+    await safe_send(uid, text, reply_markup=get_friend_mode_keyboard())
+
+
+@dp.message(F.text == BTN_FRIEND_EXIT)
+async def friend_mode_exit(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    friend_mode.pop(uid, None)
+    note = "💬 Ти знову в анонімному чаті — пиши співрозмовнику." if uid in active_chats else "🏠 Головне меню"
+    await message.answer(f"🚪 Переписку закрито.\n{note}", reply_markup=_after_friend_kb(uid))
 
 
 @dp.callback_query(F.data.startswith("friend_remove_"))
@@ -399,8 +378,12 @@ async def friend_remove(call: types.CallbackQuery):
     p = users_db.get(target_id)
     if p:
         p.get("friends", set()).discard(call.from_user.id)
-    await drop_friend_topic(call.from_user.id, target_id)
-    await drop_friend_topic(target_id, call.from_user.id)
+    for a, b in ((call.from_user.id, target_id), (target_id, call.from_user.id)):
+        if friend_mode.get(a) == b:
+            friend_mode.pop(a, None)
+        ua = users_db.get(a) or {}
+        (ua.get("friend_unread") or {}).pop(b, None)
+        (ua.get("friend_last") or {}).pop(b, None)
 
     kb = get_friends_keyboard(u)
     if kb is None:
@@ -898,6 +881,81 @@ async def adm_links(call: types.CallbackQuery):
         "<i>Мітка зараховується лише новим людям — тим, хто відкрив бот уперше.</i>",
     ]
     await call.message.answer("\n".join(lines), disable_web_page_preview=True)
+    await call.answer()
+
+
+def admin_chatlog_keyboard(page: int = 0):
+    rows = []
+    keys = list(chatlog.keys())
+    per_page = 8
+    pages = max(1, (len(keys) + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    for idx, key in enumerate(keys[page * per_page:(page + 1) * per_page], start=page * per_page + 1):
+        row = chatlog[key]
+        a, b = row["users"]
+        ua, ub = users_db.get(a) or {}, users_db.get(b) or {}
+        la = ua.get("custom_id") or str(a)
+        lb = ub.get("custom_id") or str(b)
+        rows.append([InlineKeyboardButton(
+            text=f"#{idx} {la} ↔ {lb} · {len(row['messages'])} пов.",
+            callback_data=f"adm_chat_{a}_{b}",
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_chats_{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="adm_chats_0"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_chats_{page+1}"))
+    rows.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data.startswith("adm_chats_"))
+@admin_only
+async def adm_chats(call: types.CallbackQuery):
+    chatlog_reset_if_new_day()
+    page = int(call.data.rsplit("_", 1)[-1])
+    if not chatlog:
+        await call.message.answer("💬 Збережених чатів поки немає. Журнал зберігається лише в пам'яті та очищується щодня.")
+    else:
+        await call.message.answer(
+            f"💬 <b>Останні анонімні чати</b> · {len(chatlog)}/{CHATLOG_MAX_CHATS}",
+            reply_markup=admin_chatlog_keyboard(page),
+        )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_chat_"))
+@admin_only
+async def adm_chat_detail(call: types.CallbackQuery):
+    chatlog_reset_if_new_day()
+    try:
+        _, _, a, b = call.data.split("_", 3)
+        key = tuple(sorted((int(a), int(b))))
+    except (ValueError, TypeError):
+        await call.answer("Чат не знайдено.", show_alert=True)
+        return
+    row = chatlog.get(key)
+    if row is None:
+        await call.answer("Цей чат уже відсутній у журналі.", show_alert=True)
+        return
+    lines = [f"💬 <b>Чат</b> · {chat_mode_label(row['mode'])}",
+             f"Повідомлень: {len(row['messages'])}",
+             "────────────────"]
+    omitted = 0
+    for item in row["messages"]:
+        stamp = datetime.fromtimestamp(item["time"]).strftime("%H:%M:%S")
+        line = f"<b>{esc(item['from'])}</b> [{stamp}]: {esc(item['text'])}"
+        if sum(len(x) for x in lines) + len(line) + 1 > 3700:
+            omitted += 1
+            continue
+        lines.append(line)
+    if omitted:
+        lines.append(f"… ще {omitted} повідомлень не вмістилися в одне повідомлення.")
+    await call.message.answer("\\n".join(lines),
+                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="⬅️ До списку чатів", callback_data="adm_chats_0")]
+                              ]))
     await call.answer()
 
 

@@ -152,6 +152,7 @@ def on_chat_started(a: int, b: int, mode: str):
     now = time.time()
     for x in (a, b):
         chat_meta[x] = {"start": now, "mode": mode, "msgs": 0}
+    chatlog_start(a, b, mode)
     stat_add("chats")
     if mode == "flirt":
         stat_add("flirt")

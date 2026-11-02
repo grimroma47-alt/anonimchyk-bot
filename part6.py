@@ -1118,6 +1118,60 @@ def is_fresh_newbie(u: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 🌙 Теплий старт: новачкам, які ще ні з ким не поговорили, — одне «живе» запрошення під час
+# Години знайомств (о 21:10), коли в боті справді багато людей. Лише раз на людину.
+# ---------------------------------------------------------------------------
+WARM_START_MINUTE = 10
+WARM_START_MAX_AGE = 3 * 86400  # лише ті, хто прийшов за останні 3 дні
+WARM_START_MIN_ONLINE = 3  # якщо в боті майже нікого — не кличемо, щоб не розчарувати
+warm_state: dict = {"day": None}
+
+
+def warm_start_recipients() -> list[int]:
+    now = time.time()
+    out = []
+    for uid, u in users_db.items():
+        if uid <= 0 or uid in banned_users or uid in active_chats or uid in queue or uid in user_room:
+            continue
+        if u.get("total_chats") or u.get("warm_start_sent") or not u.get("notify_meet", True):
+            continue
+        joined = u.get("joined_at") or 0
+        if not joined or now - joined > WARM_START_MAX_AGE:
+            continue
+        out.append(uid)
+    return out
+
+
+async def warm_start_tick():
+    now = datetime.now(KYIV_TZ)
+    today = now.date().isoformat()
+    if now.hour != MEET_HOUR or now.minute < WARM_START_MINUTE or warm_state.get("day") == today:
+        return
+    if not _contest_can_write():
+        return
+    warm_state["day"] = today
+    online = online_now()
+    if online < WARM_START_MIN_ONLINE:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")]])
+    sent = 0
+    for uid in warm_start_recipients():
+        users_db[uid]["warm_start_sent"] = True
+        if await safe_send(
+            uid,
+            f"🔥 <b>Зараз Година знайомств</b> — у боті <b>{online}</b> людей онлайн.\n\n"
+            "Ти ще ні з ким не поговорив(-ла) — саме час: натисни, і за кілька секунд я з'єднаю тебе "
+            "з кимось анонімно 💬",
+            reply_markup=kb,
+        ):
+            sent += 1
+        await asyncio.sleep(0.05)
+    if sent:
+        stat_add("warm_start", sent)
+    request_save()
+
+
+# ---------------------------------------------------------------------------
 # 👋 «Ми скучили»: одне повідомлення тим, хто не заходив 4+ дні (не частіше ніж раз на 2 тижні)
 # ---------------------------------------------------------------------------
 COMEBACK_AFTER_DAYS = int(os.getenv("COMEBACK_AFTER_DAYS", "4"))
@@ -1623,6 +1677,7 @@ async def relay_messages(message: types.Message):
         return
     if getattr(message, "voice", None) and (in_voice_chat or voice_mask_active(users_db.get(user_id) or {})):
         await relay_masked_voice(message, user_id, partner_id, force=in_voice_chat)
+        chatlog_record(user_id, message)
         return
 
     try:
@@ -1631,6 +1686,7 @@ async def relay_messages(message: types.Message):
         )
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, msg_mark(message))
+        chatlog_record(user_id, message)
         on_chat_message(user_id)
     except TelegramAPIError:
         end_chat(user_id)
@@ -1722,7 +1778,7 @@ async def setup_bot_commands():
 
 
 async def main():
-    global BOT_USERNAME, TOPICS_ON
+    global BOT_USERNAME
     logging.basicConfig(level=logging.INFO)
     runner = await start_web_server()
     # Дані з бази завантажуємо ДО того, як бот почне приймати повідомлення.
@@ -1732,6 +1788,7 @@ async def main():
     lease_task = asyncio.create_task(lease_heartbeat_loop())
     mono_task = asyncio.create_task(mono_poll_loop())
     contest_task = asyncio.create_task(contest_loop())
+    chatlog_task = asyncio.create_task(chatlog_reset_loop())
     try:
         # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
         # Telegram API не вбивала весь процес (і "Application exited early" на Render).
@@ -1748,8 +1805,6 @@ async def main():
         try:
             me = await bot.get_me()
             BOT_USERNAME = me.username or ""
-            TOPICS_ON = FRIEND_TOPICS and bool(getattr(me, "has_topics_enabled", False))
-            logging.info("💜 Кімнати з друзями: %s", "увімкнено" if TOPICS_ON else "вимкнено")
         except Exception as e:  # noqa: BLE001
             logging.warning("Не вдалося отримати інформацію про бота (get_me): %s", e)
 
@@ -1770,6 +1825,7 @@ async def main():
         lease_task.cancel()
         mono_task.cancel()
         contest_task.cancel()
+        chatlog_task.cancel()
         await save_state_to_db()  # фінальне збереження при зупинці (деплой/перезапуск)
         await release_lease()  # тепер нова копія може забрати свіжі дані
         await bot.session.close()
