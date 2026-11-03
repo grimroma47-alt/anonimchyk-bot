@@ -36,7 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
-BOT_VERSION = "03.11-b"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
+BOT_VERSION = "03.11-d"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -73,6 +73,8 @@ async def track_last_seen(handler, event, data):
             known = users_db.get(user.id)
             if known is not None:
                 known.pop("blocked_bot", None)  # повернувся — знову можна писати
+                known.pop("nudge_pending", None)  # відгукнувся — нагадування працюють
+                known.pop("nudge_ignored", None)
                 known["last_active_day"] = today_str()
                 known["tg_username"] = user.username
                 known["tg_name"] = " ".join(x for x in (user.first_name, user.last_name) if x) or None
@@ -646,6 +648,10 @@ AGE_RANGES = [
     ("32-36", "32-36", lambda a: 32 <= a <= 36),
     ("gt36", "36+", lambda a: a > 36),
 ]
+# 🏙 Міста України для профілю й пошуку «лише моє місто»
+CITIES = ["Київ", "Харків", "Одеса", "Дніпро", "Львів", "Запоріжжя", "Кривий Ріг", "Миколаїв", "Вінниця",
+          "Полтава", "Чернігів", "Черкаси", "Хмельницький", "Чернівці", "Житомир", "Суми", "Рівне",
+          "Івано-Франківськ", "Тернопіль", "Луцьк", "Кропивницький", "Ужгород", "Біла Церква", "Херсон"]
 FILTER_COUNTRIES = [("🇺🇦", "Україна"), ("🇵🇱", "Польща"), ("🇩🇪", "Німеччина"), ("🇨🇿", "Чехія")]
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1087,8 @@ def filters_summary(u: dict) -> str:
         parts.append("🎂 " + ", ".join(lbl for k, lbl, _ in AGE_RANGES if k in u["filter_age_ranges"]))
     if u.get("filter_country"):
         parts.append("🌍 " + esc(u["filter_country"]))
+    if u.get("filter_city") and u.get("city"):
+        parts.append("🏙 " + esc(u["city"]))
     return " · ".join(parts) if parts else "без фільтрів — шукаємо всіх"
 
 
@@ -1132,6 +1140,12 @@ def get_filters_menu_keyboard(u: dict):
     rows.append(crow)
     other = f"✅ ✏️ {cur_c}" if cur_c and cur_c not in known else "✏️ Інша країна"
     rows.append([InlineKeyboardButton(text=other, callback_data="f_country_menu")])
+    rows.append([InlineKeyboardButton(text="— 🏙 Місто (безкоштовно) —", callback_data="f_info_city")])
+    if u.get("city"):
+        rows.append([InlineKeyboardButton(
+            text=f"{'✅' if u.get('filter_city') else '⬜'} Лише моє місто: {u['city']}", callback_data="fcity_toggle")])
+    else:
+        rows.append([InlineKeyboardButton(text="🏙 Вказати своє місто", callback_data="pe_city")])
     rows.append([InlineKeyboardButton(text="🔄 Скинути все", callback_data="f_reset")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1323,6 +1337,8 @@ def passes_filters(viewer: dict, candidate: dict) -> bool:
             c_age = get_age_int(candidate)
             if c_age is None or not age_in_ranges(c_age, wanted_ranges):
                 return False
+    if viewer.get("filter_city") and viewer.get("city") and candidate.get("city") != viewer.get("city"):
+        return False  # 🏙 лише моє місто
     if filter_active(viewer, "country_filter"):
         want_country = viewer.get("filter_country")
         if want_country and candidate.get("country", "").strip().lower() != want_country.strip().lower():
@@ -1359,6 +1375,8 @@ def short_info(u: dict, public: bool = True) -> str:
     rating = f" · 👍 {pct}%" if pct is not None and u.get("rating_up", 0) + u.get("rating_down", 0) >= RATING_MIN_VOTES else ""
     age = "🙈 вік приховано" if public and u.get("hide_age") else esc(u["age"])
     country = "🙈 країну приховано" if public and u.get("hide_country") else esc(u["country"])
+    if u.get("city") and not (public and (u.get("hide_country") or u.get("hide_city"))):
+        country += f", 🏙 {esc(u['city'])}"
     return f"{esc(u['gender'])}, {age}, {country}{badge}{vip}{rating}"
 
 

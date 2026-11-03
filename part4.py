@@ -330,6 +330,8 @@ def match_score(u: dict, p: dict, mode: str) -> int:
         score += 1
     if current_mood(u) and current_mood(u) == current_mood(p):
         score += 1  # 🎭 на одній хвилі
+    if u.get("city") and u.get("city") == p.get("city"):
+        score += 1  # 🏙 з одного міста
     if (is_newbie(u) and is_warm(p)) or (is_newbie(p) and is_warm(u)):
         score += 1  # 🆕 новачку — досвідченого привітного співрозмовника, щоб перший чат вдався
     return score
@@ -347,17 +349,50 @@ def interests_line(u: dict) -> str:
     return ", ".join(INTEREST_LABELS[k] for k in keys) if keys else "не обрано"
 
 
+# 💡 Перше повідомлення: одне відкрите питання за інтересом — щоб не думати, з чого почати
+OPENERS = {
+    "music": "Що ти зараз слухаєш на повторі?",
+    "movies": "Який фільм чи серіал ти можеш передивлятися безкінечно?",
+    "games": "У що зараз граєш?",
+    "travel": "Де тобі найбільше сподобалося бувати?",
+    "it": "Яка технологія чи гаджет тебе останнім часом вразили?",
+    "sport": "Який спорт тобі до душі — дивитися чи займатися?",
+    "books": "Яку книжку ти радиш усім?",
+    "pets": "У тебе є улюбленець — кіт, пес чи хтось інший?",
+    "cook": "Яку страву ти готуєш найкраще?",
+    "fitness": "Як ти знаходиш мотивацію на тренування?",
+    "art": "Що ти найбільше любиш малювати?",
+    "photo": "Що найчастіше потрапляє тобі в кадр?",
+    "instr": "На чому граєш і скільки вже вчишся?",
+    "plants": "Яка рослина в тебе найпримхливіша?",
+    "cars": "Яке авто — твоя мрія?",
+    "yoga": "Що тобі найкраще допомагає розслабитися?",
+    "craft": "Що ти останнє зробив(-ла) своїми руками?",
+    "fishing": "Яка твоя найкраща рибалка?",
+    "anime": "Яке аніме ти порадиш новачкові?",
+    "dance": "Під яку музику тебе неможливо втримати на місці?",
+}
+
+
+def opener_line(keys: list) -> str:
+    keys = [k for k in keys if k in OPENERS]
+    if not keys:
+        return ""
+    return f"\n💡 Можна почати так: «{OPENERS[random.choice(keys)]}»"
+
+
 async def send_interest_notes(user_id: int, u: dict, partner_id: int, p: dict):
     u_open, p_open = not u.get("hide_interests"), not p.get("hide_interests")
     common = [k for k in INTEREST_LABELS if k in (u.get("interests") or set()) & (p.get("interests") or set())]
     if common and u_open and p_open:
         note = "🧩 Спільні інтереси: <b>" + ", ".join(INTEREST_LABELS[k] for k in common) + "</b> — є з чого почати 😉"
-        await safe_send(user_id, note)
-        await safe_send(partner_id, note)
+        await safe_send(user_id, note + opener_line(common))
+        await safe_send(partner_id, note + opener_line(common))
         return
     for me, other, is_open in ((user_id, p, p_open), (partner_id, u, u_open)):
         if is_open and other.get("interests"):
-            await safe_send(me, f"🧩 Інтереси співрозмовника: {interests_line(other)}")
+            keys = [k for k in INTEREST_LABELS if k in (other.get("interests") or set())]
+            await safe_send(me, f"🧩 Інтереси співрозмовника: {interests_line(other)}" + opener_line(keys))
 
 
 # ---------------------------------------------------------------------------
@@ -875,8 +910,9 @@ NEWBIE_WAIT_LINE = (
 )
 WAIT_PING_USER_COOLDOWN = int(os.getenv("WAIT_PING_USER_COOLDOWN", str(3 * 3600)))  # одну людину кличемо не частіше
 WAIT_PING_SEEKER_COOLDOWN = 10 * 60  # за одного й того самого шукача кличемо не частіше
-WAIT_PING_MAX = int(os.getenv("WAIT_PING_MAX", "40"))  # скільки людей кличемо за раз
-WAIT_PING_DAILY_MAX = int(os.getenv("WAIT_PING_DAILY_MAX", "2"))  # одну людину кличемо не більше N разів на день
+WAIT_PING_MAX = int(os.getenv("WAIT_PING_MAX", "5"))  # скільки людей кличемо за раз
+WAIT_PING_DAILY_MAX = int(os.getenv("WAIT_PING_DAILY_MAX", "1"))
+WAIT_PING_ACTIVE_DAYS = int(os.getenv("WAIT_PING_ACTIVE_DAYS", "7"))  # кличемо лише тих, хто заходив за тиждень  # одну людину кличемо не більше N разів на день
 WAIT_PING_NIGHT_END = 8  # з 00:00 до 08:00 (Київ) «хтось шукає» не надсилаємо
 wait_ping_seeker_last: dict[int, float] = {}
 
@@ -900,9 +936,14 @@ def wait_ping_recipients(seeker_id: int, mode: str) -> list[int]:
     result = []
     if datetime.now(KYIV_TZ).hour < WAIT_PING_NIGHT_END:
         return result  # уночі нікого не будимо
+    active_edge = (kyiv_today() - timedelta(days=WAIT_PING_ACTIVE_DAYS)).isoformat()
     for uid, u in users_db.items():
         if uid <= 0 or uid == seeker_id or uid in banned_users:
             continue
+        if u.get("blocked_bot") or (u.get("last_active_day") or "9999") < active_edge:
+            continue  # заблокував бота або давно не заходив
+        if not nudge_allowed(u):
+            continue  # кілька разів поспіль не відгукнувся — кличемо рідше
         if uid in active_chats or uid in queue or uid in user_room:
             continue
         if not u.get("notify_waiting", True) or u.get("gender", "Не вказано") == "Не вказано":
@@ -967,6 +1008,7 @@ async def wait_ping_after_wait(user_id: int, mode: str):
             pu["wait_ping_n"] = pu.get("wait_ping_n", 0) + 1
             if await safe_send(uid, text, reply_markup=kb):
                 sent += 1
+                nudge_sent(pu)
             await asyncio.sleep(0.05)  # не впираємось у ліміти Telegram
         if sent:
             stat_add("wait_pings", sent)
@@ -1371,6 +1413,7 @@ def privacy_keyboard(u: dict):
         inline_keyboard=[
             [InlineKeyboardButton(text=f"🎂 Приховати вік: {_onoff(u.get('hide_age'))}", callback_data="tg_hide_age")],
             [InlineKeyboardButton(text=f"🌍 Приховати країну: {_onoff(u.get('hide_country'))}", callback_data="tg_hide_country")],
+            [InlineKeyboardButton(text=f"🏙 Приховати місто: {_onoff(u.get('hide_city'))}", callback_data="tg_hide_city")],
             [InlineKeyboardButton(text=f"🧩 Приховати інтереси: {_onoff(u.get('hide_interests'))}", callback_data="tg_hide_interests")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="set_back")],
         ]
@@ -1394,6 +1437,7 @@ def notify_keyboard(u: dict):
 TOGGLES = {
     "hide_age": (False, "privacy"),
     "hide_country": (False, "privacy"),
+    "hide_city": (False, "privacy"),
     "hide_interests": (False, "privacy"),
     "notify_tasks": (True, "notify"),
     "notify_tips": (True, "notify"),
@@ -1512,6 +1556,7 @@ def profile_edit_text(u: dict) -> str:
         f"👤 Стать: <b>{esc(u['gender'])}</b>\n"
         f"🎂 Вік: <b>{esc(u['age'])}</b>{' (🙈 прихований)' if u.get('hide_age') else ''}\n"
         f"🌍 Країна: <b>{esc(u['country'])}</b>{' (🙈 прихована)' if u.get('hide_country') else ''}\n"
+        f"🏙 Місто: <b>{esc(u.get('city') or 'не вказано')}</b>{' (🙈 приховане)' if u.get('city') and u.get('hide_city') else ''}\n"
         f"🧩 Інтереси: {interests_line(u)}\n"
         f"📝 Про себе: {('«' + protect_text(esc(u['bio'])) + '»') if u.get('bio') else 'не заповнено'}\n\n"
         "Що змінити?"
@@ -1529,7 +1574,10 @@ def profile_edit_keyboard():
                 InlineKeyboardButton(text="🌍 Країна", callback_data="pe_country"),
                 InlineKeyboardButton(text="🧩 Інтереси", callback_data="pi_open"),
             ],
-            [InlineKeyboardButton(text="📝 Про себе", callback_data="pe_bio")],
+            [
+                InlineKeyboardButton(text="🏙 Місто", callback_data="pe_city"),
+                InlineKeyboardButton(text="📝 Про себе", callback_data="pe_bio"),
+            ],
         ]
     )
 
@@ -1650,6 +1698,44 @@ async def pe_age_set(message: types.Message, state: FSMContext):
     await state.clear()
     await _show_profile_editor(message.from_user.id, u)
     await maybe_send_safety_memo(message.from_user.id, u)
+
+
+@dp.callback_query(F.data == "pe_city")
+async def pe_city(call: types.CallbackQuery):
+    rows = [
+        [InlineKeyboardButton(text=c, callback_data=f"pcity_{i + j}") for j, c in enumerate(CITIES[i:i + 3])]
+        for i in range(0, len(CITIES), 3)
+    ]
+    rows.append([InlineKeyboardButton(text="🚫 Не вказувати", callback_data="pcity_none")])
+    await call.message.answer(
+        "🏙 <b>Твоє місто</b>\nТак легше знайти когось поруч. Співрозмовник побачить місто в інфо "
+        "(можна приховати: ⚙️ Налаштування → 🔒 Приватність).",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pcity_"))
+async def pcity_set(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    v = call.data[len("pcity_"):]
+    if v == "none":
+        u.pop("city", None)
+        u["filter_city"] = False
+        note = "Місто прибрано"
+    elif v.isdigit() and int(v) < len(CITIES):
+        u["city"] = CITIES[int(v)]
+        note = f"🏙 {u['city']} ✅"
+    else:
+        await call.answer()
+        return
+    request_save()
+    try:
+        await call.message.edit_text(f"🏙 Місто: <b>{esc(u.get('city') or 'не вказано')}</b>")
+    except TelegramAPIError:
+        pass
+    await call.answer(note)
+    await _show_profile_editor(call.from_user.id, u)
 
 
 @dp.callback_query(F.data == "pe_country")

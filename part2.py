@@ -473,6 +473,23 @@ async def fc_set(call: types.CallbackQuery):
     await refresh_filters(call)
 
 
+@dp.callback_query(F.data == "fcity_toggle")
+async def fcity_toggle(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    if not u.get("city"):
+        await call.answer("Спершу вкажи своє місто в профілі", show_alert=True)
+        return
+    u["filter_city"] = not u.get("filter_city")
+    await refresh_filters(call, "🏙 Шукаю лише з твого міста" if u["filter_city"] else "🏙 Шукаю з усіх міст")
+
+
+@dp.callback_query(F.data == "f_info_city")
+async def f_info_city(call: types.CallbackQuery):
+    await call.answer(
+        "🏙 Увімкни — і бот з'єднуватиме лише з людьми з твого міста. "
+        "Навіть без фільтра люди з одного міста знаходять одне одного трохи частіше.", show_alert=True)
+
+
 @dp.callback_query(F.data == "f_country_menu")
 async def f_country_menu(call: types.CallbackQuery, state: FSMContext):
     await call.message.answer(
@@ -502,6 +519,7 @@ async def f_reset(call: types.CallbackQuery):
     u["filter_gender"] = None
     u["filter_age_ranges"] = set()
     u["filter_country"] = None
+    u["filter_city"] = False
     await refresh_filters(call, "Скинуто ✅")
 
 
