@@ -152,7 +152,6 @@ def on_chat_started(a: int, b: int, mode: str):
     now = time.time()
     for x in (a, b):
         chat_meta[x] = {"start": now, "mode": mode, "msgs": 0}
-    chatlog_start(a, b, mode)
     stat_add("chats")
     if mode == "flirt":
         stat_add("flirt")
@@ -236,7 +235,6 @@ async def founders_cmd(message: types.Message):
 
 
 def on_chat_ended(a: int, b: int):
-    chatlog_end(a, b)
     try:
         ma, mb = chat_meta.pop(a, None), chat_meta.pop(b, None)
         if ma is None or mb is None:

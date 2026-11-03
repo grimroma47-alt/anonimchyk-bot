@@ -36,7 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
-BOT_VERSION = "02.11-c"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
+BOT_VERSION = "03.11-a"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -55,7 +55,8 @@ dp.callback_query.filter(F.message.chat.type == "private")
 # Хто й коли востаннє щось робив у боті — для кнопки "Онлайн".
 # Тримаємо лише в пам'яті (не в базі), щоб не записувати базу щохвилини.
 last_seen: dict[int, float] = {}
-ONLINE_WINDOW = int(os.getenv("ONLINE_WINDOW", "300"))  # "онлайн" = активний за останні N секунд
+ONLINE_WINDOW = int(os.getenv("ONLINE_WINDOW", "300"))
+VISIT_GAP = 30 * 60  # «захід» — коли людина повертається в бот після перерви від 30 хв  # "онлайн" = активний за останні N секунд
 
 
 @dp.update.outer_middleware()
@@ -65,6 +66,8 @@ async def track_last_seen(handler, event, data):
         if user is not None:
             CUR_LANG.set((users_db.get(user.id) or {}).get("lang", "uk") if LANG_RU_ENABLED else "uk")
             CUR_UID.set(user.id)
+            if time.time() - last_seen.get(user.id, 0) > VISIT_GAP:
+                stat_add("visits")  # новий захід: людина повернулась після перерви
             last_seen[user.id] = time.time()
             stats_day()["active"].add(user.id)
             known = users_db.get(user.id)
@@ -361,105 +364,6 @@ queue_since: dict[int, float] = {}  # user_id -> коли став у чергу
 search_mode: dict[int, str] = {}  # user_id у черзі -> "normal" або "flirt" (флірт шукає лише флірт)
 active_chats: dict[int, int] = {}
 user_counter = 1000
-
-# 💬 Журнал анонімних приватних чатів — тільки RAM, очищається опівночі та після рестарту.
-CHATLOG_MAX_CHATS = 150
-CHATLOG_MAX_MESSAGES = 200
-CHATLOG_MAX_MEDIA = 100
-chatlog: dict[int, dict] = {}  # id -> {a, b, mode, started, ended, messages}
-chatlog_active: dict[int, int] = {}  # user_id -> id поточного журналу
-chatlog_next_id = 1
-chatlog_day = None
-
-def chatlog_reset_if_new_day():
-    """Очищає журнал при переході на нову дату за Києвом."""
-    global chatlog_day
-    today = kyiv_today()
-    if chatlog_day != today:
-        chatlog.clear()
-        chatlog_active.clear()
-        chatlog_day = today
-
-def chatlog_start(a: int, b: int, mode: str):
-    """Починає журнал лише для анонімної розмови 1-на-1; дружні чати виключені."""
-    global chatlog_next_id
-    chatlog_reset_if_new_day()
-    if mode == "friend":
-        return
-    # Якщо в когось лишився старий активний ключ — закриваємо його перед новим чатом.
-    for uid in (a, b):
-        old_id = chatlog_active.pop(uid, None)
-        if old_id in chatlog:
-            chatlog[old_id]["ended"] = time.time()
-    while len(chatlog) >= CHATLOG_MAX_CHATS:
-        old_id = next(iter(chatlog))
-        old = chatlog.pop(old_id)
-        for uid in (old["a"], old["b"]):
-            if chatlog_active.get(uid) == old_id:
-                chatlog_active.pop(uid, None)
-    cid = chatlog_next_id
-    chatlog_next_id += 1
-    chatlog[cid] = {"id": cid, "a": a, "b": b, "mode": mode,
-                    "started": time.time(), "ended": None, "messages": []}
-    chatlog_active[a] = cid
-    chatlog_active[b] = cid
-
-def chatlog_end(a: int, b: int):
-    """Позначає завершення запису, не видаляючи його з історії."""
-    chatlog_reset_if_new_day()
-    cid = chatlog_active.get(a)
-    if cid is not None and chatlog_active.get(b) == cid and cid in chatlog:
-        chatlog[cid]["ended"] = time.time()
-        chatlog_active.pop(a, None)
-        chatlog_active.pop(b, None)
-
-def chatlog_record(user_id: int, message):
-    """Записує доставлене повідомлення; найстаріші записи витісняються автоматично."""
-    chatlog_reset_if_new_day()
-    cid = chatlog_active.get(user_id)
-    entry = chatlog.get(cid) if cid is not None else None
-    if entry is None:
-        return
-    text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
-    media_type = None
-    file_id = None
-    media_fields = (
-        ("photo", "Фото"), ("video", "Відео"), ("animation", "GIF"),
-        ("document", "Файл"), ("audio", "Аудіо"), ("voice", "Голосове"),
-        ("video_note", "Відеоповідомлення"), ("sticker", "Стікер"),
-    )
-    for field, label in media_fields:
-        value = getattr(message, field, None)
-        if value:
-            media_type = label
-            if field == "photo":
-                file_id = value[-1].file_id
-            else:
-                file_id = getattr(value, "file_id", None)
-            break
-    if not text:
-        text = f"[{media_type}]" if media_type else f"[{getattr(message, 'content_type', 'повідомлення')}]"
-    item = {"at": time.time(), "sender": user_id, "text": str(text)[:2000],
-            "media_type": media_type, "file_id": file_id}
-    messages = entry["messages"]
-    messages.append(item)
-    # Ліміт медіа окремий: при переповненні прибираємо найстаріше медіа, лишаючи текст.
-    media_indexes = [i for i, m in enumerate(messages) if m.get("media_type")]
-    if len(media_indexes) > CHATLOG_MAX_MEDIA:
-        del messages[media_indexes[0]]
-    if len(messages) > CHATLOG_MAX_MESSAGES:
-        del messages[:len(messages) - CHATLOG_MAX_MESSAGES]
-
-async def chatlog_reset_loop():
-    """Очищає журнал рівно на межі нової доби за київським часом."""
-    global chatlog_day
-    while True:
-        now = datetime.now(KYIV_TZ)
-        tomorrow = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=KYIV_TZ)
-        await asyncio.sleep(max(1, (tomorrow - now).total_seconds()))
-        chatlog.clear()
-        chatlog_active.clear()
-        chatlog_day = kyiv_today()
 
 banned_users: set[int] = set()
 # Статистика для адміна: дата (YYYY-MM-DD, Київ) -> лічильники за день. Зберігається в базі.
@@ -862,6 +766,8 @@ BTN_INTERESTS = "🧩 Інтереси"
 BTN_INTERESTS_OLD = "🧩 За інтересами"  # стара назва — для старих клавіатур
 BTN_ADD_FRIEND = "🤝 Додати в друзі"
 BTN_FRIEND_EXIT = "🚪 Вийти з переписки"
+BTN_NEXT = "⏭ Наступний"
+BTN_CALL = "📞 Дзвінок"
 
 
 # ---------------------------------------------------------------------------
@@ -985,8 +891,9 @@ def get_chat_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_GIFT), KeyboardButton(text=BTN_ADD_FRIEND)],
-            [KeyboardButton(text=BTN_STOP), KeyboardButton(text=BTN_REPORT)],
+            [KeyboardButton(text=BTN_STOP), KeyboardButton(text=BTN_NEXT)],
             [KeyboardButton(text=BTN_UNMASK), KeyboardButton(text=BTN_GAME)],
+            [KeyboardButton(text=BTN_CALL), KeyboardButton(text=BTN_REPORT)],
             [KeyboardButton(text=BTN_BLACKLIST_ADD)],
         ],
         resize_keyboard=True,
@@ -1246,7 +1153,6 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
-            [InlineKeyboardButton(text="💬 Чати", callback_data="adm_chats:0")],
             [InlineKeyboardButton(text="🔗 Посилання з мітками", callback_data="adm_links")],
             [InlineKeyboardButton(text="🎁 Подарувати подарунок", callback_data="adm_gift")],
             [InlineKeyboardButton(text="🚨 Скарги", callback_data="adm_reports_0")],

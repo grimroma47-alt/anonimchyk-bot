@@ -227,6 +227,24 @@ def week_visitors() -> int:
         return 1
 
 
+def week_visits() -> int:
+    """Скільки разів за 7 днів люди заходили в бот (захід = повернення після перерви від 30 хв)."""
+    try:
+        today = kyiv_today()
+        n = sum(int((stats_days.get((today - timedelta(days=i)).isoformat()) or {}).get("visits") or 0) for i in range(7))
+        return max(n, week_visitors())
+    except Exception:  # noqa: BLE001
+        return week_visitors()
+
+
+def visits_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "захід"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "заходи"
+    return "заходів"
+
+
 def people_word(n: int) -> str:
     if n % 10 == 1 and n % 100 != 11:
         return "людина"
@@ -1647,7 +1665,6 @@ async def relay_masked_voice(message: types.Message, user_id: int, partner_id: i
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, "[голосове з маскою]")
         on_chat_message(user_id)
-        chatlog_record(user_id, sent)
         stat_add("voice_mask")
     except TelegramAPIError:
         end_chat(user_id)

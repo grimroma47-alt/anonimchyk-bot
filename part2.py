@@ -1392,7 +1392,8 @@ async def online_stats(message: types.Message, state: FSMContext):
         f"💬 Спілкуються в чатах: <b>{in_chats}</b>\n"
         f"🔍 Шукають співрозмовника: <b>{searching}</b> (з них ❤️ флірт: {flirt_note})\n"
         f"🏠 У кімнатах: <b>{in_rooms}</b>\n"
-        f"🔥 За 7 днів у боті було: <b>{week_visitors()}</b> {people_word(week_visitors())}\n\n"
+        f"🔥 За 7 днів у боті було: <b>{week_visitors()}</b> {people_word(week_visitors())} · "
+        f"<b>{week_visits()}</b> {visits_word(week_visits())}\n\n"
         f"{meet_status_line()}\n\n"
         f"<i>Онлайн — ті, хто був активний за останні {ONLINE_WINDOW // 60} хв.</i>"
     )
@@ -1715,6 +1716,7 @@ async def room_report_submit(call: types.CallbackQuery):
 # Пошук та чат
 # ---------------------------------------------------------------------------
 @dp.message(F.text == BTN_SEARCH)
+@dp.message(Command("search"))
 async def search_partner(message: types.Message, state: FSMContext):
     await run_search(message, state, "normal")
 
@@ -1917,6 +1919,29 @@ async def stop_chat(message: types.Message, state: FSMContext):
     await send_post_chat_menu(partner_id, user_id)
     await auto_search_after_chat(user_id)
     await auto_search_after_chat(partner_id)
+
+
+@dp.message(F.text == BTN_NEXT)
+@dp.message(Command("next"))
+async def next_chat(message: types.Message, state: FSMContext):
+    """⏭ Завершити поточний чат і одразу шукати нового співрозмовника."""
+    await state.clear()
+    user_id = message.from_user.id
+    if user_id in queue:
+        await message.answer("🔍 Пошук уже йде — щойно когось знайду, з'єднаю 🙂")
+        return
+    mode = "normal"
+    partner_id = end_chat(user_id)
+    if partner_id is not None:
+        mode = last_chat_mode.get(user_id, "normal")
+        await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+        await send_post_chat_menu(user_id, partner_id)
+        await send_post_chat_menu(partner_id, user_id)
+        await auto_search_after_chat(partner_id)
+    if mode == "friend" or (mode == "flirt" and flirt_block_reason(init_user(user_id)) is not None):
+        mode = "normal"
+    await message.answer("⏭ Шукаю наступного співрозмовника…")
+    await run_search(message, state, mode)
 
 
 @dp.callback_query(F.data.startswith("rate_up_"))

@@ -1616,6 +1616,335 @@ async def relay_edit(message: types.Message):
 
 
 # ---------------------------------------------------------------------------
+# 📞 Анонімні дзвінки (LiveKit Cloud). Бот створює одноразову кімнату на двох і надсилає обом посилання
+# на сторінку дзвінка, яку віддає наш же вебсервер. Весь звук і відео йдуть через сервер LiveKit,
+# тож співрозмовники не бачать IP одне одного; Telegram-акаунти теж ніхто не бачить.
+# Умови: обом 18+, Premium хоча б в одного, згода обох. Камера за замовчуванням вимкнена. До 15 хв.
+# Змінні Render: LIVEKIT_URL (wss://…livekit.cloud), LIVEKIT_API_KEY, LIVEKIT_API_SECRET.
+# ---------------------------------------------------------------------------
+import base64
+import hashlib as _hashlib_calls
+import hmac
+import json as _json_calls
+import secrets
+
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "").strip()
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+CALLS_ON = bool(LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET and PUBLIC_URL)
+CALL_MINUTES = int(os.getenv("CALL_MINUTES", "15"))
+CALL_DAILY_MAX = int(os.getenv("CALL_DAILY_MAX", "6"))  # скільки запрошень на дзвінок людина може надіслати за день
+CALL_COOLDOWN = 60
+CALL_INVITE_TTL = 120
+CALL_MIN_AGE = 18
+
+call_requests: dict[int, tuple[int, float]] = {}  # кому -> (від кого, коли)
+call_tickets: dict[str, dict] = {}  # id посилання -> {"room","token","end","lang"}
+call_last: dict[int, float] = {}
+call_peers: dict[int, dict[int, float]] = {}  # з ким людина нещодавно мала дзвінок (для скарги)
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def livekit_jwt(claims: dict, ttl: int) -> str:
+    now = int(time.time())
+    payload = {"iss": LIVEKIT_API_KEY, "nbf": now - 10, "exp": now + ttl, **claims}
+    head = _b64url(_json_calls.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    body = _b64url(_json_calls.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode())
+    sig = hmac.new(LIVEKIT_API_SECRET.encode(), f"{head}.{body}".encode(), _hashlib_calls.sha256).digest()
+    return f"{head}.{body}.{_b64url(sig)}"
+
+
+def _livekit_http() -> str:
+    u = LIVEKIT_URL
+    if u.startswith("wss://"):
+        u = "https://" + u[6:]
+    elif u.startswith("ws://"):
+        u = "http://" + u[5:]
+    return u.rstrip("/")
+
+
+async def livekit_api(method: str, body: dict) -> bool:
+    token = livekit_jwt({"video": {"roomCreate": True, "roomList": True}}, 60)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+            async with s.post(
+                f"{_livekit_http()}/twirp/livekit.RoomService/{method}",
+                json=body, headers={"Authorization": f"Bearer {token}"},
+            ) as r:
+                if r.status != 200:
+                    logging.warning("LiveKit %s: HTTP %s %s", method, r.status, (await r.text())[:200])
+                return r.status == 200
+    except Exception as e:  # noqa: BLE001
+        logging.warning("LiveKit %s: %s", method, e)
+        return False
+
+
+def call_block_reason(u: dict, p: dict) -> str | None:
+    """Чому дзвінок неможливий (або None — можна)."""
+    for x in (u, p):
+        age = get_age_int(x)
+        low = min_age_ever(x)
+        if age is None or age < CALL_MIN_AGE or (low is not None and low < CALL_MIN_AGE):
+            return "self" if x is u else "partner"
+    if not (is_premium(u) or is_premium(p)):
+        return "premium"
+    return None
+
+
+CALL_PAGE_TEXT = {
+    "uk": {"title": "Анонімний дзвінок", "join": "📞 Приєднатися", "wait": "Чекаємо співрозмовника…",
+           "on": "Співрозмовник на зв'язку", "left": "Співрозмовник вийшов", "ended": "Дзвінок завершено",
+           "mic": "🎙 Мікрофон", "cam": "📷 Камера", "end": "Завершити", "note":
+           "Твій Telegram і номер ніхто не бачить. Камера вимкнена — вмикаєш лише ти. Не показуй документи й особисте. Якщо щось не так — завершуй дзвінок і поскаржся в боті.",
+           "err": "Не вдалося підключитися. Дозволь доступ до мікрофона або відкрий посилання в Chrome / Safari.",
+           "gone": "Посилання вже недійсне — дзвінок завершився."},
+    "ru": {"title": "Анонимный звонок", "join": "📞 Присоединиться", "wait": "Ждём собеседника…",
+           "on": "Собеседник на связи", "left": "Собеседник вышел", "ended": "Звонок завершён",
+           "mic": "🎙 Микрофон", "cam": "📷 Камера", "end": "Завершить", "note":
+           "Твой Telegram и номер никто не видит. Камера выключена — включаешь только ты. Не показывай документы и личное. Если что-то не так — завершай звонок и пожалуйся в боте.",
+           "err": "Не удалось подключиться. Разреши доступ к микрофону или открой ссылку в Chrome / Safari.",
+           "gone": "Ссылка уже недействительна — звонок завершился."},
+    "en": {"title": "Anonymous call", "join": "📞 Join", "wait": "Waiting for your partner…",
+           "on": "Your partner is here", "left": "Your partner left", "ended": "Call ended",
+           "mic": "🎙 Mic", "cam": "📷 Camera", "end": "End", "note":
+           "No one sees your Telegram or number. The camera is off — only you can turn it on. Don't show documents or anything personal. If something's wrong — end the call and report in the bot.",
+           "err": "Couldn't connect. Allow microphone access or open the link in Chrome / Safari.",
+           "gone": "This link is no longer valid — the call has ended."},
+}
+
+CALL_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>__TITLE__ · ANONimchyk</title>
+<style>
+:root{--bg:#0c0618;--card:#1a1030;--acc:#7c3aed;--txt:#f4efff;--mut:#b7a6e0}
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:radial-gradient(900px 900px at 50% 30%,#3a1a6e,#120826 60%,#08040f);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:520px;margin:0 auto;min-height:100%;display:flex;flex-direction:column;align-items:center;padding:24px 16px;gap:16px}
+h1{font-size:22px;margin:8px 0 0}.st{color:var(--mut);font-size:15px;min-height:20px;text-align:center}
+.timer{font-variant-numeric:tabular-nums;font-size:15px;color:#ffd9a8}
+.stage{position:relative;width:100%;aspect-ratio:3/4;border-radius:24px;overflow:hidden;background:#140c26;display:flex;align-items:center;justify-content:center;box-shadow:0 0 60px rgba(124,58,237,.25)}
+.mask{font-size:96px;opacity:.9}#remote video{width:100%;height:100%;object-fit:cover}
+#me{position:absolute;right:10px;bottom:10px;width:28%;aspect-ratio:3/4;border-radius:14px;overflow:hidden;background:#000;display:none}#me video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+.row{display:flex;gap:10px;width:100%}button{flex:1;border:0;border-radius:16px;padding:16px 10px;font-size:16px;font-weight:600;color:#fff;background:var(--card)}
+button.on{background:var(--acc)}button.end{background:#c0264b}button.big{background:var(--acc);font-size:19px;padding:18px}
+.note{font-size:13px;color:var(--mut);text-align:center;line-height:1.45}.hide{display:none!important}
+</style></head><body><div class="wrap">
+<h1>🎭 __TITLE__</h1><div class="timer" id="tm"></div><div class="st" id="st"></div>
+<div class="stage"><div id="remote" class="hide"></div><div class="mask" id="mk">🎭</div><div id="me"></div></div>
+<button class="big" id="join">__JOIN__</button>
+<div class="row hide" id="ctl"><button id="mic" class="on">__MIC__</button><button id="cam">__CAM__</button><button class="end" id="end">__END__</button></div>
+<div class="note">__NOTE__</div></div>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.5.7/dist/livekit-client.umd.min.js"></script>
+<script>
+const T=__TEXTS__,URL_=__URL__,TOKEN=__TOKEN__,END=__END_TS__;
+const $=id=>document.getElementById(id);let room=null,timerId=null;
+function st(t){$('st').textContent=t}
+function tick(){const s=Math.max(0,Math.round(END-Date.now()/1000));$('tm').textContent=String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');if(s<=0)finish()}
+function finish(){if(timerId)clearInterval(timerId);if(room)room.disconnect();st(T.ended);$('ctl').classList.add('hide');$('join').classList.add('hide')}
+tick();timerId=setInterval(tick,1000);
+$('join').onclick=async()=>{
+ const L=window.LivekitClient;if(!L){st(T.err);return}
+ $('join').disabled=true;
+ room=new L.Room({adaptiveStream:true,dynacast:true});
+ room.on(L.RoomEvent.TrackSubscribed,(track)=>{const el=track.attach();if(track.kind==='video'){$('remote').innerHTML='';$('remote').appendChild(el);$('remote').classList.remove('hide');$('mk').classList.add('hide')}else{el.style.display='none';document.body.appendChild(el)}});
+ room.on(L.RoomEvent.TrackUnsubscribed,(track)=>{track.detach().forEach(e=>e.remove());if(track.kind==='video'){$('remote').classList.add('hide');$('mk').classList.remove('hide')}});
+ room.on(L.RoomEvent.ParticipantConnected,()=>st(T.on));
+ room.on(L.RoomEvent.ParticipantDisconnected,()=>st(T.left));
+ room.on(L.RoomEvent.Disconnected,()=>{st(T.ended);$('ctl').classList.add('hide')});
+ room.on(L.RoomEvent.LocalTrackPublished,(pub)=>{if(pub.track&&pub.track.kind==='video'){const el=pub.track.attach();$('me').innerHTML='';$('me').appendChild(el);$('me').style.display='block'}});
+ room.on(L.RoomEvent.LocalTrackUnpublished,(pub)=>{if(pub.track&&pub.track.kind==='video'){$('me').style.display='none';$('me').innerHTML=''}});
+ try{await room.connect(URL_,TOKEN);await room.startAudio();await room.localParticipant.setMicrophoneEnabled(true);
+  $('join').classList.add('hide');$('ctl').classList.remove('hide');st(room.remoteParticipants.size?T.on:T.wait)}
+ catch(e){console.log(e);st(T.err);$('join').disabled=false}
+};
+$('mic').onclick=async()=>{const on=!room.localParticipant.isMicrophoneEnabled;await room.localParticipant.setMicrophoneEnabled(on);$('mic').classList.toggle('on',on)};
+$('cam').onclick=async()=>{const on=!room.localParticipant.isCameraEnabled;try{await room.localParticipant.setCameraEnabled(on);$('cam').classList.toggle('on',on)}catch(e){st(T.err)}};
+$('end').onclick=finish;
+</script></body></html>"""
+
+
+def call_page_html(ticket: dict | None) -> str:
+    lang = (ticket or {}).get("lang", "uk")
+    t = CALL_PAGE_TEXT.get(lang, CALL_PAGE_TEXT["uk"])
+    if not ticket or time.time() > ticket["end"]:
+        return (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                f"</head><body style='background:#0c0618;color:#f4efff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;padding:16px'>"
+                f"<div style='font-size:18px'>🎭<br><br>{html.escape(t['gone'])}</div></body></html>")
+    page = CALL_PAGE
+    for k, v in (("__TITLE__", t["title"]), ("__JOIN__", t["join"]), ("__MIC__", t["mic"]), ("__CAM__", t["cam"]),
+                 ("__END__", t["end"]), ("__NOTE__", t["note"])):
+        page = page.replace(k, html.escape(v))
+    return (page.replace("__TEXTS__", _json_calls.dumps(t, ensure_ascii=False))
+            .replace("__URL__", _json_calls.dumps(LIVEKIT_URL)).replace("__TOKEN__", _json_calls.dumps(ticket["token"]))
+            .replace("__END_TS__", str(int(ticket["end"]))))
+
+
+async def handle_call_page(request: web.Request):
+    tid = request.match_info.get("tid", "")
+    return web.Response(
+        text=call_page_html(call_tickets.get(tid)), content_type="text/html",
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
+def _call_cleanup():
+    now = time.time()
+    for k in [k for k, v in call_tickets.items() if now > v["end"] + 600]:
+        call_tickets.pop(k, None)
+
+
+@dp.message(F.text == BTN_CALL)
+@dp.message(Command("call"))
+async def call_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    pid = active_chats.get(uid)
+    if pid is None:
+        await message.answer("📞 Дзвінок можна запропонувати лише під час чату — спершу знайди співрозмовника 🙂")
+        return
+    if not CALLS_ON:
+        await message.answer("📞 Дзвінки зовсім скоро з'являться 🙂")
+        return
+    u, p = init_user(uid), init_user(pid)
+    why = call_block_reason(u, p)
+    if why == "self":
+        await message.answer(f"📞 Дзвінки доступні лише з {CALL_MIN_AGE} років.")
+        return
+    if why == "partner":
+        await message.answer("📞 З цим співрозмовником дзвінок недоступний.")
+        return
+    if why == "premium":
+        await message.answer(
+            "📞 <b>Анонімні дзвінки</b> — у 💎 Premium.\n\n"
+            "Достатньо, щоб Premium був хоча б в одного з вас. Ваші Telegram-акаунти й номери залишаються прихованими.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Premium", callback_data="prem_open")]]),
+        )
+        return
+    now = time.time()
+    if now - call_last.get(uid, 0) < CALL_COOLDOWN:
+        await message.answer("📞 Запрошення вже надіслано — зачекай хвилинку 🙂")
+        return
+    day = u.setdefault("call_day", {"d": None, "n": 0})
+    if day.get("d") != today_str():
+        day.update(d=today_str(), n=0)
+    if day["n"] >= CALL_DAILY_MAX:
+        await message.answer("📞 На сьогодні ліміт запрошень на дзвінок вичерпано. Завтра — знову 🙂")
+        return
+    day["n"] += 1
+    call_last[uid] = now
+    call_requests[pid] = (uid, now)
+    ok = await safe_send(
+        pid,
+        "📞 <b>Співрозмовник пропонує анонімний дзвінок.</b>\n\n"
+        f"Посилання відкриється в браузері. Твій Telegram і номер ніхто не побачить, камера вимкнена — вмикаєш лише ти сам(а). До {CALL_MINUTES} хв.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Прийняти", callback_data=f"call_yes:{uid}"),
+            InlineKeyboardButton(text="❌ Ні", callback_data=f"call_no:{uid}"),
+        ]]),
+    )
+    if ok:
+        await message.answer("📞 Запрошення на дзвінок надіслано — чекаємо відповіді.")
+    else:
+        call_requests.pop(pid, None)
+        await message.answer("❌ Не вдалося надіслати запрошення.")
+
+
+@dp.callback_query(F.data.startswith("call_no:"))
+async def call_no(call: types.CallbackQuery):
+    me = call.from_user.id
+    req = call_requests.pop(me, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer("Відхилено")
+    if req:
+        await safe_send(req[0], "📞 Співрозмовник поки не хоче дзвонити — нічого страшного, продовжуйте в чаті 🙂")
+
+
+@dp.callback_query(F.data.startswith("call_yes:"))
+async def call_yes(call: types.CallbackQuery):
+    me = call.from_user.id
+    try:
+        caller = int(call.data.split(":", 1)[1])
+    except ValueError:
+        await call.answer()
+        return
+    req = call_requests.pop(me, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if not req or req[0] != caller or time.time() - req[1] > CALL_INVITE_TTL or active_chats.get(me) != caller:
+        await call.answer("Запрошення вже неактуальне", show_alert=True)
+        return
+    u, p = init_user(me), init_user(caller)
+    if call_block_reason(u, p):
+        await call.answer("Дзвінок зараз недоступний", show_alert=True)
+        return
+    await call.answer()
+    room = "c_" + secrets.token_hex(8)
+    if not await livekit_api("CreateRoom", {"name": room, "empty_timeout": 120, "departure_timeout": 30, "max_participants": 2}):
+        for x in (me, caller):
+            await safe_send(x, "❌ Не вдалося створити дзвінок. Спробуйте трохи пізніше.")
+        return
+    end = time.time() + CALL_MINUTES * 60
+    _call_cleanup()
+    for x, other in ((me, caller), (caller, me)):
+        tid = secrets.token_urlsafe(18)
+        token = livekit_jwt({
+            "sub": "p_" + secrets.token_hex(6), "name": "🎭",
+            "video": {"room": room, "roomJoin": True, "canPublish": True, "canSubscribe": True, "canPublishData": False},
+        }, CALL_MINUTES * 60 + 120)
+        call_tickets[tid] = {"room": room, "token": token, "end": end, "lang": user_lang(x)}
+        call_peers.setdefault(x, {})[other] = time.time()
+        await safe_send(
+            x,
+            f"📞 <b>Дзвінок готовий!</b> Натисни кнопку — відкриється сторінка дзвінка.\n\n"
+            f"⏱ До {CALL_MINUTES} хв · 📷 камера вимкнена, поки ти сам(а) не ввімкнеш.\n"
+            "<i>Якщо мікрофон не працює — відкрий посилання в Chrome чи Safari.</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📞 Відкрити дзвінок", url=f"{PUBLIC_URL}/call/{tid}")]]),
+        )
+    stat_add("calls")
+    task = asyncio.get_running_loop().create_task(_call_finish(room, me, caller, CALL_MINUTES * 60 + 20))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _call_finish(room: str, a: int, b: int, delay: float):
+    await asyncio.sleep(delay)
+    await livekit_api("DeleteRoom", {"room": room})
+    for x, other in ((a, b), (b, a)):
+        await safe_send(
+            x, "📞 Дзвінок завершено. Якщо співрозмовник поводився погано — поскаржся, модератор перевірить.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚨 Поскаржитися на дзвінок", callback_data=f"call_rep:{other}")]]),
+        )
+
+
+@dp.callback_query(F.data.startswith("call_rep:"))
+async def call_report(call: types.CallbackQuery):
+    me = call.from_user.id
+    try:
+        other = int(call.data.split(":", 1)[1])
+    except ValueError:
+        await call.answer()
+        return
+    if time.time() - (call_peers.get(me) or {}).get(other, 0) > 6 * 3600:
+        await call.answer("Скарга на цей дзвінок уже недоступна", show_alert=True)
+        return
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+    report_pending[me] = {"on": other, "msgs": [], "ts": time.time(), "call": True}
+    await call.message.answer("🚨 Що сталося під час дзвінка? Обери причину:", reply_markup=report_reason_kb())
+
+
+# ---------------------------------------------------------------------------
 # Пересилання повідомлень (завжди останнім!)
 # ---------------------------------------------------------------------------
 @dp.message()
@@ -1686,7 +2015,6 @@ async def relay_messages(message: types.Message):
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, msg_mark(message))
         on_chat_message(user_id)
-        chatlog_record(user_id, message)
     except TelegramAPIError:
         end_chat(user_id)
         await message.answer(
@@ -1705,6 +2033,7 @@ async def start_web_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/health", handle_ping)
+    app.router.add_get("/call/{tid}", handle_call_page)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 10000))
@@ -1717,36 +2046,19 @@ async def start_web_server() -> web.AppRunner:
 async def setup_bot_commands():
     """Перекладає меню команд '/' на українську (замість заглушок command1, command2...)."""
     default_commands = [
-        types.BotCommand(command="start", description="🚀 Почати / перезапустити бота"),
-        types.BotCommand(command="edit_profile", description="✏️ Редагувати профіль"),
+        types.BotCommand(command="search", description="🔍 Шукати співрозмовника"),
+        types.BotCommand(command="next", description="⏭ Наступний співрозмовник"),
         types.BotCommand(command="stop", description="❌ Завершити чат"),
-        types.BotCommand(command="cancel", description="⬅️ Скасувати поточну дію"),
-        types.BotCommand(command="top", description="🏆 Топ дарувальників подарунків"),
-        types.BotCommand(command="filters", description="🎯 Фільтри пошуку"),
-        types.BotCommand(command="rooms", description="👥 Кімнати за інтересами"),
-        types.BotCommand(command="help", description="🆘 Допомога / зв'язок з адміном"),
+        types.BotCommand(command="call", description="📞 Дзвінок співрозмовнику (18+, Premium)"),
         types.BotCommand(command="friends", description="👫 Друзі"),
-        types.BotCommand(command="online", description="👥 Хто зараз онлайн"),
-        types.BotCommand(command="premium", description="💎 Premium"),
-        types.BotCommand(command="flirt", description="❤️ Флірт-пошук (18+)"),
+        types.BotCommand(command="filters", description="🎯 Фільтри пошуку"),
         types.BotCommand(command="interests", description="🧩 Пошук за інтересами"),
-        types.BotCommand(command="myinterests", description="🧩 Мої інтереси в профілі"),
-        types.BotCommand(command="tasks", description="📋 Щоденні завдання"),
-        types.BotCommand(command="contest", description="🏆 Конкурс запрошень"),
-        types.BotCommand(command="best", description="🌟 Топ співрозмовників тижня"),
-        types.BotCommand(command="mood", description="🎭 Мій настрій і пісня"),
         types.BotCommand(command="voice", description="🎙 Маска голосу"),
-        types.BotCommand(command="game", description="🎲 Гра в чаті"),
-        types.BotCommand(command="where", description="📍 Де я зараз"),
-        types.BotCommand(command="fun", description="✨ Розваги: гороскоп, карта дня"),
-        types.BotCommand(command="letter", description="💌 Нічний лист"),
+        types.BotCommand(command="premium", description="💎 Premium"),
         types.BotCommand(command="confess", description="🤫 Анонімне зізнання"),
-        types.BotCommand(command="topic", description="💬 Тема для розмови"),
-        types.BotCommand(command="founders", description="👑 Засновники — перші 100"),
+        types.BotCommand(command="edit_profile", description="✏️ Мій профіль"),
+        types.BotCommand(command="help", description="🆘 Допомога"),
         types.BotCommand(command="rules", description="📜 Правила"),
-        types.BotCommand(command="safety", description="🛡 Безпека"),
-        types.BotCommand(command="paysupport", description="💳 Питання щодо оплат"),
-        types.BotCommand(command="silent", description="🔒 Захист моїх медіа (Premium)"),
     ]
     await bot.set_my_commands(default_commands, scope=types.BotCommandScopeDefault())
     DEFAULT_COMMANDS[:] = default_commands
@@ -1787,7 +2099,6 @@ async def main():
     lease_task = asyncio.create_task(lease_heartbeat_loop())
     mono_task = asyncio.create_task(mono_poll_loop())
     contest_task = asyncio.create_task(contest_loop())
-    chatlog_task = asyncio.create_task(chatlog_reset_loop())
     try:
         # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
         # Telegram API не вбивала весь процес (і "Application exited early" на Render).
@@ -1824,7 +2135,6 @@ async def main():
         lease_task.cancel()
         mono_task.cancel()
         contest_task.cancel()
-        chatlog_task.cancel()
         await save_state_to_db()  # фінальне збереження при зупинці (деплой/перезапуск)
         await release_lease()  # тепер нова копія може забрати свіжі дані
         await bot.session.close()
