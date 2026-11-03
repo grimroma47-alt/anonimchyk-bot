@@ -291,8 +291,12 @@ def meet_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+MEET_ACTIVE_DAYS = int(os.getenv("MEET_ACTIVE_DAYS", "14"))
+
+
 def meet_recipients() -> list[int]:
     result = []
+    meet_active_edge = (kyiv_today() - timedelta(days=MEET_ACTIVE_DAYS)).isoformat()
     for uid, u in users_db.items():
         if uid <= 0 or uid in banned_users:
             continue
@@ -302,6 +306,10 @@ def meet_recipients() -> list[int]:
             continue  # вимкнув нагадування
         if u.get("gender", "Не вказано") == "Не вказано" and not is_fresh_newbie(u):
             continue  # ще не пройшов знайомство з ботом (крім новачків — їх кличемо на першу розмову)
+        if u.get("blocked_bot"):
+            continue
+        if (u.get("last_active_day") or "9999") < meet_active_edge:
+            continue  # давно не заходив — щоденно не нагадуємо (для таких є рідкісне «Давно не бачились»)
         result.append(uid)
     result.sort(key=lambda x: last_seen.get(x, 0), reverse=True)
     return result

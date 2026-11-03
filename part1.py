@@ -36,7 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
-BOT_VERSION = "03.11-a"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
+BOT_VERSION = "03.11-b"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -72,6 +72,7 @@ async def track_last_seen(handler, event, data):
             stats_day()["active"].add(user.id)
             known = users_db.get(user.id)
             if known is not None:
+                known.pop("blocked_bot", None)  # повернувся — знову можна писати
                 known["last_active_day"] = today_str()
                 known["tg_username"] = user.username
                 known["tg_name"] = " ".join(x for x in (user.first_name, user.last_name) if x) or None
@@ -1361,12 +1362,22 @@ def short_info(u: dict, public: bool = True) -> str:
     return f"{esc(u['gender'])}, {age}, {country}{badge}{vip}{rating}"
 
 
+BLOCKED_MARKERS = ("bot was blocked", "user is deactivated", "chat not found", "bot can't initiate")
+
+
 async def safe_send(chat_id: int, text: str, **kwargs) -> bool:
+    u = users_db.get(chat_id)
+    if u is not None and u.get("blocked_bot"):
+        return False  # людина заблокувала бота — не набридаємо; позначка зникне, щойно вона повернеться
     try:
         await bot.send_message(chat_id, text, **kwargs)
         return True
     except TelegramAPIError as e:
-        logging.warning("Не вдалося надіслати %s: %s", chat_id, e)
+        if u is not None and any(m in str(e) for m in BLOCKED_MARKERS):
+            u["blocked_bot"] = True
+            logging.info("Користувач %s заблокував бота — більше не пишемо йому першими", chat_id)
+        else:
+            logging.warning("Не вдалося надіслати %s: %s", chat_id, e)
         return False
 
 

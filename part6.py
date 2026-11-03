@@ -892,7 +892,11 @@ async def version_cmd(message: types.Message):
     if not _is_admin(message.from_user.id):
         return
     up = int(time.time() - BOT_STARTED_AT)
-    await message.answer(f"🤖 Версія бота: <b>{BOT_VERSION}</b>\n⏱ Працює без перезапуску: {up // 3600} год {up % 3600 // 60} хв")
+    blocked = sum(1 for u in users_db.values() if u.get("blocked_bot"))
+    await message.answer(
+        f"🤖 Версія бота: <b>{BOT_VERSION}</b>\n⏱ Працює без перезапуску: {up // 3600} год {up % 3600 // 60} хв\n"
+        f"{calls_status()}\n🚫 Заблокували бота: {blocked}"
+    )
 
 
 @dp.message(Command("resetroulette"))
@@ -1628,11 +1632,27 @@ import hmac
 import json as _json_calls
 import secrets
 
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "").strip()
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()
-PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "").strip().strip("\"'").strip()
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip().strip("\"'").strip()
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip().strip("\"'").strip()
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().strip("\"'").strip().rstrip("/")
 CALLS_ON = bool(LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET and PUBLIC_URL)
+
+
+def calls_status() -> str:
+    """Для адміна: чи працюють дзвінки і якої змінної бракує (лише назви, без значень)."""
+    missing = [n for n, v in (("LIVEKIT_URL", LIVEKIT_URL), ("LIVEKIT_API_KEY", LIVEKIT_API_KEY),
+                              ("LIVEKIT_API_SECRET", LIVEKIT_API_SECRET), ("PUBLIC_URL", PUBLIC_URL)) if not v]
+    if missing:
+        return "📞 Дзвінки: вимкнено — немає " + ", ".join(missing)
+    bad = []
+    if not LIVEKIT_URL.startswith(("wss://", "ws://", "https://")):
+        bad.append("LIVEKIT_URL має починатися з wss://")
+    if not PUBLIC_URL.startswith("https://"):
+        bad.append("PUBLIC_URL має починатися з https://")
+    if any(c in (LIVEKIT_URL + LIVEKIT_API_KEY + LIVEKIT_API_SECRET + PUBLIC_URL) for c in "\"' "):
+        bad.append("у значеннях є лапки або пробіли")
+    return "📞 Дзвінки: увімкнено" + (" ⚠️ " + "; ".join(bad) if bad else " ✅")
 CALL_MINUTES = int(os.getenv("CALL_MINUTES", "15"))
 CALL_DAILY_MAX = int(os.getenv("CALL_DAILY_MAX", "6"))  # скільки запрошень на дзвінок людина може надіслати за день
 CALL_COOLDOWN = 60
@@ -2115,6 +2135,7 @@ async def main():
         try:
             me = await bot.get_me()
             BOT_USERNAME = me.username or ""
+            logging.info(calls_status())
         except Exception as e:  # noqa: BLE001
             logging.warning("Не вдалося отримати інформацію про бота (get_me): %s", e)
 
