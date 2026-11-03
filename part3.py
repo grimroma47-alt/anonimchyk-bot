@@ -226,8 +226,8 @@ def _in_friend_mode(message) -> bool:
     if user is None or user.id not in friend_mode:
         return False
     t = getattr(message, "text", None) or ""
-    if t == BTN_FRIEND_EXIT:
-        return False
+    if t in (BTN_FRIEND_EXIT, BTN_CALL, BTN_GIFT):
+        return False  # кнопки самої переписки — обробляються своїми обробниками
     if t.startswith("/") or t in _menu_texts():
         friend_mode.pop(user.id, None)  # пішов у меню — переписку закрито, далі звичайна обробка
         return False
@@ -235,7 +235,10 @@ def _in_friend_mode(message) -> bool:
 
 
 def get_friend_mode_keyboard():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_FRIEND_EXIT)]], resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_CALL), KeyboardButton(text=BTN_GIFT)], [KeyboardButton(text=BTN_FRIEND_EXIT)]],
+        resize_keyboard=True,
+    )
 
 
 def _after_friend_kb(uid: int):
@@ -251,7 +254,7 @@ def friend_seen_text(fid: int) -> str:
     if ago <= ONLINE_WINDOW:
         return "🟢 зараз онлайн"
     if ago < 3600:
-        return f"був(-ла) {int(ago // 60)} хв тому"
+        return f"останній візит: {int(ago // 60)} хв тому"
     return ""
 
 
@@ -442,19 +445,50 @@ async def report_handler(message: types.Message):
 # ---------------------------------------------------------------------------
 # Подарунки співрозмовнику (тільки під час активного чату)
 # ---------------------------------------------------------------------------
+def gift_target(user_id: int) -> tuple[int | None, str]:
+    """Кому зараз дарувати / дзвонити: другу з відкритої переписки або співрозмовнику в чаті."""
+    fid = friend_mode.get(user_id)
+    if fid is not None:
+        u, f = users_db.get(user_id) or {}, users_db.get(fid)
+        if f and fid in (u.get("friends") or set()) and user_id in (f.get("friends") or set()) \
+                and not is_blacklisted(u, user_id, f, fid) and fid not in banned_users:
+            return fid, "friend"
+        return None, "friend"
+    pid = active_chats.get(user_id)
+    return (pid, "chat") if pid is not None else (None, "")
+
+
+def gift_from_label(user_id: int, kind: str) -> str:
+    if kind == "friend":
+        return f"💜 Твій друг <b>{esc((users_db.get(user_id) or {}).get('nickname') or '')}</b>"
+    return "Співрозмовник"
+
+
+def gift_verb(user_id: int) -> str:
+    """«подарував» / «подарувала» за статтю дарувальника (а не того, хто читає)."""
+    g = (users_db.get(user_id) or {}).get("gender")
+    return "подарувала" if g == "Дівчина" else "подарував" if g == "Хлопець" else "подарував(-ла)"
+
+
+def _gift_kb(user_id: int):
+    return get_friend_mode_keyboard() if friend_mode.get(user_id) is not None else get_chat_keyboard()
+
+
 @dp.message(F.text == BTN_GIFT)
 async def gift_menu(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    if user_id not in active_chats:
-        await message.answer("Дарувати можна лише співрозмовнику під час чату.", reply_markup=get_main_keyboard())
+    target, kind = gift_target(user_id)
+    if target is None:
+        await message.answer("Дарувати можна співрозмовнику під час чату або другу в переписці.", reply_markup=get_main_keyboard())
         return
-    await message.answer("🎁 Що подаруєш співрозмовнику?", reply_markup=get_gift_menu_keyboard())
+    await message.answer("🎁 Що подаруєш другу?" if kind == "friend" else "🎁 Що подаруєш співрозмовнику?",
+                         reply_markup=get_gift_menu_keyboard())
 
 
 @dp.callback_query(F.data == "gift_money")
 async def gift_money_start(call: types.CallbackQuery, state: FSMContext):
-    if call.from_user.id not in active_chats:
+    if gift_target(call.from_user.id)[0] is None:
         await call.answer("Чат вже завершено", show_alert=True)
         return
     await call.message.answer("Введіть суму в грн, яку хочете подарувати (або /cancel):")
@@ -466,7 +500,7 @@ async def gift_money_start(call: types.CallbackQuery, state: FSMContext):
 async def gift_money_finish(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    partner_id = active_chats.get(user_id)
+    partner_id, kind = gift_target(user_id)
     if partner_id is None:
         await message.answer("Чат вже завершено.", reply_markup=get_main_keyboard())
         return
@@ -488,6 +522,11 @@ async def gift_money_finish(message: types.Message, state: FSMContext):
     p = init_user(partner_id)
     p["balance"] += amount
 
+    request_save()
+    if kind == "friend":
+        await message.answer(f"🎁 Подаровано {amount:.2f} грн другу!", reply_markup=_gift_kb(user_id))
+        await safe_send(partner_id, f"🎁 {gift_from_label(user_id, kind)} {gift_verb(user_id)} тобі {amount:.2f} грн!")
+        return
     await message.answer(
         f"🎁 Подаровано {amount:.2f} грн співрозмовнику!", reply_markup=get_chat_keyboard()
     )
@@ -496,7 +535,7 @@ async def gift_money_finish(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "gift_catalog")
 async def gift_catalog_in_chat(call: types.CallbackQuery):
-    if call.from_user.id not in active_chats:
+    if gift_target(call.from_user.id)[0] is None:
         await call.answer("Чат вже завершено", show_alert=True)
         return
     await call.message.answer(
@@ -508,7 +547,7 @@ async def gift_catalog_in_chat(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "gift_inventory")
 async def gift_inventory_menu(call: types.CallbackQuery):
-    if call.from_user.id not in active_chats:
+    if gift_target(call.from_user.id)[0] is None:
         await call.answer("Чат вже завершено", show_alert=True)
         return
     u = init_user(call.from_user.id)
@@ -532,7 +571,7 @@ async def gift_inventory_menu(call: types.CallbackQuery):
 async def send_gift_item(call: types.CallbackQuery):
     global gift_revenue_total
     user_id = call.from_user.id
-    partner_id = active_chats.get(user_id)
+    partner_id, kind = gift_target(user_id)
     if partner_id is None:
         await call.answer("Чат вже завершено", show_alert=True)
         return
@@ -566,8 +605,9 @@ async def send_gift_item(call: types.CallbackQuery):
     await call.message.answer(f"🎁 Подаровано: <b>{esc(title)}</b>!")
     await safe_send(
         partner_id,
-        f"🎁 Співрозмовник подарував вам: <b>{esc(title)}</b>!\n"
-        f"На баланс нараховано {recipient_amount:.2f} грн."
+        (f"🎁 {gift_from_label(user_id, kind)} {gift_verb(user_id)} тобі: <b>{esc(title)}</b>!\n" if kind == "friend"
+         else f"🎁 Співрозмовник подарував вам: <b>{esc(title)}</b>!\n")
+        + f"На баланс нараховано {recipient_amount:.2f} грн."
         + (f"\n💸 {uah(earned)} з них можна буде вивести на карту через {EARN_HOLD_DAYS} днів." if earned else ""),
     )
     await call.answer()
@@ -1817,6 +1857,28 @@ async def topup_pay_jar(call: types.CallbackQuery):
         reply_markup=kb,
     )
     await call.answer()
+
+
+@dp.message(Command("clearage"))
+async def clear_age_history(message: types.Message):
+    """Адмін: очистити історію віку людини (архів профілю і найменший вік) — для тестових акаунтів
+    і випадків, коли людина справді помилилась із віком. Поточний вік у профілі лишається."""
+    if not _is_admin(message.from_user.id):
+        return
+    arg = (message.text or "").split(maxsplit=1)
+    uid = resolve_user_id(arg[1]) if len(arg) > 1 else None
+    u = users_db.get(uid) if uid else None
+    if not u:
+        await message.answer("Напиши так: <code>/clearage ID_1234</code> (наш ID або Telegram ID)")
+        return
+    had = len(u.get("archive") or [])
+    u["archive"] = []
+    u.pop("min_age_seen", None)
+    request_save()
+    await message.answer(
+        f"🧹 Історію віку очищено: {esc(admin_label(uid))}\n"
+        f"Видалено записів архіву: {had}. Поточний вік у профілі: {esc(str(u.get('age') or '—'))}."
+    )
 
 
 @dp.message(Command("mono"))

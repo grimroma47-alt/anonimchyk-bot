@@ -1821,9 +1821,9 @@ def _call_cleanup():
 async def call_start(message: types.Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
-    pid = active_chats.get(uid)
+    pid, kind = gift_target(uid)
     if pid is None:
-        await message.answer("📞 Дзвінок можна запропонувати лише під час чату — спершу знайди співрозмовника 🙂")
+        await message.answer("📞 Дзвінок можна запропонувати під час чату або другу в переписці 🙂")
         return
     if not CALLS_ON:
         await message.answer("📞 Дзвінки зовсім скоро з'являться 🙂")
@@ -1855,10 +1855,11 @@ async def call_start(message: types.Message, state: FSMContext):
         return
     day["n"] += 1
     call_last[uid] = now
-    call_requests[pid] = (uid, now)
+    call_requests[pid] = (uid, now, kind)
+    who = f"Друг {esc(u.get('nickname') or '')}" if kind == "friend" else "Співрозмовник"
     ok = await safe_send(
         pid,
-        "📞 <b>Співрозмовник пропонує анонімний дзвінок.</b>\n\n"
+        f"📞 <b>{who} пропонує анонімний дзвінок.</b>\n\n"
         f"Посилання відкриється в браузері. Твій Telegram і номер ніхто не побачить, камера вимкнена — вмикаєш лише ти сам(а). До {CALL_MINUTES} хв.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Прийняти", callback_data=f"call_yes:{uid}"),
@@ -1898,7 +1899,10 @@ async def call_yes(call: types.CallbackQuery):
         await call.message.edit_reply_markup(reply_markup=None)
     except TelegramAPIError:
         pass
-    if not req or req[0] != caller or time.time() - req[1] > CALL_INVITE_TTL or active_chats.get(me) != caller:
+    kind = req[2] if req and len(req) > 2 else "chat"
+    still = (active_chats.get(me) == caller) if kind == "chat" else (
+        caller in (init_user(me).get("friends") or set()) and me in (init_user(caller).get("friends") or set()))
+    if not req or req[0] != caller or time.time() - req[1] > CALL_INVITE_TTL or not still:
         await call.answer("Запрошення вже неактуальне", show_alert=True)
         return
     u, p = init_user(me), init_user(caller)
@@ -2098,6 +2102,7 @@ async def setup_bot_commands():
             types.BotCommand(command="addbalance", description="💰 Поповнити баланс користувачу"),
             types.BotCommand(command="confirm", description="🏦 Підтвердити оплату за кодом"),
             types.BotCommand(command="mono", description="🫙 Стан Банки monobank"),
+            types.BotCommand(command="clearage", description="🧹 Очистити історію віку (ID)"),
         ]
         try:
             await bot.set_my_commands(

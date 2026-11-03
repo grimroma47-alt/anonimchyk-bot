@@ -45,7 +45,13 @@ def source_breakdown(ids: list[int]) -> list[tuple[str, int, int]]:
 # 💬 Переписка з другом: поки відкрита, усе, що людина пише, йде цьому другу.
 # Стоїть перед усіма обробниками. Команда чи кнопка меню — автоматично закривають переписку.
 # ---------------------------------------------------------------------------
-@dp.message(lambda m: _in_friend_mode(m))
+def _friend_mode_filter(message, raw_state=None) -> bool:
+    if raw_state:  # людина зараз щось вводить (сума подарунка тощо) — це не повідомлення другу
+        return False
+    return _in_friend_mode(message)
+
+
+@dp.message(_friend_mode_filter)
 async def friend_mode_message(message: types.Message):
     uid = message.from_user.id
     fid = friend_mode.get(uid)
@@ -1047,8 +1053,8 @@ async def buy_gift_item(call: types.CallbackQuery):
     u.setdefault("gifts", {})
     u["gifts"][key] = u["gifts"].get(key, 0) + 1
 
-    # Якщо зараз в активному чаті — пропонуємо подарувати щойно куплене одразу
-    if call.from_user.id in active_chats:
+    # Якщо зараз в активному чаті чи переписці з другом — пропонуємо подарувати щойно куплене одразу
+    if gift_target(call.from_user.id)[0] is not None:
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=f"🎁 Подарувати {title} зараз", callback_data=f"sendgift_{key}")]

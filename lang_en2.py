@@ -851,6 +851,22 @@ EN_PAIRS2 = {
     "Яка твоя найкраща рибалка?": "What was your best fishing trip?",
     "Яке аніме ти порадиш новачкові?": "Which anime would you recommend to a beginner?",
     "Під яку музику тебе неможливо втримати на місці?": "What music makes it impossible for you to sit still?",
+    "Дарувати можна співрозмовнику під час чату або другу в переписці.": "You can give gifts to your chat partner or to a friend in a conversation.",
+    "🎁 Що подаруєш другу?": "🎁 What will you give your friend?",
+    "💜 Твій друг <b>": "💜 Your friend <b>",
+    "</b> подарував тобі ": "</b> gave you ",
+    "</b> подарувала тобі ": "</b> gave you ",
+    "</b> подарував(-ла) тобі ": "</b> gave you ",
+    "</b> подарував тобі: <b>": "</b> gave you: <b>",
+    "</b> подарувала тобі: <b>": "</b> gave you: <b>",
+    "</b> подарував(-ла) тобі: <b>": "</b> gave you: <b>",
+    "🎁 Подаровано ": "🎁 Gifted ",
+    " грн другу!": " UAH to your friend!",
+    "📞 Дзвінок можна запропонувати під час чату або другу в переписці 🙂": "📞 You can offer a call during a chat or to a friend in a conversation 🙂",
+    "📞 <b>Співрозмовник пропонує анонімний дзвінок.</b>\n\nПосилання відкриється в браузері. Твій Telegram і номер ніхто не побачить, камера вимкнена — вмикаєш лише ти сам(а). До ": "📞 <b>Your partner suggests an anonymous call.</b>\n\nThe link opens in your browser. No one will see your Telegram or number, the camera is off — only you can turn it on. Up to ",
+    "останній візит: ": "last seen: ",
+    "📞 <b>Друг ": "📞 <b>Your friend ",
+    " пропонує анонімний дзвінок.</b>\n\nПосилання відкриється в браузері. Твій Telegram і номер ніхто не побачить, камера вимкнена — вмикаєш лише ти сам(а). До ": " suggests an anonymous call.</b>\n\nThe link opens in your browser. No one will see your Telegram or number, the camera is off — only you can turn it on. Up to ",
 }
 
 # === КІНЕЦЬ lang_en2.py ===
