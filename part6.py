@@ -1748,7 +1748,7 @@ h1{font-size:22px;margin:8px 0 0}.st{color:var(--mut);font-size:15px;min-height:
 .stage{position:relative;width:100%;aspect-ratio:3/4;border-radius:24px;overflow:hidden;background:#140c26;display:flex;align-items:center;justify-content:center;box-shadow:0 0 60px rgba(124,58,237,.25)}
 .mask{font-size:96px;opacity:.9}#remote video{width:100%;height:100%;object-fit:cover}
 #me{position:absolute;right:10px;bottom:10px;width:28%;aspect-ratio:3/4;border-radius:14px;overflow:hidden;background:#000;display:none}#me video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
-.row{display:flex;gap:10px;width:100%}button{flex:1;border:0;border-radius:16px;padding:16px 10px;font-size:16px;font-weight:600;color:#fff;background:var(--card)}
+.row{display:flex;gap:10px;width:100%}button{flex:1;border:0;border-radius:16px;padding:16px 6px;font-size:15px;font-weight:600;color:#fff;background:var(--card);white-space:nowrap}
 button.on{background:var(--acc)}button.end{background:#c0264b}button.big{background:var(--acc);font-size:19px;padding:18px}
 .note{font-size:13px;color:var(--mut);text-align:center;line-height:1.45}.hide{display:none!important}
 </style></head><body><div class="wrap">
@@ -1774,14 +1774,14 @@ $('join').onclick=async()=>{
  room.on(L.RoomEvent.ParticipantConnected,()=>st(T.on));
  room.on(L.RoomEvent.ParticipantDisconnected,()=>st(T.left));
  room.on(L.RoomEvent.Disconnected,()=>{st(T.ended);$('ctl').classList.add('hide')});
- room.on(L.RoomEvent.LocalTrackPublished,(pub)=>{if(pub.track&&pub.track.kind==='video'){const el=pub.track.attach();$('me').innerHTML='';$('me').appendChild(el);$('me').style.display='block'}});
+ room.on(L.RoomEvent.LocalTrackPublished,(pub)=>{if(pub.track&&pub.track.kind==='video'&&pub.source===L.Track.Source.Camera){const el=pub.track.attach();$('me').innerHTML='';$('me').appendChild(el);$('me').style.display='block'}});
  room.on(L.RoomEvent.LocalTrackUnpublished,(pub)=>{if(pub.track&&pub.track.kind==='video'){$('me').style.display='none';$('me').innerHTML=''}});
  try{await room.connect(URL_,TOKEN);await room.startAudio();await room.localParticipant.setMicrophoneEnabled(true);
   $('join').classList.add('hide');$('ctl').classList.remove('hide');st(room.remoteParticipants.size?T.on:T.wait)}
  catch(e){console.log(e);st(T.err);$('join').disabled=false}
 };
 $('mic').onclick=async()=>{const on=!room.localParticipant.isMicrophoneEnabled;await room.localParticipant.setMicrophoneEnabled(on);$('mic').classList.toggle('on',on)};
-$('cam').onclick=async()=>{const on=!room.localParticipant.isCameraEnabled;try{await room.localParticipant.setCameraEnabled(on);$('cam').classList.toggle('on',on)}catch(e){st(T.err)}};
+$('cam').onclick=async()=>{const on=!room.localParticipant.isCameraEnabled;try{await room.localParticipant.setCameraEnabled(on);$('cam').classList.toggle('on',on);if(!on){$('me').style.display='none';$('me').innerHTML=''}}catch(e){st(T.err);$('me').style.display='none';$('me').innerHTML=''}};
 $('end').onclick=finish;
 </script></body></html>"""
 

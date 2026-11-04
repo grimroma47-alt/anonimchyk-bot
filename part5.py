@@ -232,9 +232,21 @@ def week_visits() -> int:
     try:
         today = kyiv_today()
         n = sum(int((stats_days.get((today - timedelta(days=i)).isoformat()) or {}).get("visits") or 0) for i in range(7))
-        return max(n, week_visitors())
+        return n
     except Exception:  # noqa: BLE001
         return week_visitors()
+
+
+VISITS_SHOW_RATIO = 1.5  # заходи показуємо, лише коли їх помітно більше, ніж людей
+
+
+def week_lines() -> str:
+    """🔥 люди за тиждень і (якщо цифра вже «жива») 👣 заходи за тиждень — окремими рядками."""
+    people, visits = week_visitors(), week_visits()
+    text = f"🔥 За тиждень: <b>{people}</b> {people_word(people)}\n"
+    if visits >= people * VISITS_SHOW_RATIO:
+        text += f"👣 Заходів за тиждень: <b>{visits}</b>\n"
+    return text
 
 
 def visits_word(n: int) -> str:
@@ -294,6 +306,27 @@ def meet_keyboard() -> InlineKeyboardMarkup:
 MEET_ACTIVE_DAYS = int(os.getenv("MEET_ACTIVE_DAYS", "14"))
 
 
+# 🧠 Розумні нагадування: якщо людина кілька разів поспіль не відгукнулась на «хтось шукає» чи нагадування
+# про Годину знайомств, кличемо її рідше: після 3 — раз на 3 дні, після 6 — раз на тиждень.
+# Щойно людина сама заходить у бот — лічильник обнуляється.
+NUDGE_EASY = 3
+
+
+def nudge_sent(u: dict):
+    if u.get("nudge_pending"):
+        u["nudge_ignored"] = u.get("nudge_ignored", 0) + 1  # минуле нагадування проігнорував
+    u["nudge_pending"] = time.time()
+    u["nudge_last"] = time.time()
+
+
+def nudge_allowed(u: dict) -> bool:
+    ign = u.get("nudge_ignored", 0) + (1 if u.get("nudge_pending") else 0)
+    if ign < NUDGE_EASY:
+        return True
+    gap_days = 3 if ign < 6 else 7
+    return time.time() - u.get("nudge_last", 0) >= gap_days * DAY
+
+
 def meet_recipients() -> list[int]:
     result = []
     meet_active_edge = (kyiv_today() - timedelta(days=MEET_ACTIVE_DAYS)).isoformat()
@@ -306,8 +339,8 @@ def meet_recipients() -> list[int]:
             continue  # вимкнув нагадування
         if u.get("gender", "Не вказано") == "Не вказано" and not is_fresh_newbie(u):
             continue  # ще не пройшов знайомство з ботом (крім новачків — їх кличемо на першу розмову)
-        if u.get("blocked_bot"):
-            continue
+        if u.get("blocked_bot") or not nudge_allowed(u):
+            continue  # заблокував бота або кілька разів поспіль не відгукнувся
         if (u.get("last_active_day") or "9999") < meet_active_edge:
             continue  # давно не заходив — щоденно не нагадуємо (для таких є рідкісне «Давно не бачились»)
         result.append(uid)
@@ -325,6 +358,7 @@ async def _meet_broadcast(recipients: list[int]):
         t = text + (NEWBIE_MEET_LINE if not u.get("total_chats") else "")
         if await safe_send(uid, t, reply_markup=kb):
             sent += 1
+            nudge_sent(u)
         await asyncio.sleep(0.05)  # ~20 повідомлень за секунду — в межах лімітів Telegram
     meet_hour["sent"] = sent
     request_save()

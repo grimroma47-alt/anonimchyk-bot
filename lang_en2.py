@@ -867,6 +867,11 @@ EN_PAIRS2 = {
     "останній візит: ": "last seen: ",
     "📞 <b>Друг ": "📞 <b>Your friend ",
     " пропонує анонімний дзвінок.</b>\n\nПосилання відкриється в браузері. Твій Telegram і номер ніхто не побачить, камера вимкнена — вмикаєш лише ти сам(а). До ": " suggests an anonymous call.</b>\n\nThe link opens in your browser. No one will see your Telegram or number, the camera is off — only you can turn it on. Up to ",
+    "🔥 За тиждень: <b>": "🔥 This week: <b>",
+    "</b> людина\n": "</b> person\n",
+    "</b> людини\n": "</b> people\n",
+    "</b> людей\n": "</b> people\n",
+    "👣 Заходів за тиждень: <b>": "👣 Visits this week: <b>",
 }
 
 # === КІНЕЦЬ lang_en2.py ===
