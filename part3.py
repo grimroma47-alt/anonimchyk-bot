@@ -924,6 +924,78 @@ async def adm_links(call: types.CallbackQuery):
     await call.answer()
 
 
+@dp.callback_query(F.data.startswith("adm_chats_"))
+@admin_only
+async def adm_chats(call: types.CallbackQuery):
+    chatlog_reset_if_new_day()
+    try:
+        page = max(0, int(call.data.rsplit("_", 1)[1]))
+    except ValueError:
+        page = 0
+    items = list(reversed(list(chatlog.items())))
+    per_page = 8
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = min(page, total_pages - 1)
+    chunk = items[page * per_page:(page + 1) * per_page]
+    lines = [f"💬 <b>Анонімні чати</b> · {len(items)}/{CHATLOG_MAX_CHATS}",
+             f"Сторінка {page + 1}/{total_pages}", ""]
+    rows = []
+    for key, entry in chunk:
+        a, b = key
+        ua, ub = users_db.get(a) or {}, users_db.get(b) or {}
+        la = esc(ua.get("custom_id") or a)
+        lb = esc(ub.get("custom_id") or b)
+        count = len(entry["messages"])
+        lines.append(f"• <b>{la} ↔ {lb}</b> — {count} повідомлень")
+        rows.append([InlineKeyboardButton(text=f"{la} ↔ {lb} ({count})",
+                                          callback_data=f"adm_chat_{a}_{b}")])
+    if not chunk:
+        lines.append("Поки немає записаних анонімних чатів.")
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_chats_{page-1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_chats_{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔄 Оновити", callback_data=f"adm_chats_{page}")])
+    await call.message.answer("\\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_chat_"))
+@admin_only
+async def adm_chat_detail(call: types.CallbackQuery):
+    chatlog_reset_if_new_day()
+    try:
+        _, _, a_raw, b_raw = call.data.split("_", 3)
+        key = tuple(sorted((int(a_raw), int(b_raw))))
+    except (ValueError, TypeError):
+        await call.answer("Чат не знайдено.", show_alert=True)
+        return
+    entry = chatlog.get(key)
+    if not entry:
+        await call.answer("Історія цього чату вже відсутня.", show_alert=True)
+        return
+    ua, ub = users_db.get(key[0]) or {}, users_db.get(key[1]) or {}
+    lines = [f"💬 <b>{esc(ua.get('custom_id') or key[0])} ↔ {esc(ub.get('custom_id') or key[1])}</b>",
+             f"Повідомлень: {len(entry['messages'])}", ""]
+    for item in entry["messages"][-200:]:
+        sender = users_db.get(item["uid"]) or {}
+        label = esc(sender.get("custom_id") or item["uid"])
+        stamp = datetime.fromtimestamp(item["at"]).strftime("%H:%M")
+        lines.append(f"<b>{label}</b> <i>{stamp}</i>: {esc(item['text'])}")
+    text = "\\n".join(lines)
+    if len(text) > 3800:
+        text = text[-3800:]
+        text = "… (початок історії скорочено)\\n" + text
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ До списку чатів", callback_data="adm_chats_0")]
+    ])
+    await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
 @dp.callback_query(F.data == "adm_stats")
 @admin_only
 async def adm_stats(call: types.CallbackQuery):

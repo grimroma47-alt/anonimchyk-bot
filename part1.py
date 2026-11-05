@@ -373,6 +373,77 @@ banned_users: set[int] = set()
 stats_days: dict[str, dict] = {}
 # Поточні чати: user_id -> {"start": час, "mode": режим, "msgs": скільки написав} (лише в пам'яті)
 chat_meta: dict[int, dict] = {}
+
+# Журнал анонімних приватних чатів: лише RAM, не потрапляє до БД.
+CHATLOG_MAX_CHATS = 150
+CHATLOG_MAX_MESSAGES = 200
+CHATLOG_MAX_MEDIA = 100
+chatlog: dict[tuple[int, int], dict] = {}
+chatlog_day = None
+
+
+def chatlog_reset_if_new_day():
+    global chatlog_day
+    today = kyiv_today()
+    if chatlog_day != today:
+        chatlog.clear()
+        chatlog_day = today
+
+
+def chatlog_start(a: int, b: int, mode: str):
+    if mode == "friend" or a in user_room or b in user_room:
+        return
+    chatlog_reset_if_new_day()
+    key = tuple(sorted((a, b)))
+    chatlog.pop(key, None)
+    chatlog[key] = {"users": key, "started": time.time(), "mode": mode, "messages": []}
+    while len(chatlog) > CHATLOG_MAX_CHATS:
+        chatlog.pop(next(iter(chatlog)))
+
+
+def chatlog_record(user_id: int, message):
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        return
+    key = tuple(sorted((user_id, partner_id)))
+    entry = chatlog.get(key)
+    if entry is None:
+        mode = (chat_meta.get(user_id) or {}).get("mode", "normal")
+        if mode == "friend":
+            return
+        chatlog_start(user_id, partner_id, mode)
+        entry = chatlog.get(key)
+    if entry is None:
+        return
+    media_type = None
+    for attr, label in (("photo", "фото"), ("video", "відео"), ("document", "файл"),
+                        ("voice", "голосове"), ("audio", "аудіо"), ("video_note", "відеоповідомлення"),
+                        ("sticker", "стікер"), ("animation", "анімація")):
+        if getattr(message, attr, None):
+            media_type = label
+            break
+    text_value = message.text or message.caption or ""
+    if media_type:
+        text_value = (text_value + " " if text_value else "") + f"[{media_type}]"
+    elif not text_value:
+        text_value = "[повідомлення]"
+    entry["messages"].append({"uid": user_id, "text": str(text_value)[:1500], "media": bool(media_type), "at": time.time()})
+    while len(entry["messages"]) > CHATLOG_MAX_MESSAGES:
+        entry["messages"].pop(0)
+    media_items = [i for i, item in enumerate(entry["messages"]) if item["media"]]
+    while len(media_items) > CHATLOG_MAX_MEDIA:
+        del entry["messages"][media_items[0]]
+        media_items = [i for i, item in enumerate(entry["messages"]) if item["media"]]
+
+
+async def chatlog_reset_loop():
+    while True:
+        try:
+            chatlog_reset_if_new_day()
+        except Exception as e:
+            logging.warning("Журнал чатів: %s", e)
+        await asyncio.sleep(30)
+
 compat_last: dict[int, str] = {}  # 💯 сумісність щойно завершеного чату
 game_state: dict[frozenset, dict] = {}  # 🎲 ігри в чаті
 last_chat_mode: dict[int, str] = {}  # у якому режимі був останній чат (для автопошуку)
@@ -1168,6 +1239,7 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
+            [InlineKeyboardButton(text="💬 Чати", callback_data="adm_chats_0")],
             [InlineKeyboardButton(text="🔗 Посилання з мітками", callback_data="adm_links")],
             [InlineKeyboardButton(text="🎁 Подарувати подарунок", callback_data="adm_gift")],
             [InlineKeyboardButton(text="🚨 Скарги", callback_data="adm_reports_0")],

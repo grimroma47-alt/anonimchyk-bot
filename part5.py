@@ -1707,6 +1707,7 @@ async def relay_masked_voice(message: types.Message, user_id: int, partner_id: i
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, "[голосове з маскою]")
         on_chat_message(user_id)
+        chatlog_record(user_id, message)
         stat_add("voice_mask")
     except TelegramAPIError:
         end_chat(user_id)
