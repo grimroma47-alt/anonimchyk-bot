@@ -36,7 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
-BOT_VERSION = "04.11-a"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
+BOT_VERSION = "06.11-a"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -373,77 +373,6 @@ banned_users: set[int] = set()
 stats_days: dict[str, dict] = {}
 # Поточні чати: user_id -> {"start": час, "mode": режим, "msgs": скільки написав} (лише в пам'яті)
 chat_meta: dict[int, dict] = {}
-
-# Журнал анонімних приватних чатів: лише RAM, не потрапляє до БД.
-CHATLOG_MAX_CHATS = 150
-CHATLOG_MAX_MESSAGES = 200
-CHATLOG_MAX_MEDIA = 100
-chatlog: dict[tuple[int, int], dict] = {}
-chatlog_day = None
-
-
-def chatlog_reset_if_new_day():
-    global chatlog_day
-    today = kyiv_today()
-    if chatlog_day != today:
-        chatlog.clear()
-        chatlog_day = today
-
-
-def chatlog_start(a: int, b: int, mode: str):
-    if mode == "friend" or a in user_room or b in user_room:
-        return
-    chatlog_reset_if_new_day()
-    key = tuple(sorted((a, b)))
-    chatlog.pop(key, None)
-    chatlog[key] = {"users": key, "started": time.time(), "mode": mode, "messages": []}
-    while len(chatlog) > CHATLOG_MAX_CHATS:
-        chatlog.pop(next(iter(chatlog)))
-
-
-def chatlog_record(user_id: int, message):
-    partner_id = active_chats.get(user_id)
-    if partner_id is None:
-        return
-    key = tuple(sorted((user_id, partner_id)))
-    entry = chatlog.get(key)
-    if entry is None:
-        mode = (chat_meta.get(user_id) or {}).get("mode", "normal")
-        if mode == "friend":
-            return
-        chatlog_start(user_id, partner_id, mode)
-        entry = chatlog.get(key)
-    if entry is None:
-        return
-    media_type = None
-    for attr, label in (("photo", "фото"), ("video", "відео"), ("document", "файл"),
-                        ("voice", "голосове"), ("audio", "аудіо"), ("video_note", "відеоповідомлення"),
-                        ("sticker", "стікер"), ("animation", "анімація")):
-        if getattr(message, attr, None):
-            media_type = label
-            break
-    text_value = message.text or message.caption or ""
-    if media_type:
-        text_value = (text_value + " " if text_value else "") + f"[{media_type}]"
-    elif not text_value:
-        text_value = "[повідомлення]"
-    entry["messages"].append({"uid": user_id, "text": str(text_value)[:1500], "media": bool(media_type), "at": time.time()})
-    while len(entry["messages"]) > CHATLOG_MAX_MESSAGES:
-        entry["messages"].pop(0)
-    media_items = [i for i, item in enumerate(entry["messages"]) if item["media"]]
-    while len(media_items) > CHATLOG_MAX_MEDIA:
-        del entry["messages"][media_items[0]]
-        media_items = [i for i, item in enumerate(entry["messages"]) if item["media"]]
-
-
-async def chatlog_reset_loop():
-    while True:
-        try:
-            chatlog_reset_if_new_day()
-        except Exception as e:
-            logging.warning("Журнал чатів: %s", e)
-        await asyncio.sleep(30)
-
 compat_last: dict[int, str] = {}  # 💯 сумісність щойно завершеного чату
 game_state: dict[frozenset, dict] = {}  # 🎲 ігри в чаті
 last_chat_mode: dict[int, str] = {}  # у якому режимі був останній чат (для автопошуку)
@@ -576,12 +505,31 @@ GIFT_CATALOG = {
     "crown": ("👑 Корона", 300),
     "rocket": ("🚀 Ракета", 500),
     "castle": ("🏰 Замок", 1000),
+    # ✨ Особливі подарунки — окрема колонка в магазині, кожен щось робить (див. special_gift_payload)
+    "sp_fireworks": ("🎆 Феєрверк", 30),
+    "sp_fireheart": ("❤️‍🔥 Вогняне серце", 35),
+    "sp_mask": ("🎭 Маска-сюрприз", 40),
+    "sp_oracle": ("🔮 Передбачення", 15),
+    "sp_card": ("💌 Листівка", 20),
+    "sp_key": ("🗝 Ключик", 25),
+    "sp_moon": ("🌙 Місяць", 50),
+    "sp_sock": ("🧦 Шкарпетка", 5),
+    "sp_potato": ("🥔 Картоплина", 6),
+    "sp_herring": ("🐟 Оселедець", 8),
     # 🎃 лімітовані — у продажу лише на Хелловін (хто купив — лишаються назавжди)
     "pumpkin": ("🎃 Гарбуз", 20),
     "bat": ("🦇 Кажан", 30),
     "ghost": ("👻 Привид", 50),
 }
 LIMITED_GIFTS = {"pumpkin", "bat", "ghost"}
+SPECIAL_GIFTS = [k for k in GIFT_CATALOG if k.startswith("sp_")]
+# Колекційні: обмежений тираж, кожен екземпляр має свій номер (#7 з 50) і не продається назад
+COLLECTIBLE_GIFTS = {"sp_moon": 50}
+collect_sold: dict = {}  # скільки екземплярів колекційного подарунка вже продано
+# Ці подарунки не випадають випадково (щоденний подарунок, рулетка, маска-сюрприз)
+NO_RANDOM_GIFTS = LIMITED_GIFTS | set(SPECIAL_GIFTS)
+# 💸 Реферальна програма: запрошувач отримує частку від РЕАЛЬНИХ поповнень свого друга (на вивід)
+REF_TOPUP_SHARE = float(os.getenv("REF_TOPUP_SHARE", "0.10"))  # 0.10 = 10%
 # Частка від ціни подарунка, яка йде отримувачу (решта — дохід адміна)
 GIFT_RECIPIENT_SHARE = float(os.getenv("GIFT_RECIPIENT_SHARE", "0.25"))  # 0.25 = 25%
 # 💸 Вивід зароблених грошей на карту: мінімум і скільки днів «відлежуються» гроші з подарунків
@@ -659,7 +607,7 @@ def lottery_days_word(days: int) -> str:
 
 
 def lottery_random_gift(lo: float, hi: float) -> str:
-    keys = [k for k, (_t, p) in GIFT_CATALOG.items() if lo <= p <= hi and k not in LIMITED_GIFTS]
+    keys = [k for k, (_t, p) in GIFT_CATALOG.items() if lo <= p <= hi and k not in NO_RANDOM_GIFTS]
     return random.choice(keys or list(GIFT_CATALOG.keys()))
 
 
@@ -1012,16 +960,37 @@ def get_gift_menu_keyboard():
 def get_gift_catalog_keyboard():
     """Магазин подарунків: купити подарунок про запас (в інвентар)."""
     hw = halloween_active()
-    order = [k for k in GIFT_CATALOG if k in LIMITED_GIFTS] + [k for k in GIFT_CATALOG if k not in LIMITED_GIFTS]
-    buttons = [
+    regular = [k for k in GIFT_CATALOG if k in LIMITED_GIFTS and hw] + [
+        k for k in GIFT_CATALOG if k not in LIMITED_GIFTS and k not in SPECIAL_GIFTS
+    ]
+    left = [
         InlineKeyboardButton(
             text=("⏳ " if key in LIMITED_GIFTS else "") + f"{GIFT_CATALOG[key][0]} — {GIFT_CATALOG[key][1]} грн",
             callback_data=f"buygift_{key}",
         )
-        for key in order
-        if key not in LIMITED_GIFTS or hw
+        for key in regular
     ]
-    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    right = []
+    for key in SPECIAL_GIFTS:
+        title, price = GIFT_CATALOG[key]
+        if key in COLLECTIBLE_GIFTS:
+            left_n = COLLECTIBLE_GIFTS[key] - collect_sold.get(key, 0)
+            label = f"{title} — {price} грн · {left_n} шт" if left_n > 0 else f"{title} — розпродано"
+        else:
+            label = f"{title} — {price} грн"
+        right.append(InlineKeyboardButton(text=label, callback_data=f"buygift_{key}"))
+    # Ліва колонка — звичайні подарунки, права («ряд збоку») — ✨ особливі, які щось роблять
+    rows = [[
+        InlineKeyboardButton(text="🎁 Звичайні", callback_data="gift_info"),
+        InlineKeyboardButton(text="✨ Особливі", callback_data="gift_info"),
+    ]]
+    for i in range(max(len(left), len(right))):
+        row = []
+        if i < len(left):
+            row.append(left[i])
+        if i < len(right):
+            row.append(right[i])
+        rows.append(row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1239,7 +1208,6 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
-            [InlineKeyboardButton(text="💬 Чати", callback_data="adm_chats_0")],
             [InlineKeyboardButton(text="🔗 Посилання з мітками", callback_data="adm_links")],
             [InlineKeyboardButton(text="🎁 Подарувати подарунок", callback_data="adm_gift")],
             [InlineKeyboardButton(text="🚨 Скарги", callback_data="adm_reports_0")],
@@ -1562,7 +1530,37 @@ def apply_topup_bonus(u: dict, amount: float) -> float:
     u["topup_total"] = total_before + amount
     if bonus:
         u["balance"] += bonus
+    ref_topup_reward(u, amount)
     return bonus
+
+
+def ref_topup_reward(u: dict, amount: float) -> float:
+    """Запрошувач отримує REF_TOPUP_SHARE від реального поповнення друга.
+    Гроші йдуть і на баланс, і в «Зароблено» (відлежуються EARN_HOLD_DAYS днів, вивід від WITHDRAW_MIN, 18+,
+    підтвердження адміна). Якщо друг нічого не поповнює — бот не платить нічого."""
+    ref_id = u.get("referred_by")
+    if not ref_id or ref_id not in users_db or ref_id in banned_users or amount <= 0 or REF_TOPUP_SHARE <= 0:
+        return 0.0
+    amt = round(float(amount) * REF_TOPUP_SHARE, 2)
+    if amt <= 0:
+        return 0.0
+    r = users_db[ref_id]
+    r["balance"] = round(r.get("balance", 0.0) + amt, 2)
+    r.setdefault("earn_pending", []).append([time.time(), amt])
+    r["earned_total"] = round(r.get("earned_total", 0.0) + amt, 2)
+    r["ref_earned"] = round(r.get("ref_earned", 0.0) + amt, 2)
+    stat_add("ref_earn", amt)
+    request_save()
+    text = (
+        f"💸 Твій друг поповнив баланс — тобі нараховано <b>{uah(amt)}</b> "
+        f"({REF_TOPUP_SHARE * 100:.0f}% від поповнення).\n"
+        f"Ці гроші можна буде вивести на карту через {EARN_HOLD_DAYS} днів (від {uah(WITHDRAW_MIN, 0)})."
+    )
+    try:
+        asyncio.get_running_loop().create_task(safe_send(ref_id, text))
+    except RuntimeError:
+        pass
+    return amt
 
 
 def topup_progress_text(u: dict) -> str:
@@ -1915,6 +1913,7 @@ def _make_snapshot() -> bytes:
             "confess_db": confess_db,
             "letters_db": letters_db,
             "withdraw_db": withdraw_db,
+            "collect_sold": collect_sold,
         },
         protocol=4,
     )
@@ -1964,6 +1963,8 @@ def _apply_snapshot(blob: bytes):
     letters_db.update(data.get("letters_db") or {"items": [], "delivered_day": None})
     withdraw_db.clear()
     withdraw_db.update(data.get("withdraw_db") or {"next": 1, "items": {}})
+    collect_sold.clear()
+    collect_sold.update(data.get("collect_sold") or {})
 
     # Якщо в нових версіях бота з'являться нові поля профілю — додаємо їх старим користувачам.
     saved_counter = user_counter
@@ -2131,6 +2132,137 @@ async def persistence_loop():
         await save_state_to_db()
 
 
+# ---------------------------------------------------------------------------
+# Мітки джерел: t.me/<бот>?start=tt — щоб бачити, звідки приходять люди
+# ---------------------------------------------------------------------------
+SOURCE_LABELS = {
+    "tt": "🎵 TikTok",
+    "yt": "▶️ YouTube",
+    "ig": "📸 Instagram",
+    "tgads": "📣 Telegram Ads",
+    "ref": "🤝 Запрошення друзів",
+    "direct": "🔎 Напряму / пошук",
+}
+
+
+def source_from_start(arg: str) -> str:
+    arg = (arg or "").strip()
+    if not arg:
+        return "direct"
+    if arg.startswith("ref_"):
+        return "ref"
+    code = re.sub(r"[^a-z0-9_]", "", arg.lower())[:32]
+    return code or "direct"
+
+
+def source_label(code: str | None) -> str:
+    if not code:
+        return "❔ невідомо (до міток)"
+    return SOURCE_LABELS.get(code, f"💬 {code}")
+
+
+def source_breakdown(ids: list[int]) -> list[tuple[str, int, int]]:
+    """[(джерело, скільки прийшло, скільки з них уже спілкувались)] — найбільші зверху."""
+    agg: dict[str, list[int]] = {}
+    for uid in ids:
+        u = users_db.get(uid)
+        if not u:
+            continue
+        row = agg.setdefault(u.get("source") or "", [0, 0])
+        row[0] += 1
+        if u.get("total_chats", 0) > 0:
+            row[1] += 1
+    return sorted(((k, v[0], v[1]) for k, v in agg.items()), key=lambda x: -x[1])
+
+
+# ---------------------------------------------------------------------------
+# 💬 Переписка з другом: поки відкрита, усе, що людина пише, йде цьому другу.
+# Стоїть перед усіма обробниками. Команда чи кнопка меню — автоматично закривають переписку.
+# ---------------------------------------------------------------------------
+def _friend_mode_filter(message, raw_state=None) -> bool:
+    if raw_state:  # людина зараз щось вводить (сума подарунка тощо) — це не повідомлення другу
+        return False
+    return _in_friend_mode(message)
+
+
+@dp.message(_friend_mode_filter)
+async def friend_mode_message(message: types.Message):
+    uid = message.from_user.id
+    fid = friend_mode.get(uid)
+    if fid is None:
+        return
+    err = await deliver_friend_message(uid, fid, message)
+    if err:
+        friend_mode.pop(uid, None)
+        await message.answer(f"❌ {err}", reply_markup=_after_friend_kb(uid))
+
+
+# ---------------------------------------------------------------------------
+# Команди
+# ---------------------------------------------------------------------------
+@dp.message(CommandStart())
+async def start_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    is_new_user = user_id not in users_db
+    u = init_user(user_id)
+
+    # Реферальне посилання: /start ref_<id>
+    if is_new_user:
+        parts = (message.text or "").split(maxsplit=1)
+        u["source"] = source_from_start(parts[1] if len(parts) == 2 else "")
+        if len(parts) == 2 and parts[1].startswith("ref_"):
+            try:
+                referrer_id = int(parts[1][len("ref_"):])
+            except ValueError:
+                referrer_id = None
+            if referrer_id and referrer_id != user_id and referrer_id in users_db:
+                u["referred_by"] = referrer_id
+                ref = users_db[referrer_id]
+                ref["referral_count"] = ref.get("referral_count", 0) + 1
+                ref["balance"] += REFERRAL_BONUS
+                await safe_send(
+                    referrer_id,
+                    f"👥 За вашим запрошенням приєднався новий користувач!\n"
+                    f"+{REFERRAL_BONUS:.0f} грн на баланс. Дякуємо! 🎉",
+                )
+                if ref["referral_count"] % REFERRAL_PREMIUM_EVERY == 0:
+                    now = time.time()
+                    start = max(now, ref["perks"].get("premium", 0))
+                    ref["perks"]["premium"] = start + REFERRAL_PREMIUM_DAYS * DAY
+                    await safe_send(
+                        referrer_id,
+                        f"🎉 Ти запросив вже {ref['referral_count']} друзів!\n"
+                        f"У подарунок — {REFERRAL_PREMIUM_DAYS} днів Premium 💎",
+                    )
+
+    code = (getattr(message.from_user, "language_code", None) or "uk").lower()
+    if LANG_RU_ENABLED and is_new_user and not code.startswith("uk"):
+        await message.answer(
+            "🌐 Обери мову / Выбери язык / Choose your language:",
+            reply_markup=lang_pick_kb("lang_new_"),
+        )
+        return
+    await send_welcome(message.chat.id, message.from_user.first_name, u, state, message)
+
+
+async def send_welcome(chat_id: int, first_name, u: dict, state: FSMContext, message=None):
+    user_id = chat_id
+    welcome = (
+        f"Привіт, {protect_text(esc(first_name))}! Вітаємо в анонімному чаті! 🤫\n\n"
+        f"Твій унікальний номер: <b>{u['custom_id']}</b>\n"
+        "Змінити профіль можна будь-коли: ⚙️ Налаштування → ✏️ Мій профіль.\n\n"
+        "📜 Користуючись ботом, ти погоджуєшся з правилами: /rules"
+    )
+    if not u.get("founder_no") and founder_promo_line():
+        welcome += "\n\n" + founder_promo_line()
+    if not await send_banner(user_id, "start", caption=welcome, reply_markup=get_main_keyboard()):
+        if message is not None:
+            await message.answer(welcome, reply_markup=get_main_keyboard())
+        else:
+            await safe_send(chat_id, welcome, reply_markup=get_main_keyboard())
+    if not profile_complete(u):
+        await start_onboarding(chat_id, state)
 
 
 # === КІНЕЦЬ part1.py ===

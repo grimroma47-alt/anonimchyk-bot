@@ -1,991 +1,3 @@
-# ---------------------------------------------------------------------------
-# Щотижневий конкурс запрошень: топ-3 за тиждень отримують Premium
-# ---------------------------------------------------------------------------
-# Друг зараховується лише тоді, коли поспілкувався в першому справжньому чаті (від 1 хв, обидва писали) —
-# так фейкові акаунти, які просто натиснули /start, нічого не дають.
-CONTEST_PRIZES = [  # (місце, днів Premium)
-    ("🥇", int(os.getenv("CONTEST_PRIZE_1", "30"))),
-    ("🥈", int(os.getenv("CONTEST_PRIZE_2", "14"))),
-    ("🥉", int(os.getenv("CONTEST_PRIZE_3", "7"))),
-]
-CONTEST_MIN_INVITES = int(os.getenv("CONTEST_MIN_INVITES", "3"))  # мінімум друзів, щоб потрапити в призери
-CONTEST_FOREVER_BONUS = float(os.getenv("CONTEST_FOREVER_BONUS", "100"))  # грн, якщо в переможця вже вічний Premium
-CONTEST_TOP_SHOWN = 10
-
-
-def contest_week_key(day: date | None = None) -> str:
-    y, w, _ = (day or kyiv_today()).isocalendar()
-    return f"{y}-W{w:02d}"
-
-
-def contest_week_range(key: str) -> str:
-    y, w = key.split("-W")
-    monday = date.fromisocalendar(int(y), int(w), 1)
-    sunday = monday + timedelta(days=6)
-    months = ["січня", "лютого", "березня", "квітня", "травня", "червня",
-              "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
-    if monday.month == sunday.month:
-        return f"{monday.day}–{sunday.day} {months[sunday.month - 1]}"
-    return f"{monday.day} {months[monday.month - 1]} – {sunday.day} {months[sunday.month - 1]}"
-
-
-def _contest_can_write() -> bool:
-    return _lease_held or not DATABASE_URL
-
-
-def contest_ranking() -> list[tuple[int, int]]:
-    """[(user_id, кількість)] — більше друзів вище; при рівності вище той, хто набрав раніше."""
-    items = [(uid, v[0], v[1]) for uid, v in (ref_contest.get("counts") or {}).items() if v[0] > 0]
-    items.sort(key=lambda t: (-t[1], t[2]))
-    return [(uid, n) for uid, n, _ts in items]
-
-
-async def contest_finalize(week: str):
-    """Видає призи за тиждень (рівно один раз) і повідомляє переможців."""
-    if week in ref_contest.setdefault("awarded", []):
-        return
-    ref_contest["awarded"].append(week)
-    ref_contest["awarded"] = ref_contest["awarded"][-20:]
-    winners = []
-    ranking = [(uid, n) for uid, n in contest_ranking() if n >= CONTEST_MIN_INVITES and uid not in banned_users]
-    now = time.time()
-    for (medal, days), (uid, n) in zip(CONTEST_PRIZES, ranking):
-        u = users_db.get(uid)
-        if u is None:
-            continue
-        current = u["perks"].get("premium", 0)
-        if current == float("inf"):
-            u["balance"] += CONTEST_FOREVER_BONUS
-            prize = f"+{CONTEST_FOREVER_BONUS:.0f} грн (у тебе вже вічний Premium)"
-        else:
-            u["perks"]["premium"] = max(now, current) + days * DAY
-            prize = f"Premium на {days} днів"
-        winners.append((uid, n, f"{medal} {prize}"))
-        await safe_send(
-            uid,
-            f"🏆 <b>Ти переміг у конкурсі запрошень!</b>\n\n"
-            f"Тиждень {contest_week_range(week)}: {n} {_plural(n, 'друг', 'друзі', 'друзів')} → {medal} місце.\n"
-            f"Твій приз: <b>{prize}</b> 💎\n\nДякуємо, що розповідаєш про нас! Новий тиждень уже почався — /contest",
-        )
-    ref_contest.setdefault("history", []).append({"week": week, "winners": winners})
-    ref_contest["history"] = ref_contest["history"][-10:]
-    request_save()
-    if ADMIN_ID:
-        lines = [f"{w[2]} — {admin_label(w[0])}: {w[1]} {_plural(w[1], 'друг', 'друзі', 'друзів')}" for w in winners] or ["Призерів немає (ніхто не набрав мінімум)."]
-        await safe_send(ADMIN_ID, f"🏆 Конкурс запрошень за {contest_week_range(week)} завершено:\n" + "\n".join(lines))
-
-
-async def contest_tick():
-    """Перехід на новий тиждень: підсумки минулого і чистий старт."""
-    if not _contest_can_write():
-        return
-    current = contest_week_key()
-    week = ref_contest.get("week")
-    if week == current:
-        return
-    if week:
-        await contest_finalize(week)
-    ref_contest["week"] = current
-    ref_contest["counts"] = {}
-    request_save()
-
-
-async def contest_loop():
-    while True:
-        try:
-            await contest_tick()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Конкурс запрошень: %s", e)
-        try:
-            await top_tick()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Топ тижня: %s", e)
-        try:
-            await meet_tick()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Година знайомств: %s", e)
-        try:
-            await queue_cleanup_tick()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Черга: %s", e)
-        try:
-            await launch_tick()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Запуск «Зняти маску»: %s", e)
-        try:
-            await letters_tick()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Нічні листи: %s", e)
-        try:
-            await rooms_tick()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Живі кімнати: %s", e)
-        try:
-            await comeback_tick()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("«Ми скучили»: %s", e)
-        try:
-            await warm_start_tick()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Теплий старт: %s", e)
-        try:
-            await hw_night_tick()
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Ніч страшилок: %s", e)
-        await asyncio.sleep(60)
-
-
-# ---------------------------------------------------------------------------
-# 🧹 Жива черга: хто чекає > 3 хв — спершу «ти тут?»; хто > 10 хв — знімаємо з пошуку
-# ---------------------------------------------------------------------------
-QUEUE_STALE_AFTER = int(os.getenv("QUEUE_STALE_AFTER", "180"))  # після скількох секунд питати «ти тут?»
-QUEUE_MAX_WAIT = int(os.getenv("QUEUE_MAX_WAIT", "600"))  # після скількох секунд знімати з черги
-HERE_PING_COOLDOWN = 120
-here_pinged: dict[int, float] = {}
-
-
-async def ask_still_here(user_id: int):
-    """Хтось шукає, а ця людина в черзі давно — питаємо, чи вона ще тут."""
-    if user_id not in queue or time.time() - here_pinged.get(user_id, 0) < HERE_PING_COOLDOWN:
-        return
-    here_pinged[user_id] = time.time()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Я тут — почати чат", callback_data="here_ok")]])
-    await safe_send(user_id, "🔔 Знайшовся співрозмовник! Ти ще тут?\nНатисни кнопку — і одразу почнемо чат 👇", reply_markup=kb)
-
-
-@dp.callback_query(F.data == "here_ok")
-async def here_ok(call: types.CallbackQuery, state: FSMContext):
-    user_id = call.from_user.id
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    if user_id in active_chats:
-        await call.answer("Ти вже в чаті 🙂")
-        return
-    mode = search_mode.get(user_id, "normal")
-    if user_id in queue:
-        queue.remove(user_id)
-    await call.answer()
-    await pull_from_room(user_id)
-    await run_search(call.message, state, mode, user_id=user_id)
-
-
-async def queue_cleanup_tick():
-    """Раз на хвилину: хто чекає довше QUEUE_MAX_WAIT — знімаємо з пошуку і пояснюємо."""
-    now = time.time()
-    for uid in list(queue):
-        since = queue_since.get(uid)
-        if since is None:
-            queue_since[uid] = now  # старі записи (до оновлення) — відлік з цієї хвилини
-            continue
-        if now - since < QUEUE_MAX_WAIT:
-            continue
-        if now - since < BG_SEARCH_MAX:
-            if not bg_notified.get(uid):
-                bg_notified[uid] = now
-                stat_add("bg_search")
-                await safe_send(uid, bg_search_text(), reply_markup=bg_search_kb())
-            continue
-        bg_notified.pop(uid, None)
-        if uid in queue:
-            queue.remove(uid)
-        await pull_from_room(uid, quiet=True)
-        mode = search_mode.pop(uid, "normal")
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Шукати знову", callback_data=f"wp_go:{mode}")]])
-        await safe_send(
-            uid,
-            f"😔 За дві години ніхто не знайшовся — пошук зупинено.\n\n"
-            f"Натисни, щоб шукати знову. А о {MEET_HOUR}:00 — ⏰ Година знайомств, тоді онлайн найбільше людей.",
-            reply_markup=kb,
-        )
-
-
-# ---------------------------------------------------------------------------
-# ⏰ Година знайомств: щодня 21:00–22:00 (Київ) усі заходять одночасно
-# ---------------------------------------------------------------------------
-MEET_HOUR = int(os.getenv("MEET_HOUR", "21"))  # початок години (за Києвом)
-MEET_REMIND_MINUTES = 5  # за скільки хвилин до початку нагадувати
-
-
-def meet_is_live(now: datetime | None = None) -> bool:
-    now = now or datetime.now(KYIV_TZ)
-    return now.hour == MEET_HOUR
-
-
-def week_visitors() -> int:
-    """Скільки різних людей заходило в бот за останні 7 днів (з сьогоднішнім, за Києвом).
-    Кожна людина рахується один раз, скільки б разів не заходила."""
-    try:
-        today = kyiv_today()
-        seen: set = set()
-        for i in range(7):
-            seen |= set((stats_days.get((today - timedelta(days=i)).isoformat()) or {}).get("active") or ())
-        seen |= set(stats_day().get("active") or ())
-        return max(1, len(seen))
-    except Exception:  # noqa: BLE001
-        return 1
-
-
-def week_visits() -> int:
-    """Скільки разів за 7 днів люди заходили в бот (захід = повернення після перерви від 30 хв)."""
-    try:
-        today = kyiv_today()
-        n = sum(int((stats_days.get((today - timedelta(days=i)).isoformat()) or {}).get("visits") or 0) for i in range(7))
-        return n
-    except Exception:  # noqa: BLE001
-        return week_visitors()
-
-
-VISITS_SHOW_RATIO = 1.5  # заходи показуємо, лише коли їх помітно більше, ніж людей
-
-
-def week_lines() -> str:
-    """🔥 люди за тиждень і (якщо цифра вже «жива») 👣 заходи за тиждень — окремими рядками."""
-    people, visits = week_visitors(), week_visits()
-    text = f"🔥 За тиждень: <b>{people}</b> {people_word(people)}\n"
-    if visits >= people * VISITS_SHOW_RATIO:
-        text += f"👣 Заходів за тиждень: <b>{visits}</b>\n"
-    return text
-
-
-def visits_word(n: int) -> str:
-    if n % 10 == 1 and n % 100 != 11:
-        return "захід"
-    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        return "заходи"
-    return "заходів"
-
-
-def people_word(n: int) -> str:
-    if n % 10 == 1 and n % 100 != 11:
-        return "людина"
-    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        return "людини"
-    return "людей"
-
-
-def online_now() -> int:
-    now = time.time()
-    return sum(1 for ts in last_seen.values() if now - ts <= ONLINE_WINDOW)
-
-
-def _total_chats_sum() -> int:
-    return sum(u.get("total_chats", 0) for uid, u in users_db.items() if uid > 0)
-
-
-def meet_status_line() -> str:
-    if meet_is_live():
-        return f"🔥 <b>Зараз Година знайомств</b> — до {MEET_HOUR + 1}:00 співрозмовника знайдеш найшвидше!"
-    return f"⏰ Година знайомств — щодня о {MEET_HOUR}:00. Усі заходять одночасно 💬"
-
-
-def meet_reminder_text() -> str:
-    online = max(online_now(), 1)
-    return (
-        f"⏰ <b>Година знайомств</b> — сьогодні о {MEET_HOUR}:00!\n\n"
-        f"Щовечора з {MEET_HOUR}:00 до {MEET_HOUR + 1}:00 усі заходять одночасно, "
-        "тож співрозмовник знаходиться за лічені секунди 💬\n\n"
-        f"🟢 Зараз у боті: <b>{online}</b>\n\n"
-        "Почни пошук уже зараз — або повертайся о дев'ятій 👇\n"
-        "<i>Вимкнути нагадування: ⚙️ Налаштування → 🔔 Сповіщення</i>"
-    )
-
-
-def meet_keyboard() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")],
-        [InlineKeyboardButton(text="❤️ Флірт-пошук", callback_data="wp_go:flirt")],
-    ]
-    extra = evening_extra_button()
-    if extra:
-        rows.append([extra])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-MEET_ACTIVE_DAYS = int(os.getenv("MEET_ACTIVE_DAYS", "14"))
-
-
-# 🧠 Розумні нагадування: якщо людина кілька разів поспіль не відгукнулась на «хтось шукає» чи нагадування
-# про Годину знайомств, кличемо її рідше: після 3 — раз на 3 дні, після 6 — раз на тиждень.
-# Щойно людина сама заходить у бот — лічильник обнуляється.
-NUDGE_EASY = 3
-
-
-def nudge_sent(u: dict):
-    if u.get("nudge_pending"):
-        u["nudge_ignored"] = u.get("nudge_ignored", 0) + 1  # минуле нагадування проігнорував
-    u["nudge_pending"] = time.time()
-    u["nudge_last"] = time.time()
-
-
-def nudge_allowed(u: dict) -> bool:
-    ign = u.get("nudge_ignored", 0) + (1 if u.get("nudge_pending") else 0)
-    if ign < NUDGE_EASY:
-        return True
-    gap_days = 3 if ign < 6 else 7
-    return time.time() - u.get("nudge_last", 0) >= gap_days * DAY
-
-
-def meet_recipients() -> list[int]:
-    result = []
-    meet_active_edge = (kyiv_today() - timedelta(days=MEET_ACTIVE_DAYS)).isoformat()
-    for uid, u in users_db.items():
-        if uid <= 0 or uid in banned_users:
-            continue
-        if uid in active_chats or uid in queue or uid in user_room:
-            continue  # і так уже спілкується або шукає
-        if not u.get("notify_meet", True):
-            continue  # вимкнув нагадування
-        if u.get("gender", "Не вказано") == "Не вказано" and not is_fresh_newbie(u):
-            continue  # ще не пройшов знайомство з ботом (крім новачків — їх кличемо на першу розмову)
-        if u.get("blocked_bot") or not nudge_allowed(u):
-            continue  # заблокував бота або кілька разів поспіль не відгукнувся
-        if (u.get("last_active_day") or "9999") < meet_active_edge:
-            continue  # давно не заходив — щоденно не нагадуємо (для таких є рідкісне «Давно не бачились»)
-        result.append(uid)
-    result.sort(key=lambda x: last_seen.get(x, 0), reverse=True)
-    return result
-
-
-async def _meet_broadcast(recipients: list[int]):
-    text, kb = meet_reminder_text() + evening_extra_text(), meet_keyboard()
-    sent = 0
-    for uid in recipients:
-        if uid in active_chats or uid in queue:
-            continue
-        u = users_db.get(uid) or {}
-        t = text + (NEWBIE_MEET_LINE if not u.get("total_chats") else "")
-        if await safe_send(uid, t, reply_markup=kb):
-            sent += 1
-            nudge_sent(u)
-        await asyncio.sleep(0.05)  # ~20 повідомлень за секунду — в межах лімітів Telegram
-    meet_hour["sent"] = sent
-    request_save()
-
-
-async def meet_tick():
-    """Раз на хвилину: нагадування о 20:55, лічимо пік онлайну, о 22:00 — підсумок адміну."""
-    if not _contest_can_write():
-        return
-    now = datetime.now(KYIV_TZ)
-    today = now.date().isoformat()
-    remind_from = MEET_HOUR * 60 - MEET_REMIND_MINUTES
-    minutes = now.hour * 60 + now.minute
-    if remind_from <= minutes < MEET_HOUR * 60 and meet_hour.get("reminded") != today:
-        meet_hour["reminded"] = today  # спершу позначаємо — щоб після перезапуску не надіслати двічі
-        meet_hour["chats_start"] = None
-        meet_hour["peak"] = 0
-        meet_hour["sent"] = 0
-        request_save()
-        task = asyncio.get_running_loop().create_task(_meet_broadcast(meet_recipients()))
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
-    if meet_is_live(now):
-        if meet_hour.get("chats_start") is None:
-            meet_hour["chats_start"] = _total_chats_sum()
-            request_save()
-        meet_hour["peak"] = max(meet_hour.get("peak", 0), online_now())
-    elif now.hour == (MEET_HOUR + 1) % 24 and meet_hour.get("summary") != today and meet_hour.get("chats_start") is not None:
-        meet_hour["summary"] = today
-        chats = max(0, (_total_chats_sum() - meet_hour["chats_start"]) // 2)
-        request_save()
-        if ADMIN_ID:
-            await safe_send(
-                ADMIN_ID,
-                "⏰ <b>Година знайомств — підсумок</b>\n\n"
-                f"📨 Нагадування отримали: <b>{meet_hour.get('sent', 0)}</b>\n"
-                f"🟢 Пік онлайну: <b>{meet_hour.get('peak', 0)}</b>\n"
-                f"💬 Нових чатів за годину: <b>{chats}</b>",
-            )
-
-
-@dp.message(Command("meettest"))
-async def meet_test(message: types.Message, state: FSMContext):
-    """Адмін: подивитися, як виглядає нагадування (надсилається тільки тобі)."""
-    if not _is_admin(message.from_user.id):
-        return
-    await state.clear()
-    await message.answer(meet_reminder_text(), reply_markup=meet_keyboard())
-    await message.answer(f"👆 Так виглядатиме нагадування. Отримають зараз: {len(meet_recipients())} людей.")
-
-
-# ---------------------------------------------------------------------------
-# 🏆 Топ тижня: найкращі співрозмовники за 👍/👎, підсумки щонеділі о 20:00 (Київ)
-# ---------------------------------------------------------------------------
-TOP_MIN_CHAT_SECONDS = 90  # коротші чати в топі не оцінюються
-TOP_MIN_VOTES = int(os.getenv("TOP_MIN_VOTES", "20"))  # мінімум оцінок за тиждень, щоб потрапити в топ
-TOP_PUBLISH_HOUR = 20  # неділя, 20:00 за Києвом
-TOP_PRIZES = [("🥇", 7), ("🥈", 3), ("🥉", 3)]  # місце -> днів Premium
-TOP_STICKER_FILE_ID = os.getenv("TOP_STICKER_FILE_ID", "")  # анімований стікер-нагорода (file_id)
-
-
-def top_week_key(now: datetime | None = None) -> str:
-    """Тиждень топу закінчується в неділю о 20:00: зсуваємо час на 4 год, і неділя 20:00 стає понеділком."""
-    now = now or datetime.now(KYIV_TZ)
-    shifted = (now + timedelta(hours=24 - TOP_PUBLISH_HOUR)).date()
-    return contest_week_key(shifted)
-
-
-def top_record_vote(rater_id: int, target_id: int, up: bool):
-    """Оцінка після справжнього чату (≥ 90 с). Одна людина оцінює іншу в топі лише раз на тиждень."""
-    if rater_id == target_id or target_id in banned_users or rater_id in banned_users:
-        return
-    current = top_week_key()
-    if top_week.get("week") is None:
-        top_week["week"] = current
-    if top_week.get("week") != current:
-        return  # тиждень щойно закінчився — підсумки ще рахуються, ця оцінка в топ не йде
-    pairs = top_week.setdefault("pairs", set())
-    key = f"{rater_id}:{target_id}"
-    if key in pairs:
-        return
-    pairs.add(key)
-    v = top_week.setdefault("votes", {}).setdefault(target_id, [0, 0])
-    v[0 if up else 1] += 1
-    request_save()
-
-
-def top_ranking() -> list[tuple[int, int, int, int]]:
-    """[(user_id, 👍, 👎, %)] — вище більший відсоток 👍, при рівності — більше 👍."""
-    items = []
-    for uid, (up, down) in (top_week.get("votes") or {}).items():
-        total = up + down
-        if total < TOP_MIN_VOTES or uid in banned_users or uid == ADMIN_ID or uid not in users_db:
-            continue
-        items.append((uid, up, down, round(up * 100 / total)))
-    items.sort(key=lambda t: (-t[1] / (t[1] + t[2]), -t[1]))
-    return items
-
-
-async def _top_broadcast(text: str):
-    for uid in list(users_db):
-        if uid in banned_users or uid < 0:
-            continue
-        await safe_send(uid, text)
-        await asyncio.sleep(0.05)  # ~20 повідомлень за секунду — в межах лімітів Telegram
-
-
-async def top_publish(week: str):
-    """Підсумки тижня: рівно один раз (навіть після перезапуску на Render)."""
-    published = top_week.setdefault("published", [])
-    if week in published:
-        return
-    published.append(week)
-    top_week["published"] = published[-20:]
-    request_save()
-    now = time.time()
-    winners = []
-    for (medal, days), (uid, up, down, pct) in zip(TOP_PRIZES, top_ranking()):
-        u = users_db[uid]
-        current = u["perks"].get("premium", 0)
-        if current == float("inf"):
-            prize = "у тебе вже вічний Premium 💎"
-        else:
-            # не накопичується: просто N днів від зараз (якщо вже є довший — нічого не забираємо)
-            u["perks"]["premium"] = max(current, now + days * DAY)
-            prize = f"Premium на {days} {_plural(days, 'день', 'дні', 'днів')}"
-        u["top_week_count"] = u.get("top_week_count", 0) + 1
-        winners.append((uid, up, down, pct, medal))
-        await safe_send(
-            uid,
-            f"🏆 <b>Ти в топі тижня!</b> {medal} місце\n\n"
-            f"👍 {up} · 👎 {down} — {pct}% співрозмовників залишились задоволені.\n"
-            f"Твоя нагорода: <b>{prize}</b> + значок «🏆 Був у топі» в профілі.\n\nДякуємо, що робиш чат кращим ❤️",
-        )
-        if TOP_STICKER_FILE_ID:
-            try:
-                await bot.send_sticker(uid, TOP_STICKER_FILE_ID)
-            except TelegramAPIError:
-                pass
-    top_week.setdefault("history", []).append({"week": week, "winners": winners})
-    top_week["history"] = top_week["history"][-10:]
-    request_save()
-    if not winners:
-        if ADMIN_ID:
-            await safe_send(ADMIN_ID, f"🏆 Топ тижня: ніхто не набрав {TOP_MIN_VOTES} оцінок — розсилку пропущено.")
-        return
-    lines = [
-        f"{medal} <b>{esc(users_db[uid]['nickname'])}</b> — 👍 {pct}% ({up + down} оцінок)"
-        for uid, up, down, pct, medal in winners
-    ]
-    text = (
-        "🏆 <b>Топ співрозмовників тижня</b>\n\n" + "\n".join(lines) +
-        "\n\nЇх оцінили найтепліше ❤️ Став 👍 після гарної розмови — "
-        "і наступного тижня тут можеш бути ти. Деталі: /best"
-    )
-    task = asyncio.get_running_loop().create_task(_top_broadcast(text))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-
-async def top_tick():
-    if not _contest_can_write():
-        return
-    current = top_week_key()
-    week = top_week.get("week")
-    if week == current:
-        return
-    if week:
-        await top_publish(week)
-    top_week["week"] = current
-    top_week["votes"] = {}
-    top_week["pairs"] = set()
-    request_save()
-
-
-def top_text(user_id: int) -> str:
-    up, down = (top_week.get("votes") or {}).get(user_id, [0, 0])
-    total = up + down
-    lines = ["🏆 <b>Топ співрозмовників тижня</b>\n",
-             "Після чату довше 1,5 хв співрозмовники ставлять 👍 або 👎. "
-             f"Щонеділі о 20:00 трійка з найбільшим відсотком 👍 (від {TOP_MIN_VOTES} оцінок) отримує нагороди:",
-             "🥇 Premium на 7 днів · 🥈🥉 Premium на 3 дні + значок «🏆 Був у топі»\n",
-             f"<b>Твій тиждень:</b> 👍 {up} · 👎 {down}"]
-    if total < TOP_MIN_VOTES:
-        lines.append(f"До участі ще {TOP_MIN_VOTES - total} {_plural(TOP_MIN_VOTES - total, 'оцінка', 'оцінки', 'оцінок')}.")
-    else:
-        place = next((i for i, t in enumerate(top_ranking(), 1) if t[0] == user_id), None)
-        lines.append(f"Зараз ти на <b>{place}</b> місці ({round(up * 100 / total)}% 👍).")
-    last = (top_week.get("history") or [None])[-1]
-    if last and last.get("winners"):
-        lines.append("\n<b>Минулого тижня:</b>")
-        for uid, _up, _down, pct, medal in last["winners"]:
-            lines.append(f"{medal} {esc(users_db.get(uid, {}).get('nickname', '?'))} — {pct}%")
-    return "\n".join(lines)
-
-
-@dp.message(Command("best"))
-async def top_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    init_user(message.from_user.id)
-    await message.answer(top_text(message.from_user.id))
-
-
-def contest_on_real_chat(user_id: int):
-    """Запрошений друг провів перший справжній чат — зараховуємо його тому, хто запросив."""
-    u = users_db.get(user_id)
-    if not u or u.get("ref_qualified") or not u.get("referred_by"):
-        return
-    u["ref_qualified"] = True
-    ref_id = u["referred_by"]
-    if ref_id not in users_db or ref_id in banned_users:
-        return
-    if ref_contest.get("week") != contest_week_key():
-        ref_contest["week"] = ref_contest.get("week") or contest_week_key()
-    entry = ref_contest.setdefault("counts", {}).setdefault(ref_id, [0, 0.0])
-    entry[0] += 1
-    entry[1] = time.time()
-    place = next((i for i, (uid, _n) in enumerate(contest_ranking(), 1) if uid == ref_id), None)
-    _notify_later(
-        ref_id,
-        f"🏆 Твій друг поспілкувався в першому чаті — <b>+1 у конкурсі запрошень</b>!\n"
-        f"Цього тижня: {entry[0]} · місце: {place}. Деталі: /contest",
-    )
-    request_save()
-
-
-def _ref_link(user_id: int) -> str:
-    return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}" if BOT_USERNAME else ""
-
-
-def contest_text(user_id: int) -> str:
-    week = ref_contest.get("week") or contest_week_key()
-    ranking = contest_ranking()
-    lines = [
-        f"🏆 <b>Конкурс запрошень</b> · {contest_week_range(week)}",
-        "",
-        "Запрошуй друзів за своїм посиланням. Друг зараховується, коли поспілкується "
-        "в першому чаті (від 1 хв).",
-        "",
-        "<b>Призи щонеділі опівночі:</b>",
-    ]
-    lines += [f"{medal} Premium на {days} днів" for medal, days in CONTEST_PRIZES]
-    lines.append(f"<i>Щоб потрапити в призери — мінімум {CONTEST_MIN_INVITES} друзі.</i>")
-    lines.append("")
-    if ranking:
-        lines.append("<b>Топ тижня:</b>")
-        medals = [m for m, _d in CONTEST_PRIZES]
-        for i, (uid, n) in enumerate(ranking[:CONTEST_TOP_SHOWN], 1):
-            mark = medals[i - 1] if i <= len(medals) else f"{i}."
-            you = " ← ти" if uid == user_id else ""
-            nick = esc(users_db.get(uid, {}).get("nickname", "Користувач"))
-            lines.append(f"{mark} {nick} — {n}{you}")
-    else:
-        lines.append("Цього тижня ще ніхто не запросив друзів — стань першим! 🚀")
-    mine = next(((i, n) for i, (uid, n) in enumerate(ranking, 1) if uid == user_id), None)
-    lines.append("")
-    if mine:
-        lines.append(f"📍 Ти: <b>{mine[1]}</b> {_plural(mine[1], 'друг', 'друзі', 'друзів')} · <b>{mine[0]}</b> місце")
-    else:
-        lines.append("📍 Ти поки не в рейтингу — надішли посилання другу!")
-    history = ref_contest.get("history") or []
-    if history and history[-1].get("winners"):
-        last = history[-1]
-        names = ", ".join(
-            f"{w[2].split()[0]} {esc(users_db.get(w[0], {}).get('nickname', '?'))}" for w in last["winners"]
-        )
-        lines.append(f"\n🎉 Переможці минулого тижня: {names}")
-    link = _ref_link(user_id)
-    if link:
-        lines.append(f"\n🔗 Твоє посилання:\n<code>{esc(link)}</code>")
-    return "\n".join(lines)
-
-
-def contest_keyboard(user_id: int):
-    link = _ref_link(user_id)
-    rows = []
-    if link:
-        share_text = "Заходь в ANONimchyk — анонімний чат для знайомств і розмов 🎭"
-        share = f"https://t.me/share/url?url={quote(link)}&text={quote(share_text)}"
-        rows.append([InlineKeyboardButton(text="📤 Надіслати другу", url=share)])
-    rows.append([InlineKeyboardButton(text="🔄 Оновити", callback_data="contest_open")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.message(Command("contest"))
-async def contest_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    init_user(message.from_user.id)
-    await contest_tick()
-    await message.answer(contest_text(message.from_user.id), reply_markup=contest_keyboard(message.from_user.id))
-
-
-@dp.callback_query(F.data == "contest_open")
-async def contest_open(call: types.CallbackQuery):
-    init_user(call.from_user.id)
-    await contest_tick()
-    text, kb = contest_text(call.from_user.id), contest_keyboard(call.from_user.id)
-    if call.message.text and call.message.text.startswith("🏆 Конкурс запрошень"):
-        try:
-            await call.message.edit_text(text, reply_markup=kb)
-        except TelegramAPIError:
-            pass  # нічого не змінилось
-        await call.answer("Оновлено")
-        return
-    await call.message.answer(text, reply_markup=kb)
-    await call.answer()
-
-
-# ---------------------------------------------------------------------------
-# Правила, безпека, підтримка з оплат
-# ---------------------------------------------------------------------------
-RULES_TEXT = (
-    "📜 <b>Правила ANONimchyk</b>\n\n"
-    "1. <b>Повага.</b> Без образ, погроз, цькування й дискримінації.\n"
-    "2. <b>Без спаму.</b> Ніякої реклами, посилань, продажів і «заробітку».\n"
-    "3. <b>Інтимне — лише у ❤️ флірт-чаті (18+)</b> і тільки за взаємною згодою. "
-    "Будь-який такий контент із неповнолітніми чи для неповнолітніх — бан назавжди.\n"
-    "4. <b>Не вимагай</b> фото, номер, адресу, гроші чи паролі. Не публікуй чужі особисті дані.\n"
-    "5. <b>Не видавай себе</b> за іншу людину чи адміністрацію, не шахрай.\n"
-    "6. <b>Вказуй справжній вік.</b> Флірт-чат — лише з 18 років.\n\n"
-    f"⚖️ Порушення → скарга «{BTN_REPORT}». Після кількох скарг акаунт блокується автоматично, "
-    "за серйозні порушення — бан адміністратором без попередження.\n\n"
-    "📄 Повідомлення в чатах не зберігаються. Лише якщо на тебе поскаржаться, той, хто скаржиться, "
-    "може додати твої останні повідомлення (текст) як доказ для модератора.\n\n"
-    "🤫 Бот не показує співрозмовнику твій Telegram-акаунт. Але свою анонімність бережи і сам — "
-    "детальніше: /safety\n"
-    "💳 Питання щодо оплат: /paysupport"
-)
-
-SAFETY_TEXT = (
-    "🛡 <b>Безпека в анонімному чаті</b>\n\n"
-    "• <b>Не кажи</b>, де живеш, у якій школі вчишся, своє прізвище та номер телефону.\n"
-    "• <b>Не надсилай</b> фото, особливо особисті. Надіслане вже не повернеш.\n"
-    "• <b>Не переходь</b> у інші месенджери чи соцмережі з незнайомцями й не погоджуйся на зустрічі.\n"
-    "• <b>Ніхто не має права</b> вимагати від тебе фото, гроші, коди чи паролі.\n"
-    "• Якщо співрозмовник лякає, тисне чи пише неприємне — просто завершуй чат.\n\n"
-    f"🚨 <b>{BTN_REPORT}</b> — скарга, адміністратор перевірить.\n"
-    f"🚫 <b>{BTN_BLACKLIST_ADD}</b> — ця людина більше ніколи тобі не трапиться.\n\n"
-    "Якщо сталося щось серйозне — розкажи дорослому, якому довіряєш. "
-    "В Україні безкоштовно допомагає дитяча лінія <b>116 111</b>."
-)
-
-MATCH_SAFETY_REMINDER = (
-    "🛡 Пам'ятай: не кажи, де живеш, і не надсилай фото незнайомцям. "
-    f"Щось не так — «{BTN_REPORT}» або «{BTN_BLACKLIST_ADD}». Більше: /safety"
-)
-MATCH_SAFETY_EVERY = 24 * 3600  # коротке нагадування неповнолітнім — не частіше разу на добу
-_match_safety_last: dict[int, float] = {}
-
-PAYSUPPORT_TEXT = (
-    "💳 <b>Питання щодо оплат</b>\n\n"
-    "Баланс у боті — внутрішня валюта: ним оплачуються Premium, подарунки та послуги в магазині. "
-    "Гроші з балансу не виводяться.\n\n"
-    "<b>Оплатив, а баланс не поповнився?</b>\n"
-    "• Банка monobank / реквізити: зарахування може тривати до кількох хвилин, "
-    "а якщо в коментарі не було коду — до перевірки адміністратором.\n"
-    "• Напиши в підтримку: <b>суму, час оплати</b> і код заявки <b>P…</b> (якщо був) "
-    "— і ми все перевіримо.\n\n"
-    "Повернення коштів можливе у разі технічної помилки, коли оплачену послугу не було надано."
-)
-
-
-async def maybe_send_safety_memo(user_id: int, u: dict):
-    """Повна пам'ятка неповнолітнім — один раз (після анкети чи зміни віку)."""
-    if is_minor(u) and not u.get("safety_memo_shown"):
-        u["safety_memo_shown"] = True
-        request_save()
-        await safe_send(user_id, SAFETY_TEXT)
-
-
-async def send_match_safety(user_id: int, u: dict):
-    if not is_minor(u):
-        return
-    if not u.get("safety_memo_shown"):
-        await maybe_send_safety_memo(user_id, u)
-        _match_safety_last[user_id] = time.time()
-        return
-    now = time.time()
-    if now - _match_safety_last.get(user_id, 0) < MATCH_SAFETY_EVERY:
-        return
-    _match_safety_last[user_id] = now
-    await safe_send(user_id, MATCH_SAFETY_REMINDER)
-
-
-@dp.message(Command("rules", "terms"))
-async def rules_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer(RULES_TEXT)
-
-
-@dp.message(Command("safety"))
-async def safety_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer(SAFETY_TEXT)
-
-
-@dp.message(Command("paysupport"))
-async def paysupport_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        PAYSUPPORT_TEXT,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="💬 Написати в підтримку", callback_data="support_start")]]
-        ),
-    )
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# 📍 Де я зараз: статус чату/пошуку/кімнати і швидке повернення
-# ---------------------------------------------------------------------------
-def chat_mode_label(mode: str) -> str:
-    if mode == "flirt":
-        return "❤️ Флірт-чат"
-    if mode == "voice":
-        return "🎙 Голосовий чат"
-    if mode.startswith("int:"):
-        return f"🧩 Чат за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}"
-    return "🔍 Анонімний чат"
-
-
-def where_text(user_id: int) -> str:
-    now = time.time()
-    if user_id in active_chats:
-        meta = chat_meta.get(user_id) or {}
-        p = users_db.get(active_chats[user_id]) or {}
-        mins = int((now - meta.get("start", now)) // 60)
-        return (
-            f"💬 <b>Ти зараз у чаті</b>: {chat_mode_label(meta.get('mode', 'normal'))}\n"
-            f"👤 Співрозмовник: {short_info(p)}\n"
-            f"⏱ {mins} хв · твоїх повідомлень: {meta.get('msgs', 0)}\n\n"
-            "Просто пиши — повідомлення йдуть співрозмовнику. Завершити: «❌ Завершити чат»."
-        )
-    if user_id in queue:
-        mode = search_mode.get(user_id, "normal")
-        mins = int((now - queue_since.get(user_id, now)) // 60)
-        return f"⏳ <b>Йде пошук</b>: {chat_mode_label(mode)} · {mins} хв\nЩойно когось знайду — одразу з'єдную."
-    if user_id in user_room:
-        room = rooms.get(user_room[user_id]) or {}
-        title = {**ROOM_TOPICS, **HW_ROOM}.get(room.get("topic"), "кімната")
-        return f"👥 <b>Ти в кімнаті</b>: {title} · учасників: {len(room.get('members') or ())}"
-    return "🙂 Ти зараз не в чаті й не в пошуку. Натисни «🔍 Шукати співрозмовника» 👇"
-
-
-@dp.message(F.text == BTN_BACK_CHAT)
-@dp.message(F.text == BTN_BACK_ROOM)
-@dp.message(Command("where", "chat"))
-async def where_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    uid = message.from_user.id
-    extra, line = {}, ""
-    if uid in active_chats:
-        kb = get_chat_keyboard()
-        extra, line = resume_kwargs(uid)
-    elif uid in user_room:
-        kb = get_room_keyboard()
-    else:
-        kb = get_main_keyboard()
-    text = where_text(uid) + (f"\n\n{line}" if line else "")
-    try:
-        await message.answer(text, reply_markup=kb, **extra)
-    except TelegramAPIError:  # повідомлення видалене чи недоступне — просто без цитати
-        await message.answer(where_text(uid), reply_markup=kb)
-
-# ---------------------------------------------------------------------------
-# ✨ Розваги: гороскоп, карта дня, сумісність знаків, що нового, канал зізнань
-# ---------------------------------------------------------------------------
-import hashlib
-
-ZODIAC = {k: (uk, el) for k, uk, el in [('aries', '♈ Овен', 'fire'), ('taurus', '♉ Телець', 'earth'), ('gemini', '♊ Близнюки', 'air'), ('cancer', '♋ Рак', 'water'), ('leo', '♌ Лев', 'fire'), ('virgo', '♍ Діва', 'earth'), ('libra', '♎ Терези', 'air'), ('scorpio', '♏ Скорпіон', 'water'), ('sagittarius', '♐ Стрілець', 'fire'), ('capricorn', '♑ Козоріг', 'earth'), ('aquarius', '♒ Водолій', 'air'), ('pisces', '♓ Риби', 'water')]}
-H_DAY = [
-    'Сьогодні вдалий день, щоб почати те, що давно відкладав(-ла).',
-    'Енергії багато — направ її на одну справу, а не на десять.',
-    'День спокійний: ідеальний час навести лад у думках.',
-    'Хтось чекає від тебе першого кроку. Можливо, варто його зробити.',
-    'Невелика несподіванка підніме настрій ближче до вечора.',
-    'Не поспішай із висновками — до вечора все проясниться.',
-    'Сьогодні твоя сила — у словах. Говори щиро.',
-    'Гарний день для нових знайомств і цікавих розмов.',
-    'Дай собі відпочити — продуктивність повернеться завтра.',
-    'Маленька перемога сьогодні важливіша, ніж здається.',
-]
-H_LOVE = [
-    'У коханні: щирий комплімент зробить більше, ніж ти думаєш.',
-    'У коханні: хтось думає про тебе частіше, ніж показує.',
-    'У коханні: відкрийся трохи більше — і отримаєш у відповідь тепло.',
-    'У коханні: не шукай ідеального — шукай свого.',
-    'У коханні: ввечері можлива розмова, яка багато змінить.',
-    'У коханні: зірки радять бути сміливішим(-ою).',
-    'У коханні: тиша теж буває відповіддю — дай людині час.',
-    'У коханні: несподіване знайомство може стати чимось більшим.',
-]
-H_TIP = [
-    'Порада дня: випий води й посміхнись незнайомцю 🙂',
-    'Порада дня: напиши тому, за ким сумуєш.',
-    'Порада дня: зроби одну справу до кінця.',
-    'Порада дня: прогулянка вирішить більше, ніж ти думаєш.',
-    'Порада дня: скажи «ні» тому, що забирає твою енергію.',
-    'Порада дня: увімкни улюблену пісню на повну.',
-    'Порада дня: похвали себе — ти багато робиш.',
-]
-H_COLORS = ['фіолетовий', 'золотий', 'бірюзовий', 'рожевий', 'смарагдовий', 'сріблястий', 'синій', 'бордовий']
-TAROT = [
-    ('🃏 Блазень', 'Новий початок і легкість. Не бійся зробити крок у невідоме.'),
-    ('🪄 Маг', 'Усе потрібне вже в тебе є. Дій — і вийде.'),
-    ('🌙 Верховна Жриця', 'Довірся інтуїції — вона сьогодні не підведе.'),
-    ('🌸 Імператриця', 'День турботи, краси й тепла. Подаруй його собі й іншим.'),
-    ('👑 Імператор', 'Час взяти ситуацію під контроль і поставити межі.'),
-    ('📜 Ієрофант', 'Мудра порада прийде від того, кого ти поважаєш.'),
-    ('💞 Закохані', 'Важливий вибір серцем. Слухай, що відчуваєш.'),
-    ('🏇 Колісниця', 'Рух уперед і перемога, якщо тримаєш курс.'),
-    ('🦁 Сила', "Твоя м'якість — це теж сила. Спокій переможе."),
-    ('🏮 Відлюдник', 'Побудь трохи наодинці — відповідь прийде зсередини.'),
-    ('🎡 Колесо Фортуни', 'Удача повертається до тебе обличчям. Лови момент.'),
-    ('⚖️ Справедливість', 'Чесність повернеться до тебе сторицею.'),
-    ('🙃 Повішений', 'Подивись на ситуацію під іншим кутом — і все зміниться.'),
-    ('🦋 Зміни', 'Щось старе завершується, щоб звільнити місце новому.'),
-    ('🍯 Помірність', 'Баланс і терпіння — сьогодні твої найкращі друзі.'),
-    ('😈 Спокуса', 'Помітиш спокусу — запитай себе, чи справді воно тобі треба.'),
-    ('⚡ Вежа', 'Несподіванка струсне рутину — і це на краще.'),
-    ('⭐ Зірка', 'Надія й натхнення. Мрій сміливо — сьогодні можна.'),
-    ('🌕 Місяць', 'Не все таке, яким здається. Не поспішай з висновками.'),
-    ('☀️ Сонце', 'Радість, тепло й успіх. Найкраща карта дня ✨'),
-    ('📯 Суд', 'Час підбити підсумки й пробачити — собі теж.'),
-    ('🌍 Світ', 'Завершення й гармонія. Ти саме там, де маєш бути.'),
-]
-COMPAT_TEXT = {k: v[0] for k, v in {'same': ('Ви говорите однією мовою стихії — легко, тепло й зрозуміло 💜', 'Вы говорите на одном языке стихии — легко, тепло и понятно 💜'), 'good': ('Ви чудово доповнюєте одне одного: де одному бракує — інший має з надлишком ✨', 'Вы отлично дополняете друг друга: где одному не хватает — у другого с избытком ✨'), 'mid': ('Цікава пара: будуть і іскри, і суперечки — нудно точно не буде 😉', 'Интересная пара: будут и искры, и споры — скучно точно не будет 😉'), 'hard': ('Різні стихії — складніше, але якщо вдасться, це буде дуже сильна пара 🔥', 'Разные стихии — сложнее, но если получится, это будет очень сильная пара 🔥')}.items()}
-HOROSCOPE_CHANNEL = os.getenv("HOROSCOPE_CHANNEL", "")  # напр. @ANONimchyk_goroskop — з'явиться кнопка
-NEWS_CHANNEL = os.getenv("NEWS_CHANNEL", "")  # напр. @ANONimchyk_news
-
-
-def _seed(*parts) -> int:
-    return int(hashlib.md5(":".join(map(str, parts)).encode()).hexdigest(), 16)
-
-
-def fun_menu_kb():
-    rows = [
-        [InlineKeyboardButton(text="🔮 Гороскоп на сьогодні", callback_data="fun_horo")],
-        [InlineKeyboardButton(text="🃏 Карта дня", callback_data="fun_tarot"),
-         InlineKeyboardButton(text="💞 Сумісність знаків", callback_data="fun_compat")],
-        [InlineKeyboardButton(text="📰 Що нового", callback_data="fun_news"),
-         InlineKeyboardButton(text="🤫 Канал зізнань", url=confess_channel_link())],
-    ]
-    if HOROSCOPE_CHANNEL:
-        rows.append([InlineKeyboardButton(text="🌙 Канал «ANONimchyk Гороскоп»", url=f"https://t.me/{HOROSCOPE_CHANNEL.lstrip('@')}")])
-    if NEWS_CHANNEL:
-        rows.append([InlineKeyboardButton(text="📣 Канал «ANONimchyk News»", url=f"https://t.me/{NEWS_CHANNEL.lstrip('@')}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-FUN_MENU_TEXT = "✨ <b>Розваги</b>\nЧим зайнятись, поки шукаєш співрозмовника 👇\n<i>Гороскоп і карти — для настрою й розваги 😉</i>"
-
-
-@dp.message(F.text == BTN_FUN)
-@dp.message(Command("fun"))
-async def fun_menu(message: types.Message, state: FSMContext):
-    await state.clear()
-    await send_banner(message.from_user.id, "fun")
-    await message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
-
-
-@dp.callback_query(F.data == "fun_menu")
-async def fun_menu_cb(call: types.CallbackQuery):
-    await call.message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
-    await call.answer()
-
-
-def zodiac_kb(prefix: str):
-    keys = list(ZODIAC)
-    rows = [[InlineKeyboardButton(text=ZODIAC[k][0], callback_data=f"{prefix}{k}") for k in keys[i:i + 3]]
-            for i in range(0, 12, 3)]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def horoscope_text(sign: str, day) -> str:
-    s = _seed("horo", sign, day.isoformat())
-    return (
-        f"🔮 <b>{ZODIAC[sign][0]} · {day.strftime('%d.%m')}</b>\n\n"
-        f"{H_DAY[s % len(H_DAY)]}\n\n"
-        f"💜 {H_LOVE[(s // 7) % len(H_LOVE)]}\n\n"
-        f"✨ {H_TIP[(s // 49) % len(H_TIP)]}\n\n"
-        f"🍀 Щасливе число: <b>{(s // 343) % 33 + 1}</b> · колір: <b>{H_COLORS[(s // 11) % len(H_COLORS)]}</b>"
-    )
-
-
-def horo_after_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔁 Змінити знак", callback_data="fun_horo_pick"),
-         InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")],
-    ])
-
-
-@dp.callback_query(F.data == "fun_horo")
-async def fun_horo(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    sign = u.get("zodiac")
-    await call.answer()
-    if sign in ZODIAC:
-        await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
-        stat_add("horoscope")
-        return
-    await call.message.answer("🔮 Обери свій знак — я запам'ятаю, і далі гороскоп буде в один дотик:", reply_markup=zodiac_kb("fun_z:"))
-
-
-@dp.callback_query(F.data == "fun_horo_pick")
-async def fun_horo_pick(call: types.CallbackQuery):
-    await call.answer()
-    await call.message.answer("🔮 Обери свій знак:", reply_markup=zodiac_kb("fun_z:"))
-
-
-@dp.callback_query(F.data.startswith("fun_z:"))
-async def fun_zodiac_set(call: types.CallbackQuery):
-    sign = call.data.split(":", 1)[1]
-    if sign not in ZODIAC:
-        await call.answer()
-        return
-    u = init_user(call.from_user.id)
-    u["zodiac"] = sign
-    request_save()
-    await call.answer(f"Запам'ятав: {ZODIAC[sign][0]}")
-    await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
-    stat_add("horoscope")
-
-
 @dp.callback_query(F.data == "fun_tarot")
 async def fun_tarot(call: types.CallbackQuery):
     i = _seed("tarot", call.from_user.id, kyiv_today().isoformat()) % len(TAROT)
@@ -1707,7 +719,6 @@ async def relay_masked_voice(message: types.Message, user_id: int, partner_id: i
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, "[голосове з маскою]")
         on_chat_message(user_id)
-        chatlog_record(user_id, message)
         stat_add("voice_mask")
     except TelegramAPIError:
         end_chat(user_id)
@@ -1812,6 +823,1486 @@ async def voice_mask_pitch(call: types.CallbackQuery):
         pass
     await call.answer(f"🎚 Тон: {n:+d}" if n else "🎙 Тон 0 — твій звичайний голос")
 
+# ---------------------------------------------------------------------------
+# 🤫 Анонімні зізнання: людина пише історію → модерація адміна → публікація в канал
+# ---------------------------------------------------------------------------
+CONFESS_CHANNEL = os.getenv("CONFESS_CHANNEL", "@ANONimchyk_zizn")
+CONFESS_MIN, CONFESS_MAX = 30, 1500
+CONFESS_COOLDOWN = int(os.getenv("CONFESS_COOLDOWN", str(3 * 3600)))  # одне зізнання на 3 години
+PHONE_REGEX = re.compile(r"(\+?\d[\d\s\-()]{8,}\d)")
+
+
+def confess_channel_link(msg_id: int | None = None) -> str:
+    name = CONFESS_CHANNEL.lstrip("@")
+    return f"https://t.me/{name}" + (f"/{msg_id}" if msg_id else "")
+
+
+def confess_cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Скасувати", callback_data="conf_cancel")]])
+
+
+@dp.message(F.text == BTN_CONFESS)
+@dp.message(Command("confess"))
+async def confess_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    if user_id in banned_users:
+        return
+    if user_id in active_chats:
+        await message.answer("🤫 Спершу заверши чат — а тоді розкажеш своє зізнання 🙂")
+        return
+    last = (confess_db.get("last_by") or {}).get(str(user_id), 0)
+    wait = int(last + CONFESS_COOLDOWN - time.time())
+    if wait > 0 and not _is_admin(user_id):
+        await message.answer(f"🤫 Наступне зізнання можна надіслати через {wait // 3600} год {wait % 3600 // 60} хв 💜")
+        return
+    await state.set_state(ConfessStates.text)
+    await send_banner(user_id, "confess")
+    await message.answer(
+        "🤫 <b>Анонімне зізнання</b>\n\n"
+        "Напиши те, що не можеш сказати нікому. Ми опублікуємо це в каналі "
+        f"<a href=\"{confess_channel_link()}\">Анонімні зізнання</a> — без імені, ніку й будь-яких даних про тебе.\n\n"
+        "• без імен і деталей, за якими можна впізнати людей, — ні тебе, ні інших "
+        "(адреси, телефони, @ніки, школа чи робота);\n"
+        f"• від {CONFESS_MIN} до {CONFESS_MAX} символів;\n"
+        "• перед публікацією зізнання перевіряє модератор.\n\n"
+        "Напиши своє зізнання одним повідомленням 👇",
+        reply_markup=confess_cancel_kb(),
+        disable_web_page_preview=True,
+    )
+
+
+@dp.message(ConfessStates.text)
+async def confess_got_text(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("🤫 Зізнання приймаємо лише текстом — напиши його одним повідомленням 🙂", reply_markup=confess_cancel_kb())
+        return
+    if len(text) < CONFESS_MIN:
+        await message.answer(f"Трохи коротко 🙂 Напиши хоча б {CONFESS_MIN} символів.", reply_markup=confess_cancel_kb())
+        return
+    if len(text) > CONFESS_MAX:
+        await message.answer(f"Задовго — максимум {CONFESS_MAX} символів (зараз {len(text)}). Скороти, будь ласка.", reply_markup=confess_cancel_kb())
+        return
+    if LINK_REGEX.search(text) or PHONE_REGEX.search(text):
+        await message.answer("🚫 Без посилань, @ніків і телефонів — так ніхто не дізнається, хто ти 💜 Перепиши, будь ласка.", reply_markup=confess_cancel_kb())
+        return
+    await state.update_data(confess_text=text)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Надіслати на перевірку", callback_data="conf_send")],
+            [InlineKeyboardButton(text="✏️ Переписати", callback_data="conf_again"), InlineKeyboardButton(text="❌ Скасувати", callback_data="conf_cancel")],
+        ]
+    )
+    await message.answer(
+        "Ось як це виглядатиме в каналі:\n\n"
+        f"<blockquote>{esc(text)}</blockquote>\n\n"
+        "Публікуємо анонімно? Натискаючи «Надіслати», ти погоджуєшся на публікацію цього тексту в каналі та в озвучених відео ANONimchyk у соцмережах.",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data == "conf_cancel")
+async def confess_cancel(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.message.answer("Скасовано. Повертайся, коли захочеш 💜", reply_markup=get_main_keyboard())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "conf_again")
+async def confess_again(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ConfessStates.text)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.message.answer("✏️ Добре, напиши нову версію одним повідомленням 👇", reply_markup=confess_cancel_kb())
+    await call.answer()
+
+
+def confess_admin_kb(cid: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Опублікувати", callback_data=f"conf_ok:{cid}"),
+            InlineKeyboardButton(text="❌ Відхилити", callback_data=f"conf_no:{cid}"),
+        ]]
+    )
+
+
+@dp.callback_query(F.data == "conf_send")
+async def confess_send(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    text = data.get("confess_text")
+    await state.clear()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if not text:
+        await call.answer("Зізнання не знайдено, спробуй ще раз.", show_alert=True)
+        return
+    user_id = call.from_user.id
+    cid = confess_db.get("next_id", 1)
+    confess_db["next_id"] = cid + 1
+    confess_db.setdefault("items", {})[str(cid)] = {"uid": user_id, "text": text, "at": time.time(), "status": "pending"}
+    confess_db.setdefault("last_by", {})[str(user_id)] = time.time()
+    request_save()
+    stat_add("confess")
+    u = init_user(user_id)
+    if ADMIN_ID:
+        await safe_send(
+            ADMIN_ID,
+            f"🤫 <b>Нове зізнання #{cid}</b> (від {esc(u.get('custom_id', ''))})\n\n<blockquote>{esc(text)}</blockquote>",
+            reply_markup=confess_admin_kb(cid),
+        )
+    await call.message.answer(
+        "📨 Надіслано на перевірку! Щойно зізнання з'явиться в каналі — я тобі повідомлю 💜",
+        reply_markup=get_main_keyboard(),
+    )
+    await call.answer()
+
+
+def confess_post_text(no: int, text: str) -> str:
+    # Посилання в тексті, а не кнопкою: під постами з кнопками Telegram не показує «Коментувати»
+    link = f"https://t.me/{BOT_USERNAME or 'ANONimchykbot'}?start=zizn"
+    return f"🤫 <b>Зізнання #{no}</b>\n\n{esc(text)}\n\n<i>Розкажи своє — анонімно 👉</i> <a href=\"{link}\">@{BOT_USERNAME or 'ANONimchykbot'}</a>"
+
+
+def confess_post_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🤫 Зізнатись анонімно", url=f"https://t.me/{BOT_USERNAME or 'ANONimchykbot'}?start=zizn")]]
+    )
+
+
+@dp.callback_query(F.data.startswith("conf_ok:"))
+async def confess_approve(call: types.CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await call.answer()
+        return
+    cid = call.data.split(":", 1)[1]
+    item = (confess_db.get("items") or {}).get(cid)
+    if not item or item.get("status") != "pending":
+        await call.answer("Вже оброблено.", show_alert=True)
+        return
+    no = confess_db.get("pub_no", 0) + 1
+    try:
+        msg = await bot.send_message(CONFESS_CHANNEL, confess_post_text(no, item["text"]), disable_web_page_preview=True)
+    except TelegramAPIError as e:
+        await call.answer(f"Не вдалося опублікувати: {e}"[:190], show_alert=True)
+        return
+    confess_db["pub_no"] = no
+    item.update(status="published", no=no, msg_id=getattr(msg, "message_id", None))
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await safe_send(
+        item["uid"],
+        f"✅ Твоє зізнання опубліковано як <b>#{no}</b>: {confess_channel_link(item.get('msg_id'))}\n\nДякуємо за довіру 💜",
+    )
+    await call.answer(f"Опубліковано #{no}")
+
+
+@dp.callback_query(F.data.startswith("conf_no:"))
+async def confess_reject(call: types.CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await call.answer()
+        return
+    cid = call.data.split(":", 1)[1]
+    item = (confess_db.get("items") or {}).get(cid)
+    if not item or item.get("status") != "pending":
+        await call.answer("Вже оброблено.", show_alert=True)
+        return
+    item["status"] = "rejected"
+    item.pop("text", None)  # відхилене не зберігаємо
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await safe_send(
+        item["uid"],
+        "🤫 Цього разу зізнання не пройшло модерацію — можливо, в ньому були чиїсь дані або воно порушує правила. "
+        "Можеш написати нове 💜",
+    )
+    await call.answer("Відхилено")
+
+# ---------------------------------------------------------------------------
+# 🎭 Зняти маску: за взаємною згодою показати одне одному нік, вік і фото профілю;
+# @username — окремою кнопкою, тільки якщо людина сама захоче. Вмикається в UNMASK_AT.
+# ---------------------------------------------------------------------------
+def _parse_unmask_at() -> datetime:
+    raw = os.getenv("UNMASK_AT", "2026-10-23T20:00")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        dt = datetime(2026, 10, 23, 20, 0)
+    return dt if dt.tzinfo else dt.replace(tzinfo=KYIV_TZ)
+
+
+UNMASK_AT = _parse_unmask_at()
+UNMASK_MIN_MSGS = int(os.getenv("UNMASK_MIN_MSGS", "5"))  # скільки повідомлень має написати КОЖЕН
+FOUNDER_PACK_URL = os.getenv("FOUNDER_PACK_URL", "")  # посилання на стікерпак «Пак засновника»
+unmask_requests: dict[int, int] = {}  # кому надіслано запит -> хто просить
+unmask_done: set[frozenset] = set()  # пари, які вже зняли маски в цьому чаті
+
+
+def unmask_live() -> bool:
+    return datetime.now(KYIV_TZ) >= UNMASK_AT
+
+
+def unmask_wait_text() -> str:
+    left = int((UNMASK_AT - datetime.now(KYIV_TZ)).total_seconds())
+    days, rem = divmod(max(left, 0), 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days} {_plural(days, 'день', 'дні', 'днів')}")
+    if hours:
+        parts.append(f"{hours} год")
+    if not days:
+        parts.append(f"{mins} хв")
+    return (
+        "🎭 <b>Зняти маску</b> відкриється в <b>п'ятницю, 23 жовтня о 20:00</b>.\n"
+        f"⏳ Залишилось: {' '.join(parts)}\n\n"
+        "Тоді за взаємною згодою ви зможете показати одне одному нік, вік і фото — "
+        "а контакт тільки якщо самі захочете 💜"
+    )
+
+
+def unmask_pair_blocked(u: dict, p: dict) -> str | None:
+    """Причина, чому пара не може зняти маски (None — можна)."""
+    a, b = get_age_int(u), get_age_int(p)
+    if a is None or b is None:
+        return "🎭 Щоб зняти маску, у вас обох має бути вказаний вік у профілі."
+    if (a < 18) != (b < 18):
+        return "🎭 Зняти маску можна лише з однолітками — так безпечніше для всіх 💜"
+    return None
+
+
+def unmask_card(u: dict) -> str:
+    badge = " 👑" if u.get("founder_no") else ""
+    g = u.get("gender", "")
+    gico = "👨" if g == "Хлопець" else "👩" if g == "Дівчина" else "🙂"
+    age = u.get("age", "")
+    country = u.get("country", "")
+    lines = [f"{gico} <b>{esc(u.get('nickname', ''))}</b>{badge}"]
+    info = ", ".join(x for x in (f"{age} р." if str(age).isdigit() else "", country if country and country != "Не вказано" else "") if x)
+    if info:
+        lines.append(info)
+    ml = mood_line(u)
+    if ml:
+        lines.append(ml)
+    return "\n".join(lines)
+
+
+def unmask_share_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="📨 Поділитися моїм @username", callback_data="unmask_share")]]
+    )
+
+
+@dp.message(F.text == BTN_UNMASK)
+@dp.message(Command("unmask"))
+async def unmask_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    if not unmask_live() and not _is_admin(user_id):
+        await message.answer(unmask_wait_text())
+        return
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await message.answer(
+            "🎭 Зняти маску можна лише під час анонімного чату — знайди співрозмовника 🙂",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+    if frozenset((user_id, partner_id)) in unmask_done:
+        await message.answer("🎭 Ви вже зняли маски в цьому чаті 💜")
+        return
+    if unmask_requests.get(partner_id) == user_id:
+        await message.answer("⏳ Запит уже надіслано — чекаємо відповіді співрозмовника.")
+        return
+    u, p = init_user(user_id), init_user(partner_id)
+    reason = unmask_pair_blocked(u, p)
+    if reason:
+        await message.answer(reason)
+        return
+    mine = (chat_meta.get(user_id) or {}).get("msgs", 0)
+    theirs = (chat_meta.get(partner_id) or {}).get("msgs", 0)
+    if min(mine, theirs) < UNMASK_MIN_MSGS:
+        await message.answer(
+            "🎭 Спершу трохи поспілкуйтесь — маску знімають, коли вже є про що говорити 🙂\n"
+            f"(кожен має написати хоча б {UNMASK_MIN_MSGS} повідомлень)"
+        )
+        return
+    if unmask_requests.get(user_id) == partner_id:  # співрозмовник уже попросив — одразу знімаємо
+        unmask_requests.pop(user_id, None)
+        await unmask_reveal(user_id, partner_id)
+        return
+    unmask_requests[partner_id] = user_id
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="🎭 Так, знімаємо", callback_data="unmask_yes"),
+            InlineKeyboardButton(text="🙈 Ще ні", callback_data="unmask_no"),
+        ]]
+    )
+    ok = await safe_send(
+        partner_id,
+        "🎭 <b>Співрозмовник пропонує зняти маски.</b>\n\n"
+        "Ви обоє побачите нік, вік і фото профілю одне одного. "
+        "Контакт (@username) — тільки якщо кожен сам захоче ним поділитися.\n\nЗнімаємо?",
+        reply_markup=kb,
+    )
+    if ok:
+        await message.answer("🎭 Запит надіслано. Маски знімуться, тільки якщо співрозмовник погодиться 💜")
+    else:
+        unmask_requests.pop(partner_id, None)
+        await message.answer("❌ Не вдалося надіслати запит.")
+
+
+async def _send_unmask_card(to_id: int, about_id: int):
+    about = init_user(about_id)
+    text = "🎭 <b>Маски знято!</b> Ось хто з тобою говорив:\n\n" + unmask_card(about)
+    photo_id = None
+    try:
+        photos = await bot.get_user_profile_photos(about_id, limit=1)
+        if photos and photos.total_count and photos.photos:
+            photo_id = photos.photos[0][-1].file_id
+    except Exception as e:  # noqa: BLE001
+        logging.info("Фото профілю %s: %s", about_id, e)
+    if photo_id:
+        try:
+            await bot.send_photo(to_id, photo_id, caption=text, protect_content=True)
+            return
+        except TelegramAPIError:
+            pass
+    await safe_send(to_id, text + "\n\n<i>(фото профілю приховане)</i>")
+
+
+async def unmask_reveal(a: int, b: int):
+    if active_chats.get(a) != b:
+        return
+    unmask_done.add(frozenset((a, b)))
+    stat_add("unmask")
+    await send_banner(a, "unmask")
+    await send_banner(b, "unmask")
+    await _send_unmask_card(a, b)
+    await _send_unmask_card(b, a)
+    note = (
+        "Хочеш продовжити спілкування поза ботом? Поділись контактом — тільки якщо сам цього хочеш. "
+        "А можна й далі говорити тут 💜"
+    )
+    await safe_send(a, note, reply_markup=unmask_share_kb())
+    await safe_send(b, note, reply_markup=unmask_share_kb())
+
+
+@dp.callback_query(F.data == "unmask_yes")
+async def unmask_yes(call: types.CallbackQuery):
+    me = call.from_user.id
+    requester = unmask_requests.pop(me, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if requester is None or active_chats.get(me) != requester:
+        await call.answer("Запит уже неактуальний.", show_alert=True)
+        return
+    await call.answer("🎭")
+    await unmask_reveal(me, requester)
+
+
+@dp.callback_query(F.data == "unmask_no")
+async def unmask_no(call: types.CallbackQuery):
+    me = call.from_user.id
+    requester = unmask_requests.pop(me, None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if requester is not None:
+        await safe_send(requester, "🎭 Співрозмовник поки не готовий зняти маску. Можливо, пізніше 🙂")
+    await call.answer("Добре, маски лишаються 🙂")
+
+
+@dp.callback_query(F.data == "unmask_share")
+async def unmask_share(call: types.CallbackQuery):
+    me = call.from_user.id
+    partner = active_chats.get(me)
+    if partner is None or frozenset((me, partner)) not in unmask_done:
+        await call.answer("Чат уже завершено.", show_alert=True)
+        return
+    username = call.from_user.username
+    if not username:
+        await call.answer(
+            "У тебе немає @username у Telegram. Додай його в Налаштуваннях Telegram і натисни ще раз.",
+            show_alert=True,
+        )
+        return
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    u = init_user(me)
+    await safe_send(partner, f"📨 <b>{esc(u['nickname'])}</b> ділиться контактом: @{esc(username)}")
+    await call.answer("Контакт надіслано 💜")
+
+
+def launch_text() -> str:
+    lines = [
+        "🎭 <b>Сьогодні о 20:00 ANONimchyk знімає маски!</b>",
+        "",
+        "Тепер у кожному чаті є кнопка «🎭 Зняти маску»:",
+        "• поспілкуйтесь трохи — і запропонуйте зняти маски;",
+        "• тільки якщо погодитесь обоє, ви побачите нік, вік і фото одне одного;",
+        "• контакт — лише якщо сам захочеш ним поділитися.",
+        "",
+        "🎙 Нове: «Маска голосу» — надсилай голосові, а співрозмовник почує змінений голос. Увімкнути: /voice",
+        "🤫 І канал анонімних зізнань: @ANONimchyk_zizn",
+        "✨ А ще «Розваги»: гороскоп, карта дня і сумісність знаків — /fun",
+        "",
+        "💸 Тепер подарунки — це не тільки приємно: частина вартості кожного подарунка, "
+        "який тобі дарують, стає твоїми грошима. Вивід на карту від 200 \u2060грн 💜",
+        "",
+        "💬 А ще в чатах: відповідь свайпом, виправлення повідомлень і кнопка «🎲 Інша тема». "
+        "Додай пару слів «Про себе» в профілі — співрозмовник побачить їх на старті.",
+        "",
+        "⏰ А о 21:00 — Година знайомств: найбільше людей онлайн. Саме час 💜",
+    ]
+    return "\n".join(lines)
+
+
+def founder_pack_text(no: int) -> str:
+    return (
+        f"👑 <b>Засновнику №{no} — обіцяний подарунок!</b>\n\n"
+        "Твій ексклюзивний 🎁 <b>Пак засновника</b> — анімовані стікери ANONimchyk, "
+        "які ніколи не продаватимуться:\n"
+        f"{FOUNDER_PACK_URL}\n\nДякуємо, що ти з нами з самого початку 💜"
+    )
+
+
+def launch_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")]]
+    )
+
+
+async def launch_broadcast():
+    sent = 0
+    for uid, u in list(users_db.items()):
+        if uid <= 0 or uid in banned_users:
+            continue
+        if await safe_send(uid, launch_text(), reply_markup=launch_keyboard()):
+            sent += 1
+            if FOUNDER_PACK_URL and u.get("founder_no"):
+                await safe_send(uid, founder_pack_text(u["founder_no"]))
+        await asyncio.sleep(0.05)
+    launch_state["sent"] = sent
+    request_save()
+    if ADMIN_ID:
+        await safe_send(ADMIN_ID, f"🎭 Розсилку про запуск отримали: <b>{sent}</b>")
+
+
+async def launch_tick():
+    """Раз на хвилину: рівно в UNMASK_AT — одна розсилка про запуск (і Пак засновника)."""
+    if not _contest_can_write() or launch_state.get("done") or not unmask_live():
+        return
+    if (datetime.now(KYIV_TZ) - UNMASK_AT).total_seconds() > 6 * 3600:
+        launch_state["done"] = True  # бот прокинувся надто пізно — не спамимо вночі
+        request_save()
+        return
+    launch_state["done"] = True  # спершу позначаємо — щоб після перезапуску не надіслати двічі
+    request_save()
+    await launch_broadcast()
+
+
+@dp.message(Command("launchtest"))
+async def launch_test(message: types.Message):
+    """Адмін: подивитись текст розсилки й Пак засновника (надсилається лише тобі)."""
+    if not _is_admin(message.from_user.id):
+        return
+    await message.answer(launch_text(), reply_markup=launch_keyboard())
+    if FOUNDER_PACK_URL:
+        await message.answer(founder_pack_text(1))
+    else:
+        await message.answer("⚠️ FOUNDER_PACK_URL не задано в Render — Пак засновника не надішлеться.")
+    await message.answer(f"Запуск: {UNMASK_AT.strftime('%d.%m %H:%M')} · розсилка вже була: {launch_state.get('done')}")
+
+# ---------------------------------------------------------------------------
+# 💸 Вивід грошей на карту: частина вартості подарунків, які тобі дарують, від WITHDRAW_MIN грн.
+# Зараховуються лише подарунки після запуску оновлення і лише в межах реальних поповнень дарувальника
+# (безкоштовні бонуси не перетворюються на гроші). Гроші «відлежуються» EARN_HOLD_DAYS днів,
+# виплату робить адмін вручну. Номер карти не зберігається в базі — лише останні 4 цифри.
+# ---------------------------------------------------------------------------
+WITHDRAW_MIN_AGE = 18
+
+
+def uah(x: float, digits: int = 2) -> str:
+    """Сума виводу завжди в гривнях (не в ⭐) — позначка \u2060 вимикає заміну на зірки."""
+    return f"{x:.{digits}f} \u2060грн"
+
+
+def paid_pool(u: dict) -> float:
+    """Скільки реальних поповнень людини ще може «перетворитись» на заробіток отримувачів подарунків."""
+    if "paid_pool" not in u:
+        u["paid_pool"] = float(u.get("topup_total") or 0.0)
+    return u["paid_pool"]
+
+
+def earn_from_gift(sender: dict, recipient: dict, price: float) -> float:
+    if time.time() < UNMASK_AT.timestamp():
+        return 0.0  # рахуємо лише з моменту запуску оновлення
+    base = min(float(price), paid_pool(sender))
+    if base <= 0:
+        return 0.0
+    sender["paid_pool"] = round(sender["paid_pool"] - base, 2)
+    amt = round(base * GIFT_RECIPIENT_SHARE, 2)
+    if amt <= 0:
+        return 0.0
+    recipient.setdefault("earn_pending", []).append([time.time(), amt])
+    recipient["earned_total"] = round(recipient.get("earned_total", 0.0) + amt, 2)
+    return amt
+
+
+def earn_mature(u: dict) -> None:
+    """Переносить гроші, що вже «відлежались», у доступні до виводу."""
+    pend = u.get("earn_pending") or []
+    if not pend:
+        return
+    edge = time.time() - EARN_HOLD_DAYS * 86400
+    ready = sum(a for t, a in pend if t <= edge)
+    if ready:
+        u["earn_pending"] = [[t, a] for t, a in pend if t > edge]
+        u["earn_ready"] = round(u.get("earn_ready", 0.0) + ready, 2)
+
+
+def earn_on_hold(u: dict) -> float:
+    return round(sum(a for _t, a in (u.get("earn_pending") or [])), 2)
+
+
+def withdrawable(u: dict) -> float:
+    earn_mature(u)
+    return max(0.0, round(min(u.get("earn_ready", 0.0), u.get("balance", 0.0)), 2))
+
+
+def earn_wallet_line(u: dict) -> str:
+    if not u.get("earned_total"):
+        return ""
+    line = f"• <b>💸 Зароблено:</b> {uah(u['earned_total'])} · до виводу: <b>{uah(withdrawable(u))}</b>\n"
+    hold = earn_on_hold(u)
+    if hold:
+        line += f"  <i>ще {uah(hold)} стануть доступні протягом {EARN_HOLD_DAYS} днів</i>\n"
+    return line
+
+
+def wd_pending_of(user_id: int):
+    for no, w in withdraw_db.get("items", {}).items():
+        if w["user_id"] == user_id and w["status"] == "pending":
+            return no, w
+    return None, None
+
+
+def luhn_ok(num: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(num)):
+        d = int(ch)
+        if i % 2:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def wd_cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Скасувати", callback_data="wd_cancel")]])
+
+
+@dp.callback_query(F.data == "wd_open")
+async def wd_open(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    u = init_user(user_id)
+    await call.answer()
+    if user_id in banned_users:
+        return
+    if user_id in active_chats:
+        await call.message.answer("💬 Спершу заверши чат — а тоді оформимо вивід 🙂")
+        return
+    age = get_age_int(u)
+    if age is None or age < WITHDRAW_MIN_AGE:
+        await call.message.answer(
+            f"💸 Вивід на карту доступний з {WITHDRAW_MIN_AGE} років.\n"
+            "Гроші з подарунків лишаються на балансі — їх можна витрачати в боті 💜"
+        )
+        return
+    no, w = wd_pending_of(user_id)
+    if w:
+        await call.message.answer(f"⏳ Заявка №{no} на {uah(w['amount'])} уже в обробці. Щойно виплатимо — бот напише.")
+        return
+    avail = withdrawable(u)
+    hold = earn_on_hold(u)
+    if avail < WITHDRAW_MIN:
+        text = (
+            "💸 <b>Вивід на карту</b>\n\n"
+            "Коли тобі дарують подарунки в чаті, частина їхньої вартості стає твоїми грошима. "
+            f"Вони стають доступні через {EARN_HOLD_DAYS} днів, а вивести можна від <b>{uah(WITHDRAW_MIN, 0)}</b>.\n\n"
+            f"Доступно зараз: <b>{uah(avail)}</b>"
+        )
+        if hold:
+            text += f"\nНезабаром стане доступно: {uah(hold)}"
+        await call.message.answer(text)
+        return
+    await state.set_state(WithdrawStates.amount)
+    await state.update_data(wd_avail=avail)
+    await call.message.answer(
+        f"💸 Доступно до виводу: <b>{uah(avail)}</b>\n\n"
+        f"Напиши суму від {WITHDRAW_MIN:.0f} до {uah(avail)} або натисни кнопку 👇",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"Вивести все — {uah(avail)}", callback_data="wd_all")],
+            [InlineKeyboardButton(text="✖️ Скасувати", callback_data="wd_cancel")],
+        ]),
+    )
+
+
+async def _wd_ask_card(target: types.Message, state: FSMContext, amount: float):
+    await state.update_data(wd_amount=amount)
+    await state.set_state(WithdrawStates.card)
+    await target.answer(
+        f"💳 Сума: <b>{uah(amount)}</b>\n\n"
+        "Надішли номер картки українського банку (16 цифр).\n"
+        "<i>Бот одразу видалить повідомлення з номером із чату, а в базі збереже лише останні 4 цифри.</i>",
+        reply_markup=wd_cancel_kb(),
+    )
+
+
+@dp.callback_query(F.data == "wd_all")
+async def wd_all(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if await state.get_state() != WithdrawStates.amount.state:
+        return
+    avail = withdrawable(init_user(call.from_user.id))
+    if avail < WITHDRAW_MIN:
+        await state.clear()
+        await call.message.answer(f"Доступно лише {uah(avail)} — мінімум для виводу {uah(WITHDRAW_MIN, 0)}.")
+        return
+    await _wd_ask_card(call.message, state, avail)
+
+
+@dp.callback_query(F.data == "wd_cancel")
+async def wd_cancel(call: types.CallbackQuery, state: FSMContext):
+    if (await state.get_state() or "").startswith("WithdrawStates"):
+        await state.clear()
+    await call.answer("Скасовано")
+    await call.message.answer("Вивід скасовано.", reply_markup=get_main_keyboard())
+
+
+@dp.message(WithdrawStates.amount)
+async def wd_amount(message: types.Message, state: FSMContext):
+    avail = withdrawable(init_user(message.from_user.id))
+    try:
+        amount = round(float((message.text or "").strip().replace(",", ".").replace("грн", "")), 2)
+    except ValueError:
+        await message.answer(f"Напиши лише число — наприклад, {WITHDRAW_MIN:.0f}.", reply_markup=wd_cancel_kb())
+        return
+    if amount < WITHDRAW_MIN or amount > avail:
+        await message.answer(
+            f"Сума має бути від {WITHDRAW_MIN:.0f} до {uah(avail)}.", reply_markup=wd_cancel_kb()
+        )
+        return
+    await _wd_ask_card(message, state, amount)
+
+
+@dp.message(WithdrawStates.card)
+async def wd_card(message: types.Message, state: FSMContext):
+    digits = re.sub(r"[\s-]", "", message.text or "")
+    try:
+        await message.delete()  # номер карти не лишаємо в чаті
+    except TelegramAPIError:
+        pass
+    if not (digits.isdigit() and len(digits) == 16 and luhn_ok(digits)):
+        await message.answer("⚠️ Схоже, номер з помилкою. Перевір 16 цифр і надішли ще раз.", reply_markup=wd_cancel_kb())
+        return
+    data = await state.get_data()
+    amount = float(data.get("wd_amount") or 0)
+    await state.update_data(wd_card=digits)
+    await message.answer(
+        f"Перевір, будь ласка:\n\n💸 Сума: <b>{uah(amount)}</b>\n💳 Картка: <b>•••• {digits[-4:]}</b>\n\n"
+        "Виплата зазвичай надходить протягом 1–3 робочих днів.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Підтвердити", callback_data="wd_confirm")],
+            [InlineKeyboardButton(text="✖️ Скасувати", callback_data="wd_cancel")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "wd_confirm")
+async def wd_confirm(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    data = await state.get_data()
+    card, amount = data.get("wd_card"), float(data.get("wd_amount") or 0)
+    await state.clear()
+    if not card or amount <= 0:
+        await call.answer("Заявка застаріла — почни ще раз з гаманця.", show_alert=True)
+        return
+    u = init_user(user_id)
+    if wd_pending_of(user_id)[1] or amount < WITHDRAW_MIN or amount > withdrawable(u):
+        await call.answer("Сума вже недоступна — відкрий гаманець ще раз.", show_alert=True)
+        return
+    await call.answer()
+    u["balance"] = round(u["balance"] - amount, 2)
+    u["earn_ready"] = round(u.get("earn_ready", 0.0) - amount, 2)
+    no = str(withdraw_db.get("next", 1))
+    withdraw_db["next"] = int(no) + 1
+    w = {"user_id": user_id, "amount": amount, "last4": card[-4:], "created": time.time(), "status": "pending"}
+    withdraw_db.setdefault("items", {})[no] = w
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.message.answer(
+        f"✅ Заявку №{no} на <b>{uah(amount)}</b> прийнято. Щойно гроші надійдуть на картку •••• {card[-4:]}, бот напише 💜",
+        reply_markup=get_main_keyboard(),
+    )
+    if ADMIN_ID:
+        try:
+            sent = await bot.send_message(
+                ADMIN_ID,
+                f"💸 <b>Заявка на виплату №{no}</b>\n\n"
+                f"👤 {admin_label(user_id)}\n"
+                f"🎂 Вік: {esc(u.get('age'))} · зароблено всього: {uah(u.get('earned_total', 0))}\n"
+                f"💰 Сума: <b>{uah(amount)}</b>\n"
+                f"💳 Картка: <code>{card}</code>\n\n"
+                "<i>Після переказу натисни «Виплачено» — номер картки зникне з цього повідомлення.</i>",
+                protect_content=True,
+                reply_markup=wd_admin_kb(no),
+            )
+            w["admin_msg"] = sent.message_id
+        except TelegramAPIError as e:
+            logging.warning("Заявка на виплату: не вдалося повідомити адміна: %s", e)
+
+
+def wd_admin_kb(no: str):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Виплачено", callback_data=f"wd_paid:{no}"),
+        InlineKeyboardButton(text="❌ Відхилити", callback_data=f"wd_rej:{no}"),
+    ]])
+
+
+@dp.callback_query(F.data.startswith("wd_paid:") | F.data.startswith("wd_rej:"))
+async def wd_admin_decide(call: types.CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await call.answer("Доступ заборонено", show_alert=True)
+        return
+    action, no = call.data.split(":", 1)
+    w = withdraw_db.get("items", {}).get(no)
+    if w is None or w["status"] != "pending":
+        await call.answer("Заявку вже оброблено.", show_alert=True)
+        return
+    paid = action == "wd_paid"
+    w["status"] = "paid" if paid else "rejected"
+    w["done"] = time.time()
+    u = init_user(w["user_id"])
+    if paid:
+        u["withdrawn_total"] = round(u.get("withdrawn_total", 0.0) + w["amount"], 2)
+        stat_add("withdrawn", w["amount"])
+        await safe_send(w["user_id"], f"✅ Виплату <b>{uah(w['amount'])}</b> надіслано на картку •••• {w['last4']}. Дякуємо, що ти з нами 💜")
+    else:
+        u["balance"] = round(u["balance"] + w["amount"], 2)
+        u["earn_ready"] = round(u.get("earn_ready", 0.0) + w["amount"], 2)
+        await safe_send(
+            w["user_id"],
+            f"❌ Заявку №{no} на виплату відхилено — {uah(w['amount'])} повернуто на баланс.\n"
+            "Якщо є питання — напиши в 🆘 Допомога.",
+        )
+    request_save()
+    try:
+        await call.message.edit_text(
+            f"💸 Заявка №{no}: {uah(w['amount'])} · картка •••• {w['last4']}\n"
+            f"👤 {admin_label(w['user_id'])}\n\n" + ("✅ Виплачено" if paid else "❌ Відхилено, гроші повернуто"),
+            reply_markup=None,
+        )
+    except TelegramAPIError:
+        pass
+    await call.answer("Готово")
+
+
+@dp.callback_query(F.data == "adm_wd")
+@admin_only
+async def adm_withdrawals(call: types.CallbackQuery):
+    items = withdraw_db.get("items", {})
+    pending = [(no, w) for no, w in items.items() if w["status"] == "pending"]
+    paid_sum = sum(w["amount"] for w in items.values() if w["status"] == "paid")
+    lines = [f"💸 <b>Виводи</b>\n\nВиплачено всього: {uah(paid_sum)}", f"На перевірці: {len(pending)}\n"]
+    for no, w in pending[:20]:
+        lines.append(
+            f"№{no} · {uah(w['amount'])} · •••• {w['last4']} · {admin_label(w['user_id'])}"
+            + ("" if w.get("admin_msg") else " · ⚠️ повідомлення з карткою не дійшло")
+        )
+    if pending:
+        lines.append("\n<i>Повний номер картки — у повідомленні заявки вище в чаті.</i>")
+    await call.message.answer("\n".join(lines))
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Адмін: топ балансів і обнулення лічильника рулетки
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data == "adm_topbal")
+@admin_only
+async def adm_top_balances(call: types.CallbackQuery):
+    people = [(uid, u) for uid, u in users_db.items() if uid != ADMIN_ID]
+    top = sorted(people, key=lambda x: -x[1].get("balance", 0))[:15]
+    total = sum(u.get("balance", 0) for _uid, u in people)
+    ready = sum(withdrawable(u) for _uid, u in people)
+    lines = [
+        "💰 <b>Топ балансів</b>\n",
+        f"На балансах усього: <b>{total:.2f} грн</b>",
+        f"З них можна вивести на карту: <b>{ready:.2f} грн</b>\n",
+    ]
+    for i, (uid, u) in enumerate(top, 1):
+        if u.get("balance", 0) <= 0:
+            break
+        extra = f" · зароблено {u['earned_total']:.0f}" if u.get("earned_total") else ""
+        lines.append(f"{i}. {admin_label(uid)} — <b>{u['balance']:.2f} грн</b>{extra}")
+    await call.message.answer("\n".join(lines))
+    await call.answer()
+
+
+def roul_reset_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Так, обнулити", callback_data="adm_roul_reset_yes"),
+        InlineKeyboardButton(text="✖️ Ні", callback_data="adm_roul_reset_no"),
+    ]])
+
+
+@dp.callback_query(F.data == "adm_roul_reset")
+@admin_only
+async def adm_roulette_reset(call: types.CallbackQuery):
+    await call.message.answer(
+        f"🎰 Дохід з рулетки зараз: {lottery_revenue_total:.0f} грн.\nОбнулити лічильник (напр. після тестів)?",
+        reply_markup=roul_reset_kb(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.in_({"adm_roul_reset_yes", "adm_roul_reset_no"}))
+@admin_only
+async def adm_roulette_reset_do(call: types.CallbackQuery):
+    global lottery_revenue_total
+    if call.data.endswith("_yes"):
+        lottery_revenue_total = 0.0
+        request_save()
+        text = "✅ Лічильник рулетки обнулено."
+    else:
+        text = "Залишено як є."
+    try:
+        await call.message.edit_text(text, reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+BOT_STARTED_AT = time.time()
+
+
+@dp.message(Command("version"))
+async def version_cmd(message: types.Message):
+    if not _is_admin(message.from_user.id):
+        return
+    up = int(time.time() - BOT_STARTED_AT)
+    blocked = sum(1 for u in users_db.values() if u.get("blocked_bot"))
+    await message.answer(
+        f"🤖 Версія бота: <b>{BOT_VERSION}</b>\n⏱ Працює без перезапуску: {up // 3600} год {up % 3600 // 60} хв\n"
+        f"{calls_status()}\n🚫 Заблокували бота: {blocked}"
+    )
+
+
+@dp.message(Command("resetroulette"))
+async def reset_roulette_cmd(message: types.Message):
+    if not _is_admin(message.from_user.id):
+        return
+    await message.answer(
+        f"🎰 Дохід з рулетки зараз: {lottery_revenue_total:.0f} грн.\nОбнулити лічильник (напр. після тестів)?",
+        reply_markup=roul_reset_kb(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 👥 Живі кімнати: велика кнопка з лічильником, «поки шукаємо — зазирни в кімнату»,
+# пошук у фоні (до 2 год) і теми від бота, коли в кімнаті тихо
+# ---------------------------------------------------------------------------
+BG_SEARCH_MAX = int(os.getenv("BG_SEARCH_MAX", str(2 * 3600)))  # скільки триває пошук у фоні від старту
+ROOM_QUIET_TOPIC = int(os.getenv("ROOM_QUIET_TOPIC", "300"))  # через скільки секунд тиші бот підкидає тему
+bg_notified: dict[int, float] = {}  # кому вже сказали, що пошук іде у фоні
+
+ROOM_QUESTIONS = [
+    "Яка найдивніша річ сталася з вами цього тижня?",
+    "Що вас точно підбадьорить, коли все йде не так?",
+    "Яку пісню ви б поставили на повтор прямо зараз?",
+    "Яке місце в Україні (чи у світі) варто побачити кожному?",
+    "Що ви вмієте, чого ніхто не очікує?",
+    "Яка ваша найкраща порада тому, кому зараз важко?",
+    "Котики, собаки чи ні те ні інше? Аргументуйте 😄",
+    "Який фільм ви переглянули б удруге просто зараз?",
+    "Що б ви зробили з вільним днем без телефона?",
+    "Яка ваша суперсила в компанії друзів?",
+    "Чай чи кава — і в який час доби?",
+    "Яку звичку ви хочете позбутися, а яку завести?",
+]
+
+
+HW_ROOM = {"spooky": "🎃 Страшилки"}  # тимчасова кімната на Хелловін
+
+
+def room_topics_now() -> dict:
+    return {**HW_ROOM, **ROOM_TOPICS} if halloween_active() else ROOM_TOPICS
+
+
+def rooms_online() -> int:
+    return sum(len(r["members"]) for r in rooms.values())
+
+
+def rooms_button_label() -> str:
+    n = rooms_online()
+    return f"{BTN_ROOMS} · {n}" if n >= 2 else BTN_ROOMS
+
+
+def rooms_intro_text(user_id: int) -> str:
+    text = (
+        "👥 <b>Кімнати за інтересами</b>\n\n"
+        f"Обери тему — потрапиш у групу до {ROOM_CAPACITY} людей, які говорять про те саме. "
+        "У кімнатах поки підтримується лише текст — це для безпеки спілкування в групі."
+    )
+    if user_id in queue:
+        text += "\n\n🔔 Пошук співрозмовника не зупиниться — щойно когось знайду, покличу тебе."
+    return text
+
+
+def rooms_open_kb():
+    n = rooms_online()
+    label = f"👥 Зайти в кімнату · там {n}" if n else "👥 Зайти в кімнату"
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, callback_data="rooms_open")]])
+
+
+async def offer_rooms_while_waiting(user_id: int, mode: str):
+    """Поки черга порожня — пропонуємо кімнату, де вже хтось є (пошук триває)."""
+    if mode == "voice" or user_id in user_room or rooms_online() < 1:
+        return
+    await safe_send(
+        user_id,
+        f"👥 Поки шукаємо — зазирни в кімнату: там зараз <b>{rooms_online()}</b>. Пошук при цьому не зупиниться 🔔",
+        reply_markup=rooms_open_kb(),
+    )
+
+
+@dp.callback_query(F.data == "rooms_open")
+async def rooms_open_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    await call.answer()
+    if user_id in banned_users:
+        return
+    if user_id in active_chats:
+        await call.message.answer("Спочатку заверши приватний чат.", reply_markup=get_chat_keyboard())
+        return
+    if user_id in user_room:
+        await call.message.answer("Ти вже в кімнаті 🙂", reply_markup=get_room_keyboard())
+        return
+    await call.message.answer(rooms_intro_text(user_id), reply_markup=get_room_topics_keyboard())
+
+
+async def pull_from_room(user_id: int, quiet: bool = False):
+    """Знайшовся співрозмовник — людина виходить з кімнати в приватний чат (інших попереджаємо)."""
+    room_id = user_room.get(user_id)
+    if room_id is None:
+        return
+    room = rooms.get(room_id)
+    remove_from_room(user_id)
+    if quiet or not room:
+        return
+    nick = esc((users_db.get(user_id) or {}).get("nickname", "Хтось"))
+    for member_id in list(room["members"]):
+        await safe_send(member_id, f"🚪 <b>{nick}</b> пішов у приватний чат.")
+
+
+def bg_search_text() -> str:
+    return (
+        "🔔 Поки нікого немає — я шукаю <b>у фоні</b> ще до двох годин.\n\n"
+        "Займайся своїми справами: щойно хтось з'явиться, я напишу, і ви одразу почнете чат."
+        + (f"\n\n👥 А поки можна поговорити в кімнаті — там зараз {rooms_online()}." if rooms_online() else "")
+    )
+
+
+def bg_search_kb():
+    rows = []
+    if rooms_online():
+        rows.append([InlineKeyboardButton(text="👥 Зайти в кімнату", callback_data="rooms_open")])
+    rows.append([InlineKeyboardButton(text="⏹ Зупинити пошук", callback_data="bg_stop")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "bg_stop")
+async def bg_stop(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if user_id in queue:
+        queue.remove(user_id)
+        bg_notified.pop(user_id, None)
+        await call.answer("Пошук зупинено")
+        await call.message.answer("Пошук зупинено.", reply_markup=get_main_keyboard() if user_id not in user_room else get_room_keyboard())
+    else:
+        await call.answer("Пошук уже не активний")
+
+
+async def rooms_tick():
+    """Раз на хвилину: якщо в кімнаті з 2+ людьми 5 хв тиша — бот підкидає питання для всіх."""
+    now = time.time()
+    for room in list(rooms.values()):
+        members = list(room["members"])
+        if len(members) < 2:
+            continue
+        last = max(room.get("last_msg", now), room.get("last_topic", 0))
+        if now - last < ROOM_QUIET_TOPIC:
+            continue
+        room["last_topic"] = now
+        q = random.choice([x for x in ROOM_QUESTIONS if x != room.get("last_q")])
+        room["last_q"] = q
+        for member_id in members:
+            await safe_send(member_id, f"🎲 <b>Питання для всіх:</b> {q}")
+
+
+# ---------------------------------------------------------------------------
+# 💡 «А ти знав?» і 🎁 рефералка — разом із вечірнім нагадуванням о 20:55 (щоб не слати зайвого):
+# підказка через день, у неділю — запрошення друзів за Premium. Новачкам — окремий рядок.
+# ---------------------------------------------------------------------------
+NEWBIE_MEET_LINE = "\n\n💜 Ти ще ні з ким не поговорив(-ла) — о 21:00 найкращий шанс знайти співрозмовника за секунди!"
+TIPS = [
+    ("🎙 Голосове можна надіслати з маскою — співрозмовник почує робота, привида чи демона, а не тебе.", "🎙 Спробувати маску голосу", "vm_menu"),
+    ("🎭 Якщо розмова зайшла, можна разом зняти маски й побачити одне одного — тільки якщо захочете обоє.", "🔍 Знайти співрозмовника", "wp_go:normal"),
+    ("🎲 У чаті є «Правда чи дія» і «Що обереш?» — ідеально, коли не знаєш, про що говорити.", "🔍 Знайти співрозмовника", "wp_go:normal"),
+    ("💌 Напиши нічний лист — а вранці він прилетить незнайомцю, і тобі — чийсь.", "💌 Написати лист", "tip_cmd:letter"),
+    ("🔮 Щодня новий гороскоп і карта дня Таро.", "✨ Відкрити Розваги", "fun_menu"),
+    ("🤫 Можна анонімно розповісти те, що не скажеш нікому, — у каналі зізнань.", "🤫 Написати зізнання", "tip_cmd:confess"),
+    ("👥 Є кімнати за інтересами — групові чати, де завжди хтось є.", "👥 Відкрити кімнати", "rooms_open"),
+    ("💸 Частину вартості подарунків, які тобі дарують, можна вивести на карту (18+).", "🔍 Знайти співрозмовника", "wp_go:normal"),
+]
+
+
+def evening_extra() -> tuple[str, str, str] | None:
+    """Що додати до вечірнього нагадування сьогодні: (текст, кнопка, callback) або None."""
+    today = kyiv_today()
+    if halloween_active():
+        return (
+            "🎃 <b>Тиждень Хелловіну</b>: маски голосу «Привид» і «Демон» безкоштовно, лімітовані подарунки "
+            f"🎃🦇👻 і «Страшна правда чи дія». А {HW_NIGHT.day}.{HW_NIGHT.month:02d} · {HW_NIGHT.hour}:00 — Ніч страшилок!",
+            "🎃 Що на Хелловін?",
+            "hw_open",
+        )
+    if today.weekday() == 6:  # неділя — рефералка
+        return (
+            f"🎁 <b>Premium безкоштовно</b>: запроси {REFERRAL_PREMIUM_EVERY} друзів — отримаєш "
+            f"{REFERRAL_PREMIUM_DAYS} днів Premium (фільтр за статтю й віком, усі маски голосу, без реклами). "
+            "А топ-3 тижня отримують Premium за конкурсом запрошень!",
+            "🎁 Моє посилання для друзів",
+            "prem_free",
+        )
+    if today.toordinal() % 2:
+        return None
+    text, btn, cb = TIPS[(today.toordinal() // 2) % len(TIPS)]
+    return (f"💡 <b>А ти знав?</b> {text}", btn, cb)
+
+
+def evening_extra_text() -> str:
+    x = evening_extra()
+    return f"\n\n{x[0]}" if x else ""
+
+
+def evening_extra_button():
+    x = evening_extra()
+    return InlineKeyboardButton(text=x[1], callback_data=x[2]) if x else None
+
+
+@dp.callback_query(F.data.startswith("tip_cmd:"))
+async def tip_cmd(call: types.CallbackQuery):
+    what = call.data.split(":", 1)[1]
+    await call.answer()
+    if what == "letter":
+        await call.message.answer("💌 Щоб написати нічний лист, натисни /letter")
+    elif what == "confess":
+        await call.message.answer("🤫 Щоб написати анонімне зізнання, натисни /confess")
+
+
+def is_fresh_newbie(u: dict) -> bool:
+    joined = u.get("joined_at") or 0
+    return not u.get("total_chats") and joined and time.time() - joined < 14 * 86400
+
+
+# ---------------------------------------------------------------------------
+# 🌙 Теплий старт: новачкам, які ще ні з ким не поговорили, — одне «живе» запрошення під час
+# Години знайомств (о 21:10), коли в боті справді багато людей. Лише раз на людину.
+# ---------------------------------------------------------------------------
+WARM_START_MINUTE = 10
+WARM_START_MAX_AGE = 3 * 86400  # лише ті, хто прийшов за останні 3 дні
+WARM_START_MIN_ONLINE = 3  # якщо в боті майже нікого — не кличемо, щоб не розчарувати
+warm_state: dict = {"day": None}
+
+
+def warm_start_recipients() -> list[int]:
+    now = time.time()
+    out = []
+    for uid, u in users_db.items():
+        if uid <= 0 or uid in banned_users or uid in active_chats or uid in queue or uid in user_room:
+            continue
+        if u.get("total_chats") or u.get("warm_start_sent") or not u.get("notify_meet", True):
+            continue
+        joined = u.get("joined_at") or 0
+        if not joined or now - joined > WARM_START_MAX_AGE:
+            continue
+        out.append(uid)
+    return out
+
+
+async def warm_start_tick():
+    now = datetime.now(KYIV_TZ)
+    today = now.date().isoformat()
+    if now.hour != MEET_HOUR or now.minute < WARM_START_MINUTE or warm_state.get("day") == today:
+        return
+    if not _contest_can_write():
+        return
+    warm_state["day"] = today
+    online = online_now()
+    if online < WARM_START_MIN_ONLINE:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")]])
+    sent = 0
+    for uid in warm_start_recipients():
+        users_db[uid]["warm_start_sent"] = True
+        if await safe_send(
+            uid,
+            f"🔥 <b>Зараз Година знайомств</b> — у боті <b>{online}</b> людей онлайн.\n\n"
+            "Ти ще ні з ким не поговорив(-ла) — саме час: натисни, і за кілька секунд я з'єднаю тебе "
+            "з кимось анонімно 💬",
+            reply_markup=kb,
+        ):
+            sent += 1
+        await asyncio.sleep(0.05)
+    if sent:
+        stat_add("warm_start", sent)
+    request_save()
+
+
+# ---------------------------------------------------------------------------
+# 👋 «Ми скучили»: одне повідомлення тим, хто не заходив 4+ дні (не частіше ніж раз на 2 тижні)
+# ---------------------------------------------------------------------------
+COMEBACK_AFTER_DAYS = int(os.getenv("COMEBACK_AFTER_DAYS", "4"))
+COMEBACK_EVERY_DAYS = 14
+COMEBACK_HOUR = 19  # о 19:xx за Києвом — до вечірнього піку
+comeback_state: dict = {"day": None}
+
+
+def comeback_text() -> str:
+    lines = [
+        "👋 <b>Давно не бачились!</b>",
+        "",
+        "За цей час у ANONimchyk:",
+        "🎭 у чаті можна разом зняти маски — тільки якщо захочете обоє",
+        "🎙 голосові з маскою — твій голос ніхто не впізнає",
+        "👥 кімнати, де завжди хтось є",
+    ]
+    if halloween_active():
+        lines.append("🎃 <b>Тиждень Хелловіну</b>: страшні маски голосу безкоштовно й лімітовані подарунки")
+    lines += ["", f"⏰ Найбільше людей онлайн щодня о {MEET_HOUR}:00. Заходь 💜"]
+    return "\n".join(lines)
+
+
+async def comeback_tick():
+    now = datetime.now(KYIV_TZ)
+    today = now.date()
+    if now.hour != COMEBACK_HOUR or comeback_state.get("day") == today.isoformat() or not _contest_can_write():
+        return
+    comeback_state["day"] = today.isoformat()
+    edge = (today - timedelta(days=COMEBACK_AFTER_DAYS)).isoformat()
+    again = (today - timedelta(days=COMEBACK_EVERY_DAYS)).isoformat()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")]])
+    sent = 0
+    for uid, u in list(users_db.items()):
+        if uid <= 0 or uid in banned_users or uid in active_chats or uid in queue or uid in user_room:
+            continue
+        if not u.get("notify_tips", True):
+            continue
+        last = u.get("last_active_day")
+        if not last:
+            u["last_active_day"] = today.isoformat()  # старі користувачі: відлік з сьогодні, без розсилки
+            continue
+        if last > edge or (u.get("comeback_day") or "0") > again:
+            continue
+        u["comeback_day"] = today.isoformat()
+        if await safe_send(uid, comeback_text(), reply_markup=kb):
+            sent += 1
+        await asyncio.sleep(0.05)
+    if sent:
+        stat_add("comeback", sent)
+    request_save()
+
+
+# ---------------------------------------------------------------------------
+# 🎃 Хелловін: тиждень масок (27.10–01.11) — страшні маски голосу безкоштовно, лімітовані подарунки,
+# «Страшна правда чи дія», Ніч страшилок 31.10 о 23:00 і значок 🎃 за чат 31 жовтня
+# ---------------------------------------------------------------------------
+HW_FROM = _parse_dt_env("HALLOWEEN_FROM", "2026-10-27T00:00")
+HW_TO = _parse_dt_env("HALLOWEEN_TO", "2026-11-02T00:00")
+HW_NIGHT = _parse_dt_env("HALLOWEEN_NIGHT", "2026-10-31T23:00")  # Ніч страшилок триває годину
+HW_BADGE_DAY = HW_NIGHT.date().isoformat()  # хто поспілкувався цього дня — отримує значок 🎃
+HW_NIGHT_REMIND_MIN = 5
+HALLOWEEN_VOICES = {"ghost", "demon"}
+
+SPOOKY_TRUTHS = [
+    "Чого ти боявся(-лася) в дитинстві найбільше?",
+    "Розкажи найстрашніший сон, який пам'ятаєш.",
+    "Ти віриш у привидів? Чому?",
+    "Що найдивніше траплялося з тобою вночі?",
+    "У який фільм жахів ти ніколи не подивишся вдруге?",
+    "Чи був у тебе момент, коли здавалося, що вдома хтось є?",
+    "Який звук уночі лякає тебе найбільше?",
+    "Куди б ти ніколи не пішов (не пішла) сам(а) вночі?",
+]
+SPOOKY_DARES = [
+    "Напиши страшну історію рівно в три речення 👻",
+    "Надішли голосове моторошним шепотом (маска «Привид» безкоштовна до 1.11) 🎙",
+    "Опиши свій ідеальний хелловінський костюм одним реченням 🎃",
+    "Вигадай назву для фільму жахів про ваш чат 🎬",
+    "Надішли найстрашніший стікер, який у тебе є 😱",
+    "Розкажи міську легенду зі свого міста (або вигадай її) 🏚",
+]
+
+
+def halloween_active(now: datetime | None = None) -> bool:
+    now = now or datetime.now(KYIV_TZ)
+    return HW_FROM <= now < HW_TO
+
+
+def hw_night_live(now: datetime | None = None) -> bool:
+    now = now or datetime.now(KYIV_TZ)
+    return HW_NIGHT <= now < HW_NIGHT + timedelta(hours=1)
+
+
+def hw_text() -> str:
+    return (
+        "🎃 <b>Тиждень Хелловіну в ANONimchyk</b> · до 1 листопада\n\n"
+        "👻 Маски голосу <b>«Привид»</b> і <b>«Демон»</b> — безкоштовно для всіх: /voice\n"
+        "🎁 Лімітовані подарунки 🎃 Гарбуз · 🦇 Кажан · 👻 Привид — тільки цього тижня\n"
+        "🎲 «Страшна правда чи дія» — у грі під час чату\n"
+        f"🎃 <b>Полювання на гарбузи</b>: після кожного справжнього чату є шанс знайти гарбуз. "
+        f"Збери {HW_PUMPKINS_NEED} — отримаєш Premium на добу!\n\n"
+        f"🌙 <b>{HW_NIGHT.day}.{HW_NIGHT.month:02d} · {HW_NIGHT.hour}:00 — Ніч страшилок!</b> "
+        "Заходь, розкажи страшну історію анонімно. Усі, хто поспілкується "
+        f"{HW_NIGHT.day} жовтня, отримають значок 🎃 у профілі назавжди."
+    )
+
+
+def hw_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")],
+        [InlineKeyboardButton(text="👻 Маска голосу", callback_data="vm_menu")],
+    ])
+
+
+@dp.message(F.text == BTN_HALLOWEEN)
+@dp.message(Command("halloween"))
+async def hw_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    init_user(message.from_user.id)
+    await send_banner(message.from_user.id, "halloween")
+    if not halloween_active():
+        await message.answer("🎃 Хелловінський тиждень уже завершився — до наступного року! 👻")
+        return
+    await message.answer(hw_text(), reply_markup=hw_kb())
+
+
+@dp.callback_query(F.data == "hw_open")
+async def hw_open(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer(hw_text() if halloween_active() else "🎃 Хелловін уже минув 👻", reply_markup=hw_kb())
+
+
+def hw_mark_badge(*uids: int):
+    if datetime.now(KYIV_TZ).date().isoformat() != HW_BADGE_DAY:
+        return
+    for x in uids:
+        u = users_db.get(x)
+        if u is not None and not u.get("hw2026"):
+            u["hw2026"] = True
+
+
+HW_PUMPKINS_NEED = 3
+HW_PUMPKIN_CHANCE = float(os.getenv("HW_PUMPKIN_CHANCE", "0.35"))
+HW_PUMPKIN_PREMIUM_MAX = 2  # скільки разів за Хелловін можна виграти Premium гарбузами
+
+
+async def hw_pumpkin_roll(user_id: int):
+    u = users_db.get(user_id)
+    if u is None or u.get("hw_prem_got", 0) >= HW_PUMPKIN_PREMIUM_MAX or random.random() > HW_PUMPKIN_CHANCE:
+        return
+    n = u.get("hw_pumpkins", 0) + 1
+    if n >= HW_PUMPKINS_NEED:
+        u["hw_pumpkins"] = 0
+        u["hw_prem_got"] = u.get("hw_prem_got", 0) + 1
+        current = u["perks"].get("premium", 0)
+        if current != float("inf"):
+            u["perks"]["premium"] = max(time.time(), current) + DAY
+        request_save()
+        await safe_send(user_id, "🎃🎃🎃 <b>Три гарбузи!</b> Premium на добу вже активовано — фільтри й усі маски голосу твої 💜")
+        return
+    u["hw_pumpkins"] = n
+    stat_add("pumpkins")
+    request_save()
+    await safe_send(
+        user_id,
+        f"🎃 Ти знайшов(-ла) гарбуз! <b>{n}/{HW_PUMPKINS_NEED}</b>\n"
+        f"Збери {HW_PUMPKINS_NEED} — і отримаєш Premium на добу. Гарбузи ховаються в справжніх розмовах 😉",
+    )
+
+
+async def hw_night_tick():
+    """31.10 о 22:55 — запрошення на Ніч страшилок (тим, хто отримує нагадування про Годину знайомств)."""
+    now = datetime.now(KYIV_TZ)
+    start = HW_NIGHT - timedelta(minutes=HW_NIGHT_REMIND_MIN)
+    if not (start <= now < HW_NIGHT) or launch_state.get("hw_night") or not _contest_can_write():
+        return
+    launch_state["hw_night"] = True
+    request_save()
+    text = (
+        f"🌙 <b>Ніч страшилок — о {HW_NIGHT.hour}:00!</b> 👻\n\n"
+        "Заходь, знайди співрозмовника й розкажіть одне одному найстрашнішу історію — анонімно.\n"
+        "Маска голосу «Привид» безкоштовна — розкажи моторошним голосом 🎙\n\n"
+        "🎃 Усі, хто поспілкується сьогодні, отримають значок у профілі назавжди!"
+    )
+    kb = hw_kb()
+    for uid in meet_recipients():
+        if uid in active_chats or uid in queue:
+            continue
+        await safe_send(uid, text, reply_markup=kb)
+        await asyncio.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# 🚨 Скарги з причиною і доказом від постраждалого (як у великих месенджерах):
+# під час чату в пам'яті лише останні 10 повідомлень кожного співрозмовника (текст; медіа — позначкою),
+# після чату вони стираються. Модератор отримує їх ТІЛЬКИ якщо той, хто скаржиться, сам погодився.
+# Самі повідомлення в базі не зберігаються — лише в повідомленні адміну.
+# ---------------------------------------------------------------------------
+EVIDENCE_KEEP = 10
+MINOR_FAST_BAN = 2  # стільки скарг «👶» від різних людей — бан одразу, до перевірки адміном
+recent_msgs: dict[int, list] = {}  # user_id -> [(час, текст)] його останні повідомлення в поточному чаті
+report_pending: dict[int, dict] = {}  # хто скаржиться -> {"on", "msgs", "ts", "reason"}
+
+REPORT_REASONS = {
+    "insult": "🤬 Образи, погрози",
+    "nsfw": "🔞 Непристойності",
+    "spam": "📢 Спам, реклама, шахрайство",
+    "minor": "👶 Неповнолітній / пристає до неповнолітніх",
+    "other": "❓ Інше",
+}
+
+
+def msg_mark(message) -> str:
+    text = getattr(message, "text", None)
+    if text is not None:
+        return text[:500]
+    if getattr(message, "photo", None):
+        mark = "[фото]"
+    elif getattr(message, "voice", None):
+        mark = "[голосове]"
+    elif getattr(message, "video_note", None):
+        mark = "[кружечок]"
+    elif getattr(message, "video", None):
+        mark = "[відео]"
+    elif getattr(message, "animation", None):
+        mark = "[GIF]"
+    elif getattr(message, "sticker", None):
+        mark = "[стікер]"
+    else:
+        mark = "[файл]"
+    cap = getattr(message, "caption", None)
+    return mark + (f" {cap[:300]}" if cap else "")
+
+
+def remember_recent(user_id: int, text: str):
+    buf = recent_msgs.setdefault(user_id, [])
+    buf.append((time.time(), text))
+    del buf[:-EVIDENCE_KEEP]
+
+
+def forget_recent(*uids: int):
+    for x in uids:
+        recent_msgs.pop(x, None)
+
+
+def report_reason_kb():
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"rep_r:{k}")] for k, label in REPORT_REASONS.items()]
+    rows.append([InlineKeyboardButton(text="✖️ Скасувати", callback_data="rep_r:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def report_history(target: int) -> str:
+    mine = [r for r in reports if r.get("on") == target]
+    if not mine:
+        return "перша скарга"
+    by = {}
+    for r in mine:
+        k = REPORT_REASONS.get(r.get("reason"), "без причини").split(" ")[0]
+        by[k] = by.get(k, 0) + 1
+    u = users_db.get(target) or {}
+    return f"усього {len(mine)}: " + " ".join(f"{k}×{n}" for k, n in by.items()) + f" · {rating_line(u)}"
+
+
+@dp.callback_query(F.data.startswith("rep_r:"))
+async def report_reason_pick(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    reason = call.data.split(":", 1)[1]
+    pend = report_pending.get(user_id)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if reason == "cancel" or pend is None or time.time() - pend["ts"] > 600:
+        report_pending.pop(user_id, None)
+        await call.answer("Скасовано" if reason == "cancel" else "Скарга застаріла")
+        return
+    pend["reason"] = reason if reason in REPORT_REASONS else "other"
+    await call.answer()
+    if pend["msgs"]:
+        await call.message.answer(
+            "📎 Додати до скарги останні повідомлення співрозмовника як доказ?\n"
+            "<i>Їх побачить лише модератор. Фото й відео не передаються.</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Так, додати", callback_data="rep_e:1"),
+                InlineKeyboardButton(text="Ні", callback_data="rep_e:0"),
+            ]]),
+        )
+        return
+    await submit_report(call.message, user_id, with_evidence=False)
+
+
+@dp.callback_query(F.data.startswith("rep_e:"))
+async def report_evidence_pick(call: types.CallbackQuery):
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+    if call.from_user.id not in report_pending:
+        return
+    await submit_report(call.message, call.from_user.id, with_evidence=call.data.endswith("1"))
 
 
 # === КІНЕЦЬ part5.py ===
