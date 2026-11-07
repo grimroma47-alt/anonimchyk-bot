@@ -622,5 +622,14 @@ except ImportError:
 
     logging.warning("🌐 Не знайдено lang_ru2.py — частина російського перекладу вимкнена")
 
+try:
+    from lang_ru3 import RU_PAIRS3
+
+    RU_PAIRS.update(RU_PAIRS3)
+except ImportError:
+    import logging
+
+    logging.warning("🌐 Не знайдено lang_ru3.py — частина російського перекладу вимкнена")
+
 
 # === КІНЕЦЬ lang_ru.py ===

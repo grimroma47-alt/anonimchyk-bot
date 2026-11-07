@@ -1,3 +1,226 @@
+def bg_search_text() -> str:
+    return (
+        "🔔 Поки нікого немає — я шукаю <b>у фоні</b> ще до двох годин.\n\n"
+        "Займайся своїми справами: щойно хтось з'явиться, я напишу, і ви одразу почнете чат."
+        + (f"\n\n👥 А поки можна поговорити в кімнаті — там зараз {rooms_online()}." if rooms_online() else "")
+    )
+
+
+def bg_search_kb():
+    rows = []
+    if rooms_online():
+        rows.append([InlineKeyboardButton(text="👥 Зайти в кімнату", callback_data="rooms_open")])
+    rows.append([InlineKeyboardButton(text="⏹ Зупинити пошук", callback_data="bg_stop")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "bg_stop")
+async def bg_stop(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if user_id in queue:
+        queue.remove(user_id)
+        bg_notified.pop(user_id, None)
+        await call.answer("Пошук зупинено")
+        await call.message.answer("Пошук зупинено.", reply_markup=get_main_keyboard() if user_id not in user_room else get_room_keyboard())
+    else:
+        await call.answer("Пошук уже не активний")
+
+
+async def rooms_tick():
+    """Раз на хвилину: якщо в кімнаті з 2+ людьми 5 хв тиша — бот підкидає питання для всіх."""
+    now = time.time()
+    for room in list(rooms.values()):
+        members = list(room["members"])
+        if len(members) < 2:
+            continue
+        last = max(room.get("last_msg", now), room.get("last_topic", 0))
+        if now - last < ROOM_QUIET_TOPIC:
+            continue
+        room["last_topic"] = now
+        q = random.choice([x for x in ROOM_QUESTIONS if x != room.get("last_q")])
+        room["last_q"] = q
+        for member_id in members:
+            await safe_send(member_id, f"🎲 <b>Питання для всіх:</b> {q}")
+
+
+# ---------------------------------------------------------------------------
+# 💡 «А ти знав?» і 🎁 рефералка — разом із вечірнім нагадуванням о 20:55 (щоб не слати зайвого):
+# підказка через день, у неділю — запрошення друзів за Premium. Новачкам — окремий рядок.
+# ---------------------------------------------------------------------------
+NEWBIE_MEET_LINE = "\n\n💜 Ти ще ні з ким не поговорив(-ла) — о 21:00 найкращий шанс знайти співрозмовника за секунди!"
+TIPS = [
+    ("🎙 Голосове можна надіслати з маскою — співрозмовник почує робота, привида чи демона, а не тебе.", "🎙 Спробувати маску голосу", "vm_menu"),
+    ("🎭 Якщо розмова зайшла, можна разом зняти маски й побачити одне одного — тільки якщо захочете обоє.", "🔍 Знайти співрозмовника", "wp_go:normal"),
+    ("🎲 У чаті є «Правда чи дія» і «Що обереш?» — ідеально, коли не знаєш, про що говорити.", "🔍 Знайти співрозмовника", "wp_go:normal"),
+    ("💌 Напиши нічний лист — а вранці він прилетить незнайомцю, і тобі — чийсь.", "💌 Написати лист", "tip_cmd:letter"),
+    ("🔮 Щодня новий гороскоп і карта дня Таро.", "✨ Відкрити Розваги", "fun_menu"),
+    ("🤫 Можна анонімно розповісти те, що не скажеш нікому, — у каналі зізнань.", "🤫 Написати зізнання", "tip_cmd:confess"),
+    ("👥 Є кімнати за інтересами — групові чати, де завжди хтось є.", "👥 Відкрити кімнати", "rooms_open"),
+    ("💸 Частину вартості подарунків, які тобі дарують, можна вивести на карту (18+).", "🔍 Знайти співрозмовника", "wp_go:normal"),
+]
+
+
+def evening_extra() -> tuple[str, str, str] | None:
+    """Що додати до вечірнього нагадування сьогодні: (текст, кнопка, callback) або None."""
+    today = kyiv_today()
+    if halloween_active():
+        return (
+            "🎃 <b>Тиждень Хелловіну</b>: маски голосу «Привид» і «Демон» безкоштовно, лімітовані подарунки "
+            f"🎃🦇👻 і «Страшна правда чи дія». А {HW_NIGHT.day}.{HW_NIGHT.month:02d} · {HW_NIGHT.hour}:00 — Ніч страшилок!",
+            "🎃 Що на Хелловін?",
+            "hw_open",
+        )
+    if today.weekday() == 6:  # неділя — рефералка
+        return (
+            f"🎁 <b>Premium безкоштовно</b>: запроси {REFERRAL_PREMIUM_EVERY} друзів — отримаєш "
+            f"{REFERRAL_PREMIUM_DAYS} днів Premium (фільтр за статтю й віком, усі маски голосу, без реклами). "
+            "А топ-3 тижня отримують Premium за конкурсом запрошень!",
+            "🎁 Моє посилання для друзів",
+            "prem_free",
+        )
+    if today.toordinal() % 2:
+        return None
+    text, btn, cb = TIPS[(today.toordinal() // 2) % len(TIPS)]
+    return (f"💡 <b>А ти знав?</b> {text}", btn, cb)
+
+
+def evening_extra_text() -> str:
+    x = evening_extra()
+    return f"\n\n{x[0]}" if x else ""
+
+
+def evening_extra_button():
+    x = evening_extra()
+    return InlineKeyboardButton(text=x[1], callback_data=x[2]) if x else None
+
+
+@dp.callback_query(F.data.startswith("tip_cmd:"))
+async def tip_cmd(call: types.CallbackQuery):
+    what = call.data.split(":", 1)[1]
+    await call.answer()
+    if what == "letter":
+        await call.message.answer("💌 Щоб написати нічний лист, натисни /letter")
+    elif what == "confess":
+        await call.message.answer("🤫 Щоб написати анонімне зізнання, натисни /confess")
+
+
+def is_fresh_newbie(u: dict) -> bool:
+    joined = u.get("joined_at") or 0
+    return not u.get("total_chats") and joined and time.time() - joined < 14 * 86400
+
+
+# ---------------------------------------------------------------------------
+# 🌙 Теплий старт: новачкам, які ще ні з ким не поговорили, — одне «живе» запрошення під час
+# Години знайомств (о 21:10), коли в боті справді багато людей. Лише раз на людину.
+# ---------------------------------------------------------------------------
+WARM_START_MINUTE = 10
+WARM_START_MAX_AGE = 3 * 86400  # лише ті, хто прийшов за останні 3 дні
+WARM_START_MIN_ONLINE = 3  # якщо в боті майже нікого — не кличемо, щоб не розчарувати
+warm_state: dict = {"day": None}
+
+
+def warm_start_recipients() -> list[int]:
+    now = time.time()
+    out = []
+    for uid, u in users_db.items():
+        if uid <= 0 or uid in banned_users or uid in active_chats or uid in queue or uid in user_room:
+            continue
+        if u.get("total_chats") or u.get("warm_start_sent") or not u.get("notify_meet", True):
+            continue
+        joined = u.get("joined_at") or 0
+        if not joined or now - joined > WARM_START_MAX_AGE:
+            continue
+        out.append(uid)
+    return out
+
+
+async def warm_start_tick():
+    now = datetime.now(KYIV_TZ)
+    today = now.date().isoformat()
+    if now.hour != MEET_HOUR or now.minute < WARM_START_MINUTE or warm_state.get("day") == today:
+        return
+    if not _contest_can_write():
+        return
+    warm_state["day"] = today
+    online = online_now()
+    if online < WARM_START_MIN_ONLINE:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")]])
+    sent = 0
+    for uid in warm_start_recipients():
+        users_db[uid]["warm_start_sent"] = True
+        if await safe_send(
+            uid,
+            f"🔥 <b>Зараз Година знайомств</b> — у боті <b>{online}</b> людей онлайн.\n\n"
+            "Ти ще ні з ким не поговорив(-ла) — саме час: натисни, і за кілька секунд я з'єднаю тебе "
+            "з кимось анонімно 💬",
+            reply_markup=kb,
+        ):
+            sent += 1
+        await asyncio.sleep(0.05)
+    if sent:
+        stat_add("warm_start", sent)
+    request_save()
+
+
+# ---------------------------------------------------------------------------
+# 👋 «Ми скучили»: одне повідомлення тим, хто не заходив 4+ дні (не частіше ніж раз на 2 тижні)
+# ---------------------------------------------------------------------------
+COMEBACK_AFTER_DAYS = int(os.getenv("COMEBACK_AFTER_DAYS", "4"))
+COMEBACK_EVERY_DAYS = 14
+COMEBACK_HOUR = 19  # о 19:xx за Києвом — до вечірнього піку
+comeback_state: dict = {"day": None}
+
+
+def comeback_text() -> str:
+    lines = [
+        "👋 <b>Давно не бачились!</b>",
+        "",
+        "За цей час у ANONimchyk:",
+        "🎭 у чаті можна разом зняти маски — тільки якщо захочете обоє",
+        "🎙 голосові з маскою — твій голос ніхто не впізнає",
+        "👥 кімнати, де завжди хтось є",
+    ]
+    if halloween_active():
+        lines.append("🎃 <b>Тиждень Хелловіну</b>: страшні маски голосу безкоштовно й лімітовані подарунки")
+    lines += ["", f"⏰ Найбільше людей онлайн щодня о {MEET_HOUR}:00. Заходь 💜"]
+    return "\n".join(lines)
+
+
+async def comeback_tick():
+    now = datetime.now(KYIV_TZ)
+    today = now.date()
+    if now.hour != COMEBACK_HOUR or comeback_state.get("day") == today.isoformat() or not _contest_can_write():
+        return
+    comeback_state["day"] = today.isoformat()
+    edge = (today - timedelta(days=COMEBACK_AFTER_DAYS)).isoformat()
+    again = (today - timedelta(days=COMEBACK_EVERY_DAYS)).isoformat()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")]])
+    sent = 0
+    for uid, u in list(users_db.items()):
+        if uid <= 0 or uid in banned_users or uid in active_chats or uid in queue or uid in user_room:
+            continue
+        if not u.get("notify_tips", True):
+            continue
+        last = u.get("last_active_day")
+        if not last:
+            u["last_active_day"] = today.isoformat()  # старі користувачі: відлік з сьогодні, без розсилки
+            continue
+        if last > edge or (u.get("comeback_day") or "0") > again:
+            continue
+        u["comeback_day"] = today.isoformat()
+        if await safe_send(uid, comeback_text(), reply_markup=kb):
+            sent += 1
+        await asyncio.sleep(0.05)
+    if sent:
+        stat_add("comeback", sent)
+    request_save()
+
+
 # ---------------------------------------------------------------------------
 # 🎃 Хелловін: тиждень масок (27.10–01.11) — страшні маски голосу безкоштовно, лімітовані подарунки,
 # «Страшна правда чи дія», Ніч страшилок 31.10 о 23:00 і значок 🎃 за чат 31 жовтня
@@ -829,7 +1052,6 @@ async def relay_messages(message: types.Message):
         )
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, msg_mark(message))
-        chatlog_record(user_id, message)
         on_chat_message(user_id)
     except TelegramAPIError:
         end_chat(user_id)
@@ -875,6 +1097,8 @@ async def setup_bot_commands():
         types.BotCommand(command="balance", description="💰 Мій баланс"),
         types.BotCommand(command="gifts", description="🎁 Магазин подарунків"),
         types.BotCommand(command="invite", description="🤝 Запросити друга"),
+        types.BotCommand(command="recent", description="🔁 Минулі розмови"),
+        types.BotCommand(command="donate", description="💙 Підтримати проект"),
         types.BotCommand(command="premium", description="💎 Premium"),
         types.BotCommand(command="confess", description="🤫 Анонімне зізнання"),
         types.BotCommand(command="edit_profile", description="✏️ Мій профіль"),
@@ -921,7 +1145,6 @@ async def main():
     lease_task = asyncio.create_task(lease_heartbeat_loop())
     mono_task = asyncio.create_task(mono_poll_loop())
     contest_task = asyncio.create_task(contest_loop())
-    chatlog_task = asyncio.create_task(chatlog_reset_loop())
     try:
         # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
         # Telegram API не вбивала весь процес (і "Application exited early" на Render).
@@ -959,7 +1182,6 @@ async def main():
         lease_task.cancel()
         mono_task.cancel()
         contest_task.cancel()
-        chatlog_task.cancel()
         await save_state_to_db()  # фінальне збереження при зупинці (деплой/перезапуск)
         await release_lease()  # тепер нова копія може забрати свіжі дані
         await bot.session.close()

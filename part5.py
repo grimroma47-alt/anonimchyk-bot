@@ -1,3 +1,231 @@
+@dp.message(Command("best"))
+async def top_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    init_user(message.from_user.id)
+    await message.answer(top_text(message.from_user.id))
+
+
+def contest_on_real_chat(user_id: int):
+    """Запрошений друг провів перший справжній чат — зараховуємо його тому, хто запросив."""
+    u = users_db.get(user_id)
+    if not u or u.get("ref_qualified") or not u.get("referred_by"):
+        return
+    u["ref_qualified"] = True
+    ref_id = u["referred_by"]
+    if ref_id not in users_db or ref_id in banned_users:
+        return
+    if ref_contest.get("week") != contest_week_key():
+        ref_contest["week"] = ref_contest.get("week") or contest_week_key()
+    entry = ref_contest.setdefault("counts", {}).setdefault(ref_id, [0, 0.0])
+    entry[0] += 1
+    entry[1] = time.time()
+    place = next((i for i, (uid, _n) in enumerate(contest_ranking(), 1) if uid == ref_id), None)
+    _notify_later(
+        ref_id,
+        f"🏆 Твій друг поспілкувався в першому чаті — <b>+1 у конкурсі запрошень</b>!\n"
+        f"Цього тижня: {entry[0]} · місце: {place}. Деталі: /contest",
+    )
+    request_save()
+
+
+def _ref_link(user_id: int) -> str:
+    return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}" if BOT_USERNAME else ""
+
+
+def contest_text(user_id: int) -> str:
+    week = ref_contest.get("week") or contest_week_key()
+    ranking = contest_ranking()
+    lines = [
+        f"🏆 <b>Конкурс запрошень</b> · {contest_week_range(week)}",
+        "",
+        "Запрошуй друзів за своїм посиланням. Друг зараховується, коли поспілкується "
+        "в першому чаті (від 1 хв).",
+        "",
+        "<b>Призи щонеділі опівночі:</b>",
+    ]
+    lines += [f"{medal} Premium на {days} днів" for medal, days in CONTEST_PRIZES]
+    lines.append(f"<i>Щоб потрапити в призери — мінімум {CONTEST_MIN_INVITES} друзі.</i>")
+    lines.append("")
+    if ranking:
+        lines.append("<b>Топ тижня:</b>")
+        medals = [m for m, _d in CONTEST_PRIZES]
+        for i, (uid, n) in enumerate(ranking[:CONTEST_TOP_SHOWN], 1):
+            mark = medals[i - 1] if i <= len(medals) else f"{i}."
+            you = " ← ти" if uid == user_id else ""
+            nick = esc(users_db.get(uid, {}).get("nickname", "Користувач"))
+            lines.append(f"{mark} {nick} — {n}{you}")
+    else:
+        lines.append("Цього тижня ще ніхто не запросив друзів — стань першим! 🚀")
+    mine = next(((i, n) for i, (uid, n) in enumerate(ranking, 1) if uid == user_id), None)
+    lines.append("")
+    if mine:
+        lines.append(f"📍 Ти: <b>{mine[1]}</b> {_plural(mine[1], 'друг', 'друзі', 'друзів')} · <b>{mine[0]}</b> місце")
+    else:
+        lines.append("📍 Ти поки не в рейтингу — надішли посилання другу!")
+    history = ref_contest.get("history") or []
+    if history and history[-1].get("winners"):
+        last = history[-1]
+        names = ", ".join(
+            f"{w[2].split()[0]} {esc(users_db.get(w[0], {}).get('nickname', '?'))}" for w in last["winners"]
+        )
+        lines.append(f"\n🎉 Переможці минулого тижня: {names}")
+    link = _ref_link(user_id)
+    if link:
+        lines.append(f"\n🔗 Твоє посилання:\n<code>{esc(link)}</code>")
+    return "\n".join(lines)
+
+
+def contest_keyboard(user_id: int):
+    link = _ref_link(user_id)
+    rows = []
+    if link:
+        share_text = "Заходь в ANONimchyk — анонімний чат для знайомств і розмов 🎭"
+        share = f"https://t.me/share/url?url={quote(link)}&text={quote(share_text)}"
+        rows.append([InlineKeyboardButton(text="📤 Надіслати другу", url=share)])
+    rows.append([InlineKeyboardButton(text="🔄 Оновити", callback_data="contest_open")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("contest"))
+async def contest_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    init_user(message.from_user.id)
+    await contest_tick()
+    await message.answer(contest_text(message.from_user.id), reply_markup=contest_keyboard(message.from_user.id))
+
+
+@dp.callback_query(F.data == "contest_open")
+async def contest_open(call: types.CallbackQuery):
+    init_user(call.from_user.id)
+    await contest_tick()
+    text, kb = contest_text(call.from_user.id), contest_keyboard(call.from_user.id)
+    if call.message.text and call.message.text.startswith("🏆 Конкурс запрошень"):
+        try:
+            await call.message.edit_text(text, reply_markup=kb)
+        except TelegramAPIError:
+            pass  # нічого не змінилось
+        await call.answer("Оновлено")
+        return
+    await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Правила, безпека, підтримка з оплат
+# ---------------------------------------------------------------------------
+RULES_TEXT = (
+    "📜 <b>Правила ANONimchyk</b>\n\n"
+    "1. <b>Повага.</b> Без образ, погроз, цькування й дискримінації.\n"
+    "2. <b>Без спаму.</b> Ніякої реклами, посилань, продажів і «заробітку».\n"
+    "3. <b>Інтимне — лише у ❤️ флірт-чаті (18+)</b> і тільки за взаємною згодою. "
+    "Будь-який такий контент із неповнолітніми чи для неповнолітніх — бан назавжди.\n"
+    "4. <b>Не вимагай</b> фото, номер, адресу, гроші чи паролі. Не публікуй чужі особисті дані.\n"
+    "5. <b>Не видавай себе</b> за іншу людину чи адміністрацію, не шахрай.\n"
+    "6. <b>Вказуй справжній вік.</b> Флірт-чат — лише з 18 років.\n\n"
+    f"⚖️ Порушення → скарга «{BTN_REPORT}». Після кількох скарг акаунт блокується автоматично, "
+    "за серйозні порушення — бан адміністратором без попередження.\n\n"
+    "📄 Повідомлення в чатах не зберігаються. Лише якщо на тебе поскаржаться, той, хто скаржиться, "
+    "може додати твої останні повідомлення (текст) як доказ для модератора.\n\n"
+    "🤫 Бот не показує співрозмовнику твій Telegram-акаунт. Але свою анонімність бережи і сам — "
+    "детальніше: /safety\n"
+    "💳 Питання щодо оплат: /paysupport"
+)
+
+SAFETY_TEXT = (
+    "🛡 <b>Безпека в анонімному чаті</b>\n\n"
+    "• <b>Не кажи</b>, де живеш, у якій школі вчишся, своє прізвище та номер телефону.\n"
+    "• <b>Не надсилай</b> фото, особливо особисті. Надіслане вже не повернеш.\n"
+    "• <b>Не переходь</b> у інші месенджери чи соцмережі з незнайомцями й не погоджуйся на зустрічі.\n"
+    "• <b>Ніхто не має права</b> вимагати від тебе фото, гроші, коди чи паролі.\n"
+    "• Якщо співрозмовник лякає, тисне чи пише неприємне — просто завершуй чат.\n\n"
+    f"🚨 <b>{BTN_REPORT}</b> — скарга, адміністратор перевірить.\n"
+    f"🚫 <b>{BTN_BLACKLIST_ADD}</b> — ця людина більше ніколи тобі не трапиться.\n\n"
+    "Якщо сталося щось серйозне — розкажи дорослому, якому довіряєш. "
+    "В Україні безкоштовно допомагає дитяча лінія <b>116 111</b>."
+)
+
+MATCH_SAFETY_REMINDER = (
+    "🛡 Пам'ятай: не кажи, де живеш, і не надсилай фото незнайомцям. "
+    f"Щось не так — «{BTN_REPORT}» або «{BTN_BLACKLIST_ADD}». Більше: /safety"
+)
+MATCH_SAFETY_EVERY = 24 * 3600  # коротке нагадування неповнолітнім — не частіше разу на добу
+_match_safety_last: dict[int, float] = {}
+
+PAYSUPPORT_TEXT = (
+    "💳 <b>Питання щодо оплат</b>\n\n"
+    "Баланс у боті — внутрішня валюта: ним оплачуються Premium, подарунки та послуги в магазині. "
+    "Гроші з балансу не виводяться.\n\n"
+    "<b>Оплатив, а баланс не поповнився?</b>\n"
+    "• Банка monobank / реквізити: зарахування може тривати до кількох хвилин, "
+    "а якщо в коментарі не було коду — до перевірки адміністратором.\n"
+    "• Напиши в підтримку: <b>суму, час оплати</b> і код заявки <b>P…</b> (якщо був) "
+    "— і ми все перевіримо.\n\n"
+    "Повернення коштів можливе у разі технічної помилки, коли оплачену послугу не було надано."
+)
+
+
+async def maybe_send_safety_memo(user_id: int, u: dict):
+    """Повна пам'ятка неповнолітнім — один раз (після анкети чи зміни віку)."""
+    if is_minor(u) and not u.get("safety_memo_shown"):
+        u["safety_memo_shown"] = True
+        request_save()
+        await safe_send(user_id, SAFETY_TEXT)
+
+
+async def send_match_safety(user_id: int, u: dict):
+    if not is_minor(u):
+        return
+    if not u.get("safety_memo_shown"):
+        await maybe_send_safety_memo(user_id, u)
+        _match_safety_last[user_id] = time.time()
+        return
+    now = time.time()
+    if now - _match_safety_last.get(user_id, 0) < MATCH_SAFETY_EVERY:
+        return
+    _match_safety_last[user_id] = now
+    await safe_send(user_id, MATCH_SAFETY_REMINDER)
+
+
+@dp.message(Command("rules", "terms"))
+async def rules_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(RULES_TEXT)
+
+
+@dp.message(Command("safety"))
+async def safety_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(SAFETY_TEXT)
+
+
+@dp.message(Command("paysupport"))
+async def paysupport_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        PAYSUPPORT_TEXT,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="💬 Написати в підтримку", callback_data="support_start")]]
+        ),
+    )
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# 📍 Де я зараз: статус чату/пошуку/кімнати і швидке повернення
+# ---------------------------------------------------------------------------
+def chat_mode_label(mode: str) -> str:
+    if mode == "flirt":
+        return "❤️ Флірт-чат"
+    if mode == "voice":
+        return "🎙 Голосовий чат"
+    if mode.startswith("int:"):
+        return f"🧩 Чат за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}"
+    return "🔍 Анонімний чат"
+
+
 def where_text(user_id: int) -> str:
     now = time.time()
     fid = friend_mode.get(user_id)
@@ -930,7 +1158,6 @@ async def relay_masked_voice(message: types.Message, user_id: int, partner_id: i
         )
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, "[голосове з маскою]")
-        chatlog_record(user_id, message)
         on_chat_message(user_id)
         stat_add("voice_mask")
     except TelegramAPIError:
@@ -2042,229 +2269,6 @@ async def pull_from_room(user_id: int, quiet: bool = False):
     nick = esc((users_db.get(user_id) or {}).get("nickname", "Хтось"))
     for member_id in list(room["members"]):
         await safe_send(member_id, f"🚪 <b>{nick}</b> пішов у приватний чат.")
-
-
-def bg_search_text() -> str:
-    return (
-        "🔔 Поки нікого немає — я шукаю <b>у фоні</b> ще до двох годин.\n\n"
-        "Займайся своїми справами: щойно хтось з'явиться, я напишу, і ви одразу почнете чат."
-        + (f"\n\n👥 А поки можна поговорити в кімнаті — там зараз {rooms_online()}." if rooms_online() else "")
-    )
-
-
-def bg_search_kb():
-    rows = []
-    if rooms_online():
-        rows.append([InlineKeyboardButton(text="👥 Зайти в кімнату", callback_data="rooms_open")])
-    rows.append([InlineKeyboardButton(text="⏹ Зупинити пошук", callback_data="bg_stop")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.callback_query(F.data == "bg_stop")
-async def bg_stop(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    if user_id in queue:
-        queue.remove(user_id)
-        bg_notified.pop(user_id, None)
-        await call.answer("Пошук зупинено")
-        await call.message.answer("Пошук зупинено.", reply_markup=get_main_keyboard() if user_id not in user_room else get_room_keyboard())
-    else:
-        await call.answer("Пошук уже не активний")
-
-
-async def rooms_tick():
-    """Раз на хвилину: якщо в кімнаті з 2+ людьми 5 хв тиша — бот підкидає питання для всіх."""
-    now = time.time()
-    for room in list(rooms.values()):
-        members = list(room["members"])
-        if len(members) < 2:
-            continue
-        last = max(room.get("last_msg", now), room.get("last_topic", 0))
-        if now - last < ROOM_QUIET_TOPIC:
-            continue
-        room["last_topic"] = now
-        q = random.choice([x for x in ROOM_QUESTIONS if x != room.get("last_q")])
-        room["last_q"] = q
-        for member_id in members:
-            await safe_send(member_id, f"🎲 <b>Питання для всіх:</b> {q}")
-
-
-# ---------------------------------------------------------------------------
-# 💡 «А ти знав?» і 🎁 рефералка — разом із вечірнім нагадуванням о 20:55 (щоб не слати зайвого):
-# підказка через день, у неділю — запрошення друзів за Premium. Новачкам — окремий рядок.
-# ---------------------------------------------------------------------------
-NEWBIE_MEET_LINE = "\n\n💜 Ти ще ні з ким не поговорив(-ла) — о 21:00 найкращий шанс знайти співрозмовника за секунди!"
-TIPS = [
-    ("🎙 Голосове можна надіслати з маскою — співрозмовник почує робота, привида чи демона, а не тебе.", "🎙 Спробувати маску голосу", "vm_menu"),
-    ("🎭 Якщо розмова зайшла, можна разом зняти маски й побачити одне одного — тільки якщо захочете обоє.", "🔍 Знайти співрозмовника", "wp_go:normal"),
-    ("🎲 У чаті є «Правда чи дія» і «Що обереш?» — ідеально, коли не знаєш, про що говорити.", "🔍 Знайти співрозмовника", "wp_go:normal"),
-    ("💌 Напиши нічний лист — а вранці він прилетить незнайомцю, і тобі — чийсь.", "💌 Написати лист", "tip_cmd:letter"),
-    ("🔮 Щодня новий гороскоп і карта дня Таро.", "✨ Відкрити Розваги", "fun_menu"),
-    ("🤫 Можна анонімно розповісти те, що не скажеш нікому, — у каналі зізнань.", "🤫 Написати зізнання", "tip_cmd:confess"),
-    ("👥 Є кімнати за інтересами — групові чати, де завжди хтось є.", "👥 Відкрити кімнати", "rooms_open"),
-    ("💸 Частину вартості подарунків, які тобі дарують, можна вивести на карту (18+).", "🔍 Знайти співрозмовника", "wp_go:normal"),
-]
-
-
-def evening_extra() -> tuple[str, str, str] | None:
-    """Що додати до вечірнього нагадування сьогодні: (текст, кнопка, callback) або None."""
-    today = kyiv_today()
-    if halloween_active():
-        return (
-            "🎃 <b>Тиждень Хелловіну</b>: маски голосу «Привид» і «Демон» безкоштовно, лімітовані подарунки "
-            f"🎃🦇👻 і «Страшна правда чи дія». А {HW_NIGHT.day}.{HW_NIGHT.month:02d} · {HW_NIGHT.hour}:00 — Ніч страшилок!",
-            "🎃 Що на Хелловін?",
-            "hw_open",
-        )
-    if today.weekday() == 6:  # неділя — рефералка
-        return (
-            f"🎁 <b>Premium безкоштовно</b>: запроси {REFERRAL_PREMIUM_EVERY} друзів — отримаєш "
-            f"{REFERRAL_PREMIUM_DAYS} днів Premium (фільтр за статтю й віком, усі маски голосу, без реклами). "
-            "А топ-3 тижня отримують Premium за конкурсом запрошень!",
-            "🎁 Моє посилання для друзів",
-            "prem_free",
-        )
-    if today.toordinal() % 2:
-        return None
-    text, btn, cb = TIPS[(today.toordinal() // 2) % len(TIPS)]
-    return (f"💡 <b>А ти знав?</b> {text}", btn, cb)
-
-
-def evening_extra_text() -> str:
-    x = evening_extra()
-    return f"\n\n{x[0]}" if x else ""
-
-
-def evening_extra_button():
-    x = evening_extra()
-    return InlineKeyboardButton(text=x[1], callback_data=x[2]) if x else None
-
-
-@dp.callback_query(F.data.startswith("tip_cmd:"))
-async def tip_cmd(call: types.CallbackQuery):
-    what = call.data.split(":", 1)[1]
-    await call.answer()
-    if what == "letter":
-        await call.message.answer("💌 Щоб написати нічний лист, натисни /letter")
-    elif what == "confess":
-        await call.message.answer("🤫 Щоб написати анонімне зізнання, натисни /confess")
-
-
-def is_fresh_newbie(u: dict) -> bool:
-    joined = u.get("joined_at") or 0
-    return not u.get("total_chats") and joined and time.time() - joined < 14 * 86400
-
-
-# ---------------------------------------------------------------------------
-# 🌙 Теплий старт: новачкам, які ще ні з ким не поговорили, — одне «живе» запрошення під час
-# Години знайомств (о 21:10), коли в боті справді багато людей. Лише раз на людину.
-# ---------------------------------------------------------------------------
-WARM_START_MINUTE = 10
-WARM_START_MAX_AGE = 3 * 86400  # лише ті, хто прийшов за останні 3 дні
-WARM_START_MIN_ONLINE = 3  # якщо в боті майже нікого — не кличемо, щоб не розчарувати
-warm_state: dict = {"day": None}
-
-
-def warm_start_recipients() -> list[int]:
-    now = time.time()
-    out = []
-    for uid, u in users_db.items():
-        if uid <= 0 or uid in banned_users or uid in active_chats or uid in queue or uid in user_room:
-            continue
-        if u.get("total_chats") or u.get("warm_start_sent") or not u.get("notify_meet", True):
-            continue
-        joined = u.get("joined_at") or 0
-        if not joined or now - joined > WARM_START_MAX_AGE:
-            continue
-        out.append(uid)
-    return out
-
-
-async def warm_start_tick():
-    now = datetime.now(KYIV_TZ)
-    today = now.date().isoformat()
-    if now.hour != MEET_HOUR or now.minute < WARM_START_MINUTE or warm_state.get("day") == today:
-        return
-    if not _contest_can_write():
-        return
-    warm_state["day"] = today
-    online = online_now()
-    if online < WARM_START_MIN_ONLINE:
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")]])
-    sent = 0
-    for uid in warm_start_recipients():
-        users_db[uid]["warm_start_sent"] = True
-        if await safe_send(
-            uid,
-            f"🔥 <b>Зараз Година знайомств</b> — у боті <b>{online}</b> людей онлайн.\n\n"
-            "Ти ще ні з ким не поговорив(-ла) — саме час: натисни, і за кілька секунд я з'єднаю тебе "
-            "з кимось анонімно 💬",
-            reply_markup=kb,
-        ):
-            sent += 1
-        await asyncio.sleep(0.05)
-    if sent:
-        stat_add("warm_start", sent)
-    request_save()
-
-
-# ---------------------------------------------------------------------------
-# 👋 «Ми скучили»: одне повідомлення тим, хто не заходив 4+ дні (не частіше ніж раз на 2 тижні)
-# ---------------------------------------------------------------------------
-COMEBACK_AFTER_DAYS = int(os.getenv("COMEBACK_AFTER_DAYS", "4"))
-COMEBACK_EVERY_DAYS = 14
-COMEBACK_HOUR = 19  # о 19:xx за Києвом — до вечірнього піку
-comeback_state: dict = {"day": None}
-
-
-def comeback_text() -> str:
-    lines = [
-        "👋 <b>Давно не бачились!</b>",
-        "",
-        "За цей час у ANONimchyk:",
-        "🎭 у чаті можна разом зняти маски — тільки якщо захочете обоє",
-        "🎙 голосові з маскою — твій голос ніхто не впізнає",
-        "👥 кімнати, де завжди хтось є",
-    ]
-    if halloween_active():
-        lines.append("🎃 <b>Тиждень Хелловіну</b>: страшні маски голосу безкоштовно й лімітовані подарунки")
-    lines += ["", f"⏰ Найбільше людей онлайн щодня о {MEET_HOUR}:00. Заходь 💜"]
-    return "\n".join(lines)
-
-
-async def comeback_tick():
-    now = datetime.now(KYIV_TZ)
-    today = now.date()
-    if now.hour != COMEBACK_HOUR or comeback_state.get("day") == today.isoformat() or not _contest_can_write():
-        return
-    comeback_state["day"] = today.isoformat()
-    edge = (today - timedelta(days=COMEBACK_AFTER_DAYS)).isoformat()
-    again = (today - timedelta(days=COMEBACK_EVERY_DAYS)).isoformat()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")]])
-    sent = 0
-    for uid, u in list(users_db.items()):
-        if uid <= 0 or uid in banned_users or uid in active_chats or uid in queue or uid in user_room:
-            continue
-        if not u.get("notify_tips", True):
-            continue
-        last = u.get("last_active_day")
-        if not last:
-            u["last_active_day"] = today.isoformat()  # старі користувачі: відлік з сьогодні, без розсилки
-            continue
-        if last > edge or (u.get("comeback_day") or "0") > again:
-            continue
-        u["comeback_day"] = today.isoformat()
-        if await safe_send(uid, comeback_text(), reply_markup=kb):
-            sent += 1
-        await asyncio.sleep(0.05)
-    if sent:
-        stat_add("comeback", sent)
-    request_save()
 
 
 # === КІНЕЦЬ part5.py ===

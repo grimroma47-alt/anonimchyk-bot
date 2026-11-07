@@ -37,7 +37,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
-BOT_VERSION = "07.11-c"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
+BOT_VERSION = "08.11-a"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -367,73 +367,6 @@ queue: list[int] = []
 queue_since: dict[int, float] = {}  # user_id -> коли став у чергу (щоб прибирати тих, хто пішов)
 search_mode: dict[int, str] = {}  # user_id у черзі -> "normal" або "flirt" (флірт шукає лише флірт)
 active_chats: dict[int, int] = {}
-
-
-# Архів анонімних приватних чатів: лише RAM, очищення щодня за київським часом.
-CHATLOG_MAX_CHATS = 150
-CHATLOG_MAX_MESSAGES = 200
-CHATLOG_MAX_MEDIA = 100
-chatlog: dict[int, dict] = {}
-chatlog_next_id = 1
-chatlog_day = None
-
-
-def chatlog_reset_if_new_day():
-    global chatlog_day
-    today = kyiv_today()
-    if chatlog_day != today:
-        chatlog.clear()
-        chatlog_day = today
-
-
-def chatlog_start(a: int, b: int, mode: str):
-    global chatlog_next_id
-    chatlog_reset_if_new_day()
-    # Не записуємо переписки з друзями та тематичні кімнати.
-    if mode == "friend" or a in user_room or b in user_room:
-        return
-    entry_id = chatlog_next_id
-    chatlog_next_id += 1
-    chatlog[entry_id] = {
-        "id": entry_id, "a": a, "b": b, "mode": mode,
-        "started": time.time(), "messages": [],
-    }
-    while len(chatlog) > CHATLOG_MAX_CHATS:
-        del chatlog[min(chatlog)]
-
-
-def chatlog_record(user_id: int, message):
-    chatlog_reset_if_new_day()
-    partner_id = active_chats.get(user_id)
-    if partner_id is None:
-        return
-    # Знаходимо найновішу сесію саме цієї пари.
-    entry = next((v for v in reversed(list(chatlog.values()))
-                  if {v["a"], v["b"]} == {user_id, partner_id}), None)
-    if entry is None:
-        return
-    marker = msg_mark(message) if callable(globals().get("msg_mark")) else (
-        getattr(message, "text", None) or "[медіа]"
-    )
-    is_media = not bool(getattr(message, "text", None))
-    entry["messages"].append({
-        "user": user_id, "time": time.time(), "text": str(marker)[:800],
-        "media": is_media,
-    })
-    # Спершу обмеження загальної кількості, потім — медіа.
-    del entry["messages"][:-CHATLOG_MAX_MESSAGES]
-    media_items = [i for i, m in enumerate(entry["messages"]) if m["media"]]
-    while len(media_items) > CHATLOG_MAX_MEDIA:
-        del entry["messages"][media_items[0]]
-        media_items = [i for i, m in enumerate(entry["messages"]) if m["media"]]
-
-
-async def chatlog_reset_loop():
-    chatlog_reset_if_new_day()
-    while True:
-        await asyncio.sleep(30)
-        chatlog_reset_if_new_day()
-
 user_counter = 1000
 
 banned_users: set[int] = set()
@@ -1153,9 +1086,27 @@ def get_settings_keyboard(u: dict | None = None):
 FREE_FILTERS = {"country_filter"}  # фільтр за країною — безкоштовно для всіх; стать і вік — Premium/перк
 
 
+FILTER_TRIALS = int(os.getenv("FILTER_TRIALS", "3"))  # 🎯 безкоштовні спроби пошуку за статтю (на все життя)
+TRIAL_MINUTES = 15  # одна спроба = фільтр за статтю діє 15 хв пошуку
+
+
 def filter_active(u: dict, perk: str) -> bool:
-    """Чи доступний юзеру цей фільтр (безкоштовний, куплений перк або Premium)."""
+    """Чи доступний юзеру цей фільтр (безкоштовний, куплений перк, Premium або активна пробна спроба)."""
+    if perk == "gender_filter" and (u.get("trial_until") or 0) > time.time():
+        return True
     return perk in FREE_FILTERS or is_premium(u) or has_perk(u, perk)
+
+
+def trials_left(u: dict) -> int:
+    return max(0, FILTER_TRIALS - int(u.get("trials_used") or 0))
+
+
+def quick_gender_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎲 Будь-кого", callback_data="qg_any"),
+        InlineKeyboardButton(text="👦 Хлопців", callback_data="qg_m"),
+        InlineKeyboardButton(text="👧 Дівчат", callback_data="qg_f"),
+    ]])
 
 
 def age_ranges_for(u: dict) -> list:
@@ -1280,7 +1231,6 @@ def get_admin_keyboard():
             [InlineKeyboardButton(text="🔗 Посилання з мітками", callback_data="adm_links")],
             [InlineKeyboardButton(text="🎁 Подарувати подарунок", callback_data="adm_gift")],
             [InlineKeyboardButton(text="🚨 Скарги", callback_data="adm_reports_0")],
-            [InlineKeyboardButton(text="💬 Чати", callback_data="adm_chats_0")],
             [
                 InlineKeyboardButton(text="⛔ Забанити", callback_data="adm_ban"),
                 InlineKeyboardButton(text="✅ Розбанити", callback_data="adm_unban"),
@@ -1686,6 +1636,7 @@ def get_post_chat_keyboard(partner_id: int):
                 InlineKeyboardButton(text="👎", callback_data=f"rate_down_{partner_id}"),
             ],
             [InlineKeyboardButton(text="🔄 Запросити повторний зв'язок", callback_data="reconnect_request")],
+            [InlineKeyboardButton(text="🔁 Минулі розмови", callback_data="rc_list")],
         ]
     )
 
@@ -2273,55 +2224,6 @@ async def friend_mode_message(message: types.Message):
     if err:
         friend_mode.pop(uid, None)
         await message.answer(f"❌ {err}", reply_markup=_after_friend_kb(uid))
-
-
-# ---------------------------------------------------------------------------
-# Команди
-# ---------------------------------------------------------------------------
-@dp.message(CommandStart())
-async def start_handler(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-    is_new_user = user_id not in users_db
-    u = init_user(user_id)
-
-    # Реферальне посилання: /start ref_<id>
-    if is_new_user:
-        parts = (message.text or "").split(maxsplit=1)
-        u["source"] = source_from_start(parts[1] if len(parts) == 2 else "")
-        if len(parts) == 2 and parts[1].startswith("ref_"):
-            try:
-                referrer_id = int(parts[1][len("ref_"):])
-            except ValueError:
-                referrer_id = None
-            if referrer_id and referrer_id != user_id and referrer_id in users_db:
-                u["referred_by"] = referrer_id
-                ref = users_db[referrer_id]
-                ref["referral_count"] = ref.get("referral_count", 0) + 1
-                ref["balance"] += REFERRAL_BONUS
-                await safe_send(
-                    referrer_id,
-                    f"👥 За вашим запрошенням приєднався новий користувач!\n"
-                    f"+{REFERRAL_BONUS:.0f} грн на баланс. Дякуємо! 🎉",
-                )
-                if ref["referral_count"] % REFERRAL_PREMIUM_EVERY == 0:
-                    now = time.time()
-                    start = max(now, ref["perks"].get("premium", 0))
-                    ref["perks"]["premium"] = start + REFERRAL_PREMIUM_DAYS * DAY
-                    await safe_send(
-                        referrer_id,
-                        f"🎉 Ти запросив вже {ref['referral_count']} друзів!\n"
-                        f"У подарунок — {REFERRAL_PREMIUM_DAYS} днів Premium 💎",
-                    )
-
-    code = (getattr(message.from_user, "language_code", None) or "uk").lower()
-    if LANG_RU_ENABLED and is_new_user and not code.startswith("uk"):
-        await message.answer(
-            "🌐 Обери мову / Выбери язык / Choose your language:",
-            reply_markup=lang_pick_kb("lang_new_"),
-        )
-        return
-    await send_welcome(message.chat.id, message.from_user.first_name, u, state, message)
 
 
 # === КІНЕЦЬ part1.py ===

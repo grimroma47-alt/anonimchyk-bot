@@ -1,3 +1,245 @@
+@dp.message(F.text == BTN_TASKS)
+@dp.message(Command("tasks"))
+async def tasks_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await send_banner(message.from_user.id, "tasks")
+    u = init_user(message.from_user.id)
+    await message.answer(tasks_text(message.from_user.id, u))
+
+
+# ---------------------------------------------------------------------------
+# Рейтинг і інтереси профілю: кого кому підбирати першим
+# ---------------------------------------------------------------------------
+MAX_PROFILE_INTERESTS = 3
+MATCH_SCORE_MAX = 5  # 2 — однаковий «рівень» рейтингу, +1 — спільний інтерес, +1 — настрій, +1 — новачку «теплий» співрозмовник
+
+
+def is_newbie(u: dict) -> bool:
+    """Ще жодного разу ні з ким не з'єднувався."""
+    return not u.get("total_chats")
+
+
+def is_warm(u: dict) -> bool:
+    """Досвідчений і привітний: кілька чатів, рейтинг не низький."""
+    return u.get("total_chats", 0) >= 3 and not is_low_rated(u)
+
+
+def match_score(u: dict, p: dict, mode: str) -> int:
+    """Чим більше балів, тим краща пара. Люди з низьким рейтингом спершу потрапляють одне до одного."""
+    score = 2 if is_low_rated(u) == is_low_rated(p) else 0
+    if not mode.startswith("int:") and (u.get("interests") or set()) & (p.get("interests") or set()):
+        score += 1
+    if current_mood(u) and current_mood(u) == current_mood(p):
+        score += 1  # 🎭 на одній хвилі
+    if u.get("city") and u.get("city") == p.get("city"):
+        score += 1  # 🏙 з одного міста
+    if (is_newbie(u) and is_warm(p)) or (is_newbie(p) and is_warm(u)):
+        score += 1  # 🆕 новачку — досвідченого привітного співрозмовника, щоб перший чат вдався
+    return score
+
+
+def rating_line(u: dict) -> str:
+    up, down = u.get("rating_up", 0), u.get("rating_down", 0)
+    if not up + down:
+        return "ще немає оцінок"
+    return f"👍 {up} · 👎 {down} ({rating_percent(u)}%)"
+
+
+def interests_line(u: dict) -> str:
+    keys = [k for k in INTEREST_LABELS if k in (u.get("interests") or set())]
+    return ", ".join(INTEREST_LABELS[k] for k in keys) if keys else "не обрано"
+
+
+# 💡 Перше повідомлення: одне відкрите питання за інтересом — щоб не думати, з чого почати
+OPENERS = {
+    "music": "Що ти зараз слухаєш на повторі?",
+    "movies": "Який фільм чи серіал ти можеш передивлятися безкінечно?",
+    "games": "У що зараз граєш?",
+    "travel": "Де тобі найбільше сподобалося бувати?",
+    "it": "Яка технологія чи гаджет тебе останнім часом вразили?",
+    "sport": "Який спорт тобі до душі — дивитися чи займатися?",
+    "books": "Яку книжку ти радиш усім?",
+    "pets": "У тебе є улюбленець — кіт, пес чи хтось інший?",
+    "cook": "Яку страву ти готуєш найкраще?",
+    "fitness": "Як ти знаходиш мотивацію на тренування?",
+    "art": "Що ти найбільше любиш малювати?",
+    "photo": "Що найчастіше потрапляє тобі в кадр?",
+    "instr": "На чому граєш і скільки вже вчишся?",
+    "plants": "Яка рослина в тебе найпримхливіша?",
+    "cars": "Яке авто — твоя мрія?",
+    "yoga": "Що тобі найкраще допомагає розслабитися?",
+    "craft": "Що ти останнє зробив(-ла) своїми руками?",
+    "fishing": "Яка твоя найкраща рибалка?",
+    "anime": "Яке аніме ти порадиш новачкові?",
+    "dance": "Під яку музику тебе неможливо втримати на місці?",
+}
+
+
+def opener_line(keys: list) -> str:
+    keys = [k for k in keys if k in OPENERS]
+    if not keys:
+        return ""
+    return f"\n💡 Можна почати так: «{OPENERS[random.choice(keys)]}»"
+
+
+async def send_interest_notes(user_id: int, u: dict, partner_id: int, p: dict):
+    u_open, p_open = not u.get("hide_interests"), not p.get("hide_interests")
+    common = [k for k in INTEREST_LABELS if k in (u.get("interests") or set()) & (p.get("interests") or set())]
+    if common and u_open and p_open:
+        note = "🧩 Спільні інтереси: <b>" + ", ".join(INTEREST_LABELS[k] for k in common) + "</b> — є з чого почати 😉"
+        await safe_send(user_id, note + opener_line(common))
+        await safe_send(partner_id, note + opener_line(common))
+        return
+    for me, other, is_open in ((user_id, p, p_open), (partner_id, u, u_open)):
+        if is_open and other.get("interests"):
+            keys = [k for k in INTEREST_LABELS if k in (other.get("interests") or set())]
+            await safe_send(me, f"🧩 Інтереси співрозмовника: {interests_line(other)}" + opener_line(keys))
+
+
+# ---------------------------------------------------------------------------
+# 🎭 Мій настрій · 🎵 Пісня настрою · 💬 Тема дня
+# ---------------------------------------------------------------------------
+MOODS = {
+    "happy": "😊 Гарний настрій",
+    "calm": "😌 Спокійний",
+    "sleepy": "🥱 Сонний",
+    "sad": "😔 Сумно",
+    "laugh": "😂 Хочу посміятись",
+    "talk": "💬 Хочу виговоритись",
+    "deep": "🌌 На глибокі розмови",
+    "bored": "🙃 Нудно",
+}
+MOOD_TTL = 12 * 3600  # настрій «на сьогодні»: діє 12 годин
+SONG_TTL = 24 * 3600  # пісня настрою: 24 години
+SONG_MAX = 60
+TOPIC_COOLDOWN = 20  # секунд між «новими темами» в одному чаті
+_SONG_BAD = re.compile(r"(https?://|www\.|t\.me|@\w|\.com|\.ua|\.ru)", re.I)
+
+DAILY_TOPICS = [
+    "Яка пісня зараз крутиться у тебе в голові?",
+    "Куди б ти поїхав(-ла) прямо зараз, якби квиток був безкоштовний?",
+    "Яка найдивніша їжа, яку ти куштував(-ла)?",
+    "Що тебе сьогодні порадувало, навіть якась дрібниця?",
+    "Ти більше «сова» чи «жайворонок»?",
+    "Який фільм ти можеш переглядати безкінечно?",
+    "Якби ти міг(-ла) мати одну суперсилу — яку б обрав(-ла)?",
+    "Що б ти сказав(-ла) собі п'ять років тому?",
+    "Який для тебе ідеальний вихідний?",
+    "Котики чи собаки — і чому?",
+    "Яке хобі ти давно хочеш спробувати?",
+    "Який найсмішніший випадок стався з тобою цього року?",
+    "Яка пора року твоя — і за що ти її любиш?",
+    "Чого ти точно не пробачиш у дружбі?",
+    "Чай чи кава? І як саме ти його п'єш?",
+    "Яка книга або серіал змінили твій погляд на щось?",
+    "Опиши свій день трьома емодзі.",
+    "Що тебе заспокоює, коли все бісить?",
+    "Яка в тебе «дивна» звичка, про яку мало хто знає?",
+    "Якби ти відкрив(-ла) свій заклад — що б це було?",
+    "Яка мрія в тебе зараз на першому місці?",
+    "Який найкращий подарунок ти колись отримував(-ла)?",
+    "Що б ти робив(-ла), якби завтра не треба було на роботу чи навчання?",
+    "Який звук або запах нагадує тобі дитинство?",
+    "Ти віриш у кохання з першого погляду?",
+    "Що тобі легше: почати розмову чи підтримувати її?",
+    "Яке місто в Україні ти любиш найбільше?",
+    "Що ти вмієш готувати найкраще?",
+    "Чого ти навчився(-лася) за останній місяць?",
+    "Яке маленьке рішення колись сильно змінило твоє життя?",
+]
+topic_last: dict[int, float] = {}  # user_id -> коли востаннє просив нову тему в чаті
+
+
+def current_mood(u: dict) -> str | None:
+    key = u.get("mood")
+    if key in MOODS and time.time() - (u.get("mood_at") or 0) < MOOD_TTL:
+        return key
+    return None
+
+
+def current_song(u: dict) -> str | None:
+    song = u.get("song")
+    if song and time.time() - (u.get("song_at") or 0) < SONG_TTL:
+        return song
+    return None
+
+
+def mood_line(u: dict) -> str:
+    key = current_mood(u)
+    return MOODS[key] if key else "не вказано"
+
+
+def topic_of_day() -> str:
+    return DAILY_TOPICS[kyiv_today().toordinal() % len(DAILY_TOPICS)]
+
+
+def random_topic(exclude: str | None = None) -> str:
+    pool = [t for t in DAILY_TOPICS if t != exclude]
+    return random.choice(pool)
+
+
+def mood_text(u: dict) -> str:
+    song = current_song(u)
+    same = 0
+    key = current_mood(u)
+    if key:
+        same = sum(1 for uid in queue if current_mood(users_db.get(uid, {})) == key)
+    lines = [
+        "🎭 <b>Мій настрій</b>\n",
+        "Обери, як ти зараз. Співрозмовник побачить це на початку чату, "
+        "а бот спершу шукатиме когось на одній хвилі.\n",
+        f"Зараз: <b>{mood_line(u)}</b>" + (" <i>(діє 12 год)</i>" if key else ""),
+        "🎵 Пісня настрою: " + (f"«{esc(song)}»" if song else "не вказано"),
+    ]
+    if key and same:
+        lines.append(f"🔍 З таким самим настроєм зараз шукають: <b>{same}</b>")
+    lines.append(f"\n💬 <b>Тема дня:</b> {topic_of_day()}")
+    return "\n".join(lines)
+
+
+def mood_keyboard(u: dict) -> InlineKeyboardMarkup:
+    cur = current_mood(u)
+    btns = [
+        InlineKeyboardButton(text=("✅ " if k == cur else "") + label, callback_data=f"mood_set:{k}")
+        for k, label in MOODS.items()
+    ]
+    rows = [btns[i : i + 2] for i in range(0, len(btns), 2)]
+    rows.append([InlineKeyboardButton(text="🎵 Пісня настрою", callback_data="mood_song")])
+    if cur or current_song(u):
+        rows.append([InlineKeyboardButton(text="🧹 Скинути настрій і пісню", callback_data="mood_clear")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("mood"))
+async def mood_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    u = init_user(message.from_user.id)
+    await message.answer(mood_text(u), reply_markup=mood_keyboard(u))
+
+
+@dp.callback_query(F.data == "mood_open")
+async def mood_open(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    await call.message.answer(mood_text(u), reply_markup=mood_keyboard(u))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("mood_set:"))
+async def mood_set(call: types.CallbackQuery):
+    key = call.data.split(":", 1)[1]
+    if key not in MOODS:
+        await call.answer("Невідомий настрій", show_alert=True)
+        return
+    u = init_user(call.from_user.id)
+    u["mood"], u["mood_at"] = key, time.time()
+    request_save()
+    try:
+        await call.message.edit_text(mood_text(u), reply_markup=mood_keyboard(u))
+    except TelegramAPIError:
+        pass
+    await call.answer(f"Настрій: {MOODS[key]}")
+
+
 @dp.callback_query(F.data == "mood_clear")
 async def mood_clear(call: types.CallbackQuery):
     u = init_user(call.from_user.id)
@@ -2104,234 +2346,6 @@ def top_text(user_id: int) -> str:
         for uid, _up, _down, pct, medal in last["winners"]:
             lines.append(f"{medal} {esc(users_db.get(uid, {}).get('nickname', '?'))} — {pct}%")
     return "\n".join(lines)
-
-
-@dp.message(Command("best"))
-async def top_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    init_user(message.from_user.id)
-    await message.answer(top_text(message.from_user.id))
-
-
-def contest_on_real_chat(user_id: int):
-    """Запрошений друг провів перший справжній чат — зараховуємо його тому, хто запросив."""
-    u = users_db.get(user_id)
-    if not u or u.get("ref_qualified") or not u.get("referred_by"):
-        return
-    u["ref_qualified"] = True
-    ref_id = u["referred_by"]
-    if ref_id not in users_db or ref_id in banned_users:
-        return
-    if ref_contest.get("week") != contest_week_key():
-        ref_contest["week"] = ref_contest.get("week") or contest_week_key()
-    entry = ref_contest.setdefault("counts", {}).setdefault(ref_id, [0, 0.0])
-    entry[0] += 1
-    entry[1] = time.time()
-    place = next((i for i, (uid, _n) in enumerate(contest_ranking(), 1) if uid == ref_id), None)
-    _notify_later(
-        ref_id,
-        f"🏆 Твій друг поспілкувався в першому чаті — <b>+1 у конкурсі запрошень</b>!\n"
-        f"Цього тижня: {entry[0]} · місце: {place}. Деталі: /contest",
-    )
-    request_save()
-
-
-def _ref_link(user_id: int) -> str:
-    return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}" if BOT_USERNAME else ""
-
-
-def contest_text(user_id: int) -> str:
-    week = ref_contest.get("week") or contest_week_key()
-    ranking = contest_ranking()
-    lines = [
-        f"🏆 <b>Конкурс запрошень</b> · {contest_week_range(week)}",
-        "",
-        "Запрошуй друзів за своїм посиланням. Друг зараховується, коли поспілкується "
-        "в першому чаті (від 1 хв).",
-        "",
-        "<b>Призи щонеділі опівночі:</b>",
-    ]
-    lines += [f"{medal} Premium на {days} днів" for medal, days in CONTEST_PRIZES]
-    lines.append(f"<i>Щоб потрапити в призери — мінімум {CONTEST_MIN_INVITES} друзі.</i>")
-    lines.append("")
-    if ranking:
-        lines.append("<b>Топ тижня:</b>")
-        medals = [m for m, _d in CONTEST_PRIZES]
-        for i, (uid, n) in enumerate(ranking[:CONTEST_TOP_SHOWN], 1):
-            mark = medals[i - 1] if i <= len(medals) else f"{i}."
-            you = " ← ти" if uid == user_id else ""
-            nick = esc(users_db.get(uid, {}).get("nickname", "Користувач"))
-            lines.append(f"{mark} {nick} — {n}{you}")
-    else:
-        lines.append("Цього тижня ще ніхто не запросив друзів — стань першим! 🚀")
-    mine = next(((i, n) for i, (uid, n) in enumerate(ranking, 1) if uid == user_id), None)
-    lines.append("")
-    if mine:
-        lines.append(f"📍 Ти: <b>{mine[1]}</b> {_plural(mine[1], 'друг', 'друзі', 'друзів')} · <b>{mine[0]}</b> місце")
-    else:
-        lines.append("📍 Ти поки не в рейтингу — надішли посилання другу!")
-    history = ref_contest.get("history") or []
-    if history and history[-1].get("winners"):
-        last = history[-1]
-        names = ", ".join(
-            f"{w[2].split()[0]} {esc(users_db.get(w[0], {}).get('nickname', '?'))}" for w in last["winners"]
-        )
-        lines.append(f"\n🎉 Переможці минулого тижня: {names}")
-    link = _ref_link(user_id)
-    if link:
-        lines.append(f"\n🔗 Твоє посилання:\n<code>{esc(link)}</code>")
-    return "\n".join(lines)
-
-
-def contest_keyboard(user_id: int):
-    link = _ref_link(user_id)
-    rows = []
-    if link:
-        share_text = "Заходь в ANONimchyk — анонімний чат для знайомств і розмов 🎭"
-        share = f"https://t.me/share/url?url={quote(link)}&text={quote(share_text)}"
-        rows.append([InlineKeyboardButton(text="📤 Надіслати другу", url=share)])
-    rows.append([InlineKeyboardButton(text="🔄 Оновити", callback_data="contest_open")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.message(Command("contest"))
-async def contest_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    init_user(message.from_user.id)
-    await contest_tick()
-    await message.answer(contest_text(message.from_user.id), reply_markup=contest_keyboard(message.from_user.id))
-
-
-@dp.callback_query(F.data == "contest_open")
-async def contest_open(call: types.CallbackQuery):
-    init_user(call.from_user.id)
-    await contest_tick()
-    text, kb = contest_text(call.from_user.id), contest_keyboard(call.from_user.id)
-    if call.message.text and call.message.text.startswith("🏆 Конкурс запрошень"):
-        try:
-            await call.message.edit_text(text, reply_markup=kb)
-        except TelegramAPIError:
-            pass  # нічого не змінилось
-        await call.answer("Оновлено")
-        return
-    await call.message.answer(text, reply_markup=kb)
-    await call.answer()
-
-
-# ---------------------------------------------------------------------------
-# Правила, безпека, підтримка з оплат
-# ---------------------------------------------------------------------------
-RULES_TEXT = (
-    "📜 <b>Правила ANONimchyk</b>\n\n"
-    "1. <b>Повага.</b> Без образ, погроз, цькування й дискримінації.\n"
-    "2. <b>Без спаму.</b> Ніякої реклами, посилань, продажів і «заробітку».\n"
-    "3. <b>Інтимне — лише у ❤️ флірт-чаті (18+)</b> і тільки за взаємною згодою. "
-    "Будь-який такий контент із неповнолітніми чи для неповнолітніх — бан назавжди.\n"
-    "4. <b>Не вимагай</b> фото, номер, адресу, гроші чи паролі. Не публікуй чужі особисті дані.\n"
-    "5. <b>Не видавай себе</b> за іншу людину чи адміністрацію, не шахрай.\n"
-    "6. <b>Вказуй справжній вік.</b> Флірт-чат — лише з 18 років.\n\n"
-    f"⚖️ Порушення → скарга «{BTN_REPORT}». Після кількох скарг акаунт блокується автоматично, "
-    "за серйозні порушення — бан адміністратором без попередження.\n\n"
-    "📄 Повідомлення в чатах не зберігаються. Лише якщо на тебе поскаржаться, той, хто скаржиться, "
-    "може додати твої останні повідомлення (текст) як доказ для модератора.\n\n"
-    "🤫 Бот не показує співрозмовнику твій Telegram-акаунт. Але свою анонімність бережи і сам — "
-    "детальніше: /safety\n"
-    "💳 Питання щодо оплат: /paysupport"
-)
-
-SAFETY_TEXT = (
-    "🛡 <b>Безпека в анонімному чаті</b>\n\n"
-    "• <b>Не кажи</b>, де живеш, у якій школі вчишся, своє прізвище та номер телефону.\n"
-    "• <b>Не надсилай</b> фото, особливо особисті. Надіслане вже не повернеш.\n"
-    "• <b>Не переходь</b> у інші месенджери чи соцмережі з незнайомцями й не погоджуйся на зустрічі.\n"
-    "• <b>Ніхто не має права</b> вимагати від тебе фото, гроші, коди чи паролі.\n"
-    "• Якщо співрозмовник лякає, тисне чи пише неприємне — просто завершуй чат.\n\n"
-    f"🚨 <b>{BTN_REPORT}</b> — скарга, адміністратор перевірить.\n"
-    f"🚫 <b>{BTN_BLACKLIST_ADD}</b> — ця людина більше ніколи тобі не трапиться.\n\n"
-    "Якщо сталося щось серйозне — розкажи дорослому, якому довіряєш. "
-    "В Україні безкоштовно допомагає дитяча лінія <b>116 111</b>."
-)
-
-MATCH_SAFETY_REMINDER = (
-    "🛡 Пам'ятай: не кажи, де живеш, і не надсилай фото незнайомцям. "
-    f"Щось не так — «{BTN_REPORT}» або «{BTN_BLACKLIST_ADD}». Більше: /safety"
-)
-MATCH_SAFETY_EVERY = 24 * 3600  # коротке нагадування неповнолітнім — не частіше разу на добу
-_match_safety_last: dict[int, float] = {}
-
-PAYSUPPORT_TEXT = (
-    "💳 <b>Питання щодо оплат</b>\n\n"
-    "Баланс у боті — внутрішня валюта: ним оплачуються Premium, подарунки та послуги в магазині. "
-    "Гроші з балансу не виводяться.\n\n"
-    "<b>Оплатив, а баланс не поповнився?</b>\n"
-    "• Банка monobank / реквізити: зарахування може тривати до кількох хвилин, "
-    "а якщо в коментарі не було коду — до перевірки адміністратором.\n"
-    "• Напиши в підтримку: <b>суму, час оплати</b> і код заявки <b>P…</b> (якщо був) "
-    "— і ми все перевіримо.\n\n"
-    "Повернення коштів можливе у разі технічної помилки, коли оплачену послугу не було надано."
-)
-
-
-async def maybe_send_safety_memo(user_id: int, u: dict):
-    """Повна пам'ятка неповнолітнім — один раз (після анкети чи зміни віку)."""
-    if is_minor(u) and not u.get("safety_memo_shown"):
-        u["safety_memo_shown"] = True
-        request_save()
-        await safe_send(user_id, SAFETY_TEXT)
-
-
-async def send_match_safety(user_id: int, u: dict):
-    if not is_minor(u):
-        return
-    if not u.get("safety_memo_shown"):
-        await maybe_send_safety_memo(user_id, u)
-        _match_safety_last[user_id] = time.time()
-        return
-    now = time.time()
-    if now - _match_safety_last.get(user_id, 0) < MATCH_SAFETY_EVERY:
-        return
-    _match_safety_last[user_id] = now
-    await safe_send(user_id, MATCH_SAFETY_REMINDER)
-
-
-@dp.message(Command("rules", "terms"))
-async def rules_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer(RULES_TEXT)
-
-
-@dp.message(Command("safety"))
-async def safety_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer(SAFETY_TEXT)
-
-
-@dp.message(Command("paysupport"))
-async def paysupport_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        PAYSUPPORT_TEXT,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="💬 Написати в підтримку", callback_data="support_start")]]
-        ),
-    )
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# 📍 Де я зараз: статус чату/пошуку/кімнати і швидке повернення
-# ---------------------------------------------------------------------------
-def chat_mode_label(mode: str) -> str:
-    if mode == "flirt":
-        return "❤️ Флірт-чат"
-    if mode == "voice":
-        return "🎙 Голосовий чат"
-    if mode.startswith("int:"):
-        return f"🧩 Чат за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}"
-    return "🔍 Анонімний чат"
 
 
 # === КІНЕЦЬ part4.py ===
