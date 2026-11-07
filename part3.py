@@ -405,6 +405,95 @@ def admin_only(func):
     return wrapper
 
 
+@dp.callback_query(F.data.startswith("adm_chats_"))
+@admin_only
+async def admin_chats_list(call: types.CallbackQuery):
+    chatlog_reset_if_new_day()
+    try:
+        page = max(0, int(call.data.rsplit("_", 1)[1]))
+    except (ValueError, IndexError):
+        page = 0
+    entries = list(chatlog.items())
+    entries.reverse()
+    per_page = 8
+    start = page * per_page
+    chunk = entries[start:start + per_page]
+    if not chunk and page > 0:
+        await call.answer("Ця сторінка порожня")
+        return
+    rows = []
+    for chat_id, item in chunk:
+        a, b = item["users"]
+        ua, ub = users_db.get(a) or {}, users_db.get(b) or {}
+        na = ua.get("nickname") or ua.get("custom_id") or str(a)
+        nb = ub.get("nickname") or ub.get("custom_id") or str(b)
+        stamp = datetime.fromtimestamp(item["started"], KYIV_TZ).strftime("%H:%M")
+        count = len(item["messages"])
+        rows.append([InlineKeyboardButton(
+            text=f"💬 {na[:18]} ↔ {nb[:18]} · {stamp} · {count}",
+            callback_data=f"adm_chat_{chat_id}",
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm_chats_{page-1}"))
+    if start + per_page < len(entries):
+        nav.append(InlineKeyboardButton(text="Далі ➡️", callback_data=f"adm_chats_{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔄 Оновити", callback_data=f"adm_chats_{page}")])
+    await call.message.answer(
+        f"💬 <b>Анонімні чати за сьогодні</b>\n"
+        f"Збережено: {len(entries)}/{CHATLOG_MAX_CHATS}\n"
+        f"Обери розмову:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_chat_"))
+@admin_only
+async def admin_chat_detail(call: types.CallbackQuery):
+    chatlog_reset_if_new_day()
+    try:
+        chat_id = int(call.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Чат не знайдено", show_alert=True)
+        return
+    item = chatlog.get(chat_id)
+    if item is None:
+        await call.answer("Історія вже очищена або чат видалено", show_alert=True)
+        return
+    a, b = item["users"]
+    ua, ub = users_db.get(a) or {}, users_db.get(b) or {}
+    na = ua.get("nickname") or ua.get("custom_id") or str(a)
+    nb = ub.get("nickname") or ub.get("custom_id") or str(b)
+    started = datetime.fromtimestamp(item["started"], KYIV_TZ).strftime("%d.%m.%Y о %H:%M")
+    mode = {"normal": "Звичайний", "flirt": "Флірт", "voice": "Голосовий"}.get(item["mode"], item["mode"])
+    await call.message.answer(
+        f"💬 <b>Історія чату</b>\n"
+        f"👤 {esc(na)}  ↔️  👤 {esc(nb)}\n"
+        f"🕒 {started} · {esc(mode)}\n"
+        f"Повідомлень: {len(item['messages'])}\n"
+        "━━━━━━━━━━━━━━"
+    )
+    if not item["messages"]:
+        await call.message.answer("Поки що в цій розмові немає повідомлень.")
+    else:
+        for msg in item["messages"]:
+            sender = na if msg["from"] == a else nb
+            clock = datetime.fromtimestamp(msg["time"], KYIV_TZ).strftime("%H:%M")
+            bubble = "🟦" if msg["from"] == a else "🟩"
+            body = esc(msg["text"])
+            await call.message.answer(f"{bubble} <b>{esc(sender)}</b>  <i>{clock}</i>\n{body}")
+    await call.message.answer(
+        "Кінець розмови.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ До списку чатів", callback_data="adm_chats_0")
+        ]]),
+    )
+    await call.answer()
+
+
 STATS_PERIODS = {
     "today": ("Сьогодні", 1, 0),
     "yday": ("Вчора", 1, 1),
@@ -1805,6 +1894,7 @@ def task_event(user_id: int, event: str, n: int = 1):
 
 
 def on_chat_started(a: int, b: int, mode: str):
+    chatlog_start(a, b, mode)
     hw_mark_badge(a, b)
     now = time.time()
     for x in (a, b):

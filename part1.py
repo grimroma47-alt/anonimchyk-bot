@@ -366,6 +366,74 @@ queue: list[int] = []
 queue_since: dict[int, float] = {}  # user_id -> коли став у чергу (щоб прибирати тих, хто пішов)
 search_mode: dict[int, str] = {}  # user_id у черзі -> "normal" або "flirt" (флірт шукає лише флірт)
 active_chats: dict[int, int] = {}
+
+# Історія анонімних чатів: лише RAM, очищення щодня опівночі за Києвом.
+CHATLOG_MAX_CHATS = 150
+CHATLOG_MAX_MESSAGES = 200
+CHATLOG_MAX_MEDIA = 100
+chatlog: dict[int, dict] = {}
+chatlog_next_id = 1
+chatlog_day = None
+
+
+def chatlog_reset_if_new_day():
+    global chatlog_day
+    today = kyiv_today()
+    if chatlog_day != today:
+        chatlog.clear()
+        chatlog_day = today
+
+
+def chatlog_start(a: int, b: int, mode: str):
+    global chatlog_next_id
+    chatlog_reset_if_new_day()
+    # Дружні переписки та тематичні кімнати не записуємо.
+    if mode == "friend" or a in user_room or b in user_room:
+        return
+    key = chatlog_next_id
+    chatlog_next_id += 1
+    chatlog[key] = {
+        "users": (a, b),
+        "mode": mode,
+        "started": time.time(),
+        "messages": [],
+    }
+    while len(chatlog) > CHATLOG_MAX_CHATS:
+        chatlog.pop(next(iter(chatlog)), None)
+
+
+def chatlog_record(user_id: int, message):
+    chatlog_reset_if_new_day()
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        return
+    # Знаходимо саме поточну сесію пари.
+    entry = next(
+        (item for item in reversed(list(chatlog.values()))
+         if set(item["users"]) == {user_id, partner_id}),
+        None,
+    )
+    if entry is None:
+        return
+    mark = msg_mark(message) if callable(globals().get("msg_mark")) else (getattr(message, "text", None) or "[медіа]")
+    is_media = not bool(getattr(message, "text", None))
+    entry["messages"].append({
+        "time": time.time(),
+        "from": user_id,
+        "text": str(mark)[:500],
+        "media": is_media,
+    })
+    messages = entry["messages"]
+    del messages[:-CHATLOG_MAX_MESSAGES]
+    media_indexes = [i for i, item in enumerate(messages) if item["media"]]
+    for index in reversed(media_indexes[:-CHATLOG_MAX_MEDIA]):
+        del messages[index]
+
+
+async def chatlog_reset_loop():
+    while True:
+        await asyncio.sleep(30)
+        chatlog_reset_if_new_day()
 user_counter = 1000
 
 banned_users: set[int] = set()
@@ -1211,6 +1279,7 @@ def get_admin_keyboard():
             [InlineKeyboardButton(text="🔗 Посилання з мітками", callback_data="adm_links")],
             [InlineKeyboardButton(text="🎁 Подарувати подарунок", callback_data="adm_gift")],
             [InlineKeyboardButton(text="🚨 Скарги", callback_data="adm_reports_0")],
+            [InlineKeyboardButton(text="💬 Чати", callback_data="adm_chats_0")],
             [
                 InlineKeyboardButton(text="⛔ Забанити", callback_data="adm_ban"),
                 InlineKeyboardButton(text="✅ Розбанити", callback_data="adm_unban"),

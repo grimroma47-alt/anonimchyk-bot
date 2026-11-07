@@ -647,6 +647,7 @@ async def relay_messages(message: types.Message):
         )
         remember_pair_msg(user_id, getattr(message, "message_id", None), partner_id, getattr(sent, "message_id", None))
         remember_recent(user_id, msg_mark(message))
+        chatlog_record(user_id, message)
         on_chat_message(user_id)
     except TelegramAPIError:
         end_chat(user_id)
@@ -738,6 +739,7 @@ async def main():
     lease_task = asyncio.create_task(lease_heartbeat_loop())
     mono_task = asyncio.create_task(mono_poll_loop())
     contest_task = asyncio.create_task(contest_loop())
+    chatlog_task = asyncio.create_task(chatlog_reset_loop())
     try:
         # Кожен крок ізольований try/except, щоб тимчасова мережева помилка
         # Telegram API не вбивала весь процес (і "Application exited early" на Render).
@@ -775,6 +777,7 @@ async def main():
         lease_task.cancel()
         mono_task.cancel()
         contest_task.cancel()
+        chatlog_task.cancel()
         await save_state_to_db()  # фінальне збереження при зупинці (деплой/перезапуск)
         await release_lease()  # тепер нова копія може забрати свіжі дані
         await bot.session.close()
