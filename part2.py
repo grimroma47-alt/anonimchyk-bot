@@ -1,3 +1,22 @@
+async def send_welcome(chat_id: int, first_name, u: dict, state: FSMContext, message=None):
+    user_id = chat_id
+    welcome = (
+        f"Привіт, {protect_text(esc(first_name))}! Вітаємо в анонімному чаті! 🤫\n\n"
+        f"Твій унікальний номер: <b>{u['custom_id']}</b>\n"
+        "Змінити профіль можна будь-коли: ⚙️ Налаштування → ✏️ Мій профіль.\n\n"
+        "📜 Користуючись ботом, ти погоджуєшся з правилами: /rules"
+    )
+    if not u.get("founder_no") and founder_promo_line():
+        welcome += "\n\n" + founder_promo_line()
+    if not await send_banner(user_id, "start", caption=welcome, reply_markup=get_main_keyboard()):
+        if message is not None:
+            await message.answer(welcome, reply_markup=get_main_keyboard())
+        else:
+            await safe_send(chat_id, welcome, reply_markup=get_main_keyboard())
+    if not profile_complete(u):
+        await start_onboarding(chat_id, state)
+
+
 def en_available() -> bool:
     return LANG_RU_ENABLED and LANG_EN_ENABLED and bool(EN_PAIRS)
 
@@ -720,7 +739,7 @@ async def process_successful_payment(message: types.Message):
     amount = payment.total_amount  # для XTR це кількість зірок напряму
     u = init_user(message.from_user.id)
     u["balance"] += amount
-    record_topup("stars", amount)
+    record_topup("stars", amount, message.from_user.id)
     bonus = apply_topup_bonus(u, amount)
     request_save()
     text = f"✅ Оплату отримано! Баланс поповнено на {amount} грн."
@@ -2343,15 +2362,6 @@ async def open_friend_chat(uid: int, fid: int):
         except TelegramAPIError:
             (u.get("friend_last") or {}).pop(fid, None)
     await safe_send(uid, text, reply_markup=get_friend_mode_keyboard())
-
-
-@dp.message(F.text == BTN_FRIEND_EXIT)
-async def friend_mode_exit(message: types.Message, state: FSMContext):
-    await state.clear()
-    uid = message.from_user.id
-    friend_mode.pop(uid, None)
-    note = "💬 Ти знову в анонімному чаті — пиши співрозмовнику." if uid in active_chats else "🏠 Головне меню"
-    await message.answer(f"🚪 Переписку закрито.\n{note}", reply_markup=_after_friend_kb(uid))
 
 
 # === КІНЕЦЬ part2.py ===

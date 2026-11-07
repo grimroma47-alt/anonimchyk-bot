@@ -1,3 +1,58 @@
+# ---------------------------------------------------------------------------
+# 🎃 Хелловін: тиждень масок (27.10–01.11) — страшні маски голосу безкоштовно, лімітовані подарунки,
+# «Страшна правда чи дія», Ніч страшилок 31.10 о 23:00 і значок 🎃 за чат 31 жовтня
+# ---------------------------------------------------------------------------
+HW_FROM = _parse_dt_env("HALLOWEEN_FROM", "2026-10-27T00:00")
+HW_TO = _parse_dt_env("HALLOWEEN_TO", "2026-11-02T00:00")
+HW_NIGHT = _parse_dt_env("HALLOWEEN_NIGHT", "2026-10-31T23:00")  # Ніч страшилок триває годину
+HW_BADGE_DAY = HW_NIGHT.date().isoformat()  # хто поспілкувався цього дня — отримує значок 🎃
+HW_NIGHT_REMIND_MIN = 5
+HALLOWEEN_VOICES = {"ghost", "demon"}
+
+SPOOKY_TRUTHS = [
+    "Чого ти боявся(-лася) в дитинстві найбільше?",
+    "Розкажи найстрашніший сон, який пам'ятаєш.",
+    "Ти віриш у привидів? Чому?",
+    "Що найдивніше траплялося з тобою вночі?",
+    "У який фільм жахів ти ніколи не подивишся вдруге?",
+    "Чи був у тебе момент, коли здавалося, що вдома хтось є?",
+    "Який звук уночі лякає тебе найбільше?",
+    "Куди б ти ніколи не пішов (не пішла) сам(а) вночі?",
+]
+SPOOKY_DARES = [
+    "Напиши страшну історію рівно в три речення 👻",
+    "Надішли голосове моторошним шепотом (маска «Привид» безкоштовна до 1.11) 🎙",
+    "Опиши свій ідеальний хелловінський костюм одним реченням 🎃",
+    "Вигадай назву для фільму жахів про ваш чат 🎬",
+    "Надішли найстрашніший стікер, який у тебе є 😱",
+    "Розкажи міську легенду зі свого міста (або вигадай її) 🏚",
+]
+
+
+def halloween_active(now: datetime | None = None) -> bool:
+    now = now or datetime.now(KYIV_TZ)
+    return HW_FROM <= now < HW_TO
+
+
+def hw_night_live(now: datetime | None = None) -> bool:
+    now = now or datetime.now(KYIV_TZ)
+    return HW_NIGHT <= now < HW_NIGHT + timedelta(hours=1)
+
+
+def hw_text() -> str:
+    return (
+        "🎃 <b>Тиждень Хелловіну в ANONimchyk</b> · до 1 листопада\n\n"
+        "👻 Маски голосу <b>«Привид»</b> і <b>«Демон»</b> — безкоштовно для всіх: /voice\n"
+        "🎁 Лімітовані подарунки 🎃 Гарбуз · 🦇 Кажан · 👻 Привид — тільки цього тижня\n"
+        "🎲 «Страшна правда чи дія» — у грі під час чату\n"
+        f"🎃 <b>Полювання на гарбузи</b>: після кожного справжнього чату є шанс знайти гарбуз. "
+        f"Збери {HW_PUMPKINS_NEED} — отримаєш Premium на добу!\n\n"
+        f"🌙 <b>{HW_NIGHT.day}.{HW_NIGHT.month:02d} · {HW_NIGHT.hour}:00 — Ніч страшилок!</b> "
+        "Заходь, розкажи страшну історію анонімно. Усі, хто поспілкується "
+        f"{HW_NIGHT.day} жовтня, отримають значок 🎃 у профілі назавжди."
+    )
+
+
 def hw_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")],
@@ -695,9 +750,31 @@ async def relay_messages(message: types.Message):
         if room is None:
             user_room.pop(user_id, None)
         else:
+            if message.audio or message.sticker:  # 🎵 музика і стікери — дозволені
+                if message.caption and LINK_REGEX.search(message.caption):
+                    await message.answer("🚫 Повідомлення з посиланнями або контактами заборонено.")
+                    return
+                u = init_user(user_id)
+                room["last_msg"] = time.time()
+                task_event(user_id, "room_msg")
+                head = f"<b>{esc(u['nickname'])}:</b> " + ("🎵" if message.audio else "")
+                for member_id in list(room["members"]):
+                    if member_id == user_id:
+                        continue
+                    ok = await safe_send(member_id, head)
+                    if ok:
+                        try:
+                            await bot.copy_message(member_id, message.chat.id, message.message_id)
+                        except TelegramAPIError:
+                            ok = False
+                    if not ok:
+                        room["members"].discard(member_id)
+                        user_room.pop(member_id, None)
+                return
             if not message.text:
                 await message.answer(
-                    "📷 У кімнатах поки підтримується лише текст — це для безпеки спілкування в групі."
+                    "📷 У кімнатах можна писати текст, ділитися музикою 🎵 і стікерами 😀. "
+                    "Фото, відео й голосові — тільки в приватному чаті 1-на-1."
                 )
                 return
             if LINK_REGEX.search(message.text):

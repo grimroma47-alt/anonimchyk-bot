@@ -1,3 +1,134 @@
+@dp.callback_query(F.data == "mood_clear")
+async def mood_clear(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    u["mood"], u["mood_at"], u["song"], u["song_at"] = None, 0.0, None, 0.0
+    request_save()
+    try:
+        await call.message.edit_text(mood_text(u), reply_markup=mood_keyboard(u))
+    except TelegramAPIError:
+        pass
+    await call.answer("Скинуто")
+
+
+@dp.callback_query(F.data == "mood_song")
+async def mood_song_ask(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id in active_chats:
+        await call.answer("Пісню можна змінити після чату 🙂", show_alert=True)
+        return
+    await state.set_state(MoodStates.song)
+    await call.message.answer(
+        "🎵 Напиши пісню, яка зараз у тебе в настрої — виконавця і назву "
+        f"(до {SONG_MAX} символів).\nНаприклад: <i>Океан Ельзи — Обійми</i>\n\n"
+        "Без посилань. Скасувати: /cancel"
+    )
+    await call.answer()
+
+
+@dp.message(MoodStates.song, F.text)
+async def mood_song_save(message: types.Message, state: FSMContext):
+    text = " ".join((message.text or "").split())
+    if text.startswith("/"):
+        await state.clear()
+        await message.answer("Дію скасовано.", reply_markup=get_main_keyboard())
+        return
+    if len(text) < 2 or len(text) > SONG_MAX:
+        await message.answer(f"Напиши від 2 до {SONG_MAX} символів, наприклад: Океан Ельзи — Обійми")
+        return
+    if _SONG_BAD.search(text):
+        await message.answer("Без посилань і @нікнеймів, будь ласка — лише виконавець і назва пісні 🙂")
+        return
+    u = init_user(message.from_user.id)
+    u["song"], u["song_at"] = text, time.time()
+    request_save()
+    await state.clear()
+    await message.answer(
+        "✅ Готово! Співрозмовники побачать: 🎵 «" + protect_text(esc(text)) + "»",
+        reply_markup=get_main_keyboard(),
+    )
+    await message.answer(mood_text(u), reply_markup=mood_keyboard(u))
+
+
+def vibe_note_for(me: dict, other: dict) -> str:
+    """Що бачить людина на початку чату: настрій і пісня співрозмовника + тема дня."""
+    lines = []
+    mine, theirs = current_mood(me), current_mood(other)
+    if theirs and theirs == mine:
+        lines.append(f"🎭 Ви на одній хвилі: <b>{MOODS[theirs]}</b>")
+    elif theirs:
+        lines.append(f"🎭 Настрій співрозмовника: <b>{MOODS[theirs]}</b>")
+    song = current_song(other)
+    if song:
+        lines.append("🎵 Співрозмовник зараз слухає: «" + protect_text(esc(song)) + "»")
+    if other.get("bio"):
+        lines.append("📝 Про співрозмовника: «" + protect_text(esc(other["bio"])) + "»")
+    lines.append(f"💬 Тема дня: <b>{topic_of_day()}</b>")
+    if hw_night_live():
+        lines.append("🌙 <b>Зараз Ніч страшилок</b> — розкажіть одне одному найстрашнішу історію 👻")
+    return "\n".join(lines)
+
+
+def topic_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎲 Інша тема", callback_data="topic_new")]])
+
+
+async def send_vibe_notes(user_id: int, u: dict, partner_id: int, p: dict):
+    await safe_send(user_id, vibe_note_for(u, p), reply_markup=topic_kb())
+    await safe_send(partner_id, vibe_note_for(p, u), reply_markup=topic_kb())
+
+
+@dp.message(Command("topic"))
+async def topic_cmd(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await state.clear()
+        init_user(user_id)
+        await message.answer(
+            f"💬 <b>Тема дня:</b> {topic_of_day()}\n\n"
+            "Під час чату натисни /topic — і бот підкине вам обом нову тему для розмови 🎲"
+        )
+        return
+    err = await new_topic_for_pair(user_id, partner_id)
+    if err:
+        await message.answer(err)
+
+
+async def new_topic_for_pair(user_id: int, partner_id: int) -> str | None:
+    """Підкидає обом нову тему. Повертає текст помилки, якщо тему щойно змінювали."""
+    now = time.time()
+    if now - max(topic_last.get(user_id, 0), topic_last.get(partner_id, 0)) < TOPIC_COOLDOWN:
+        return "⏳ Тему щойно змінювали — спершу обговоріть цю 🙂"
+    topic_last[user_id] = now
+    text = f"🎲 Нова тема для розмови: <b>{random_topic(topic_of_day())}</b>"
+    await safe_send(user_id, text, reply_markup=topic_kb())
+    await safe_send(partner_id, text, reply_markup=topic_kb())
+    return None
+
+
+@dp.callback_query(F.data == "topic_new")
+async def topic_new_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await call.answer("Чат уже завершено — нова тема буде в наступному 🙂", show_alert=True)
+        return
+    err = await new_topic_for_pair(user_id, partner_id)
+    await call.answer(err or "")
+
+
+async def maybe_warn_low_rating(user_id: int, u: dict):
+    if is_low_rated(u) and not u.get("low_warned"):
+        u["low_warned"] = True
+        await safe_send(
+            user_id,
+            "⚠️ Співрозмовники часто ставлять тобі 👎.\n"
+            "Через це бот рідше підбирає тебе іншим. Будь привітнішим — "
+            "і рейтинг підросте, а з ним і кількість цікавих чатів 🙂",
+        )
+    elif not is_low_rated(u) and u.get("low_warned"):
+        u["low_warned"] = False
+
+
 def profile_interests_keyboard(u: dict, tab: str = "main"):
     chosen = u.get("interests") or set()
     topics = HOBBY_TOPICS if tab == "hobby" else ROOM_TOPICS
@@ -2201,64 +2332,6 @@ def chat_mode_label(mode: str) -> str:
     if mode.startswith("int:"):
         return f"🧩 Чат за темою {INTEREST_LABELS.get(mode[4:], mode[4:])}"
     return "🔍 Анонімний чат"
-
-
-def where_text(user_id: int) -> str:
-    now = time.time()
-    fid = friend_mode.get(user_id)
-    if fid and user_id not in active_chats:
-        f = users_db.get(fid) or {}
-        return (
-            f"👫 <b>Ти в переписці з другом</b> {esc(f.get('nickname') or '')}\n"
-            f"Пиши — повідомлення йдуть другу. Вийти: «{BTN_FRIEND_EXIT}»."
-        )
-    if user_id in active_chats:
-        meta = chat_meta.get(user_id) or {}
-        p = users_db.get(active_chats[user_id]) or {}
-        mins = int((now - meta.get("start", now)) // 60)
-        return (
-            f"💬 <b>Ти зараз у чаті</b>: {chat_mode_label(meta.get('mode', 'normal'))}\n"
-            f"👤 Співрозмовник: {short_info(p)}\n"
-            f"⏱ {mins} хв · твоїх повідомлень: {meta.get('msgs', 0)}\n\n"
-            "Просто пиши — повідомлення йдуть співрозмовнику. Завершити: «❌ Завершити чат»."
-        )
-    if user_id in queue:
-        mode = search_mode.get(user_id, "normal")
-        mins = int((now - queue_since.get(user_id, now)) // 60)
-        return f"⏳ <b>Йде пошук</b>: {chat_mode_label(mode)} · {mins} хв\nЩойно когось знайду — одразу з'єдную."
-    if user_id in user_room:
-        room = rooms.get(user_room[user_id]) or {}
-        title = {**ROOM_TOPICS, **HW_ROOM}.get(room.get("topic"), "кімната")
-        return f"👥 <b>Ти в кімнаті</b>: {title} · учасників: {len(room.get('members') or ())}"
-    return "🙂 Ти зараз не в чаті й не в пошуку. Натисни «🔍 Шукати співрозмовника» 👇"
-
-
-@dp.message(F.text == BTN_BACK_CHAT)
-@dp.message(F.text == BTN_BACK_ROOM)
-@dp.message(Command("where", "chat"))
-async def where_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    uid = message.from_user.id
-    extra, line = {}, ""
-    if uid in active_chats:
-        kb = get_chat_keyboard()
-        extra, line = resume_kwargs(uid)
-    elif uid in user_room:
-        kb = get_room_keyboard()
-    elif uid in friend_mode:
-        kb = get_friend_mode_keyboard()
-    else:
-        kb = get_main_keyboard()
-    text = where_text(uid) + (f"\n\n{line}" if line else "")
-    try:
-        await message.answer(text, reply_markup=kb, **extra)
-    except TelegramAPIError:  # повідомлення видалене чи недоступне — просто без цитати
-        await message.answer(where_text(uid), reply_markup=kb)
-
-# ---------------------------------------------------------------------------
-# ✨ Розваги: гороскоп, карта дня, сумісність знаків, що нового, канал зізнань
-# ---------------------------------------------------------------------------
-import hashlib
 
 
 # === КІНЕЦЬ part4.py ===

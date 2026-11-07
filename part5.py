@@ -1,3 +1,60 @@
+def where_text(user_id: int) -> str:
+    now = time.time()
+    fid = friend_mode.get(user_id)
+    if fid and user_id not in active_chats:
+        f = users_db.get(fid) or {}
+        return (
+            f"👫 <b>Ти в переписці з другом</b> {esc(f.get('nickname') or '')}\n"
+            f"Пиши — повідомлення йдуть другу. Вийти: «{BTN_FRIEND_EXIT}»."
+        )
+    if user_id in active_chats:
+        meta = chat_meta.get(user_id) or {}
+        p = users_db.get(active_chats[user_id]) or {}
+        mins = int((now - meta.get("start", now)) // 60)
+        return (
+            f"💬 <b>Ти зараз у чаті</b>: {chat_mode_label(meta.get('mode', 'normal'))}\n"
+            f"👤 Співрозмовник: {short_info(p)}\n"
+            f"⏱ {mins} хв · твоїх повідомлень: {meta.get('msgs', 0)}\n\n"
+            "Просто пиши — повідомлення йдуть співрозмовнику. Завершити: «❌ Завершити чат»."
+        )
+    if user_id in queue:
+        mode = search_mode.get(user_id, "normal")
+        mins = int((now - queue_since.get(user_id, now)) // 60)
+        return f"⏳ <b>Йде пошук</b>: {chat_mode_label(mode)} · {mins} хв\nЩойно когось знайду — одразу з'єдную."
+    if user_id in user_room:
+        room = rooms.get(user_room[user_id]) or {}
+        title = {**ROOM_TOPICS, **HW_ROOM}.get(room.get("topic"), "кімната")
+        return f"👥 <b>Ти в кімнаті</b>: {title} · учасників: {len(room.get('members') or ())}"
+    return "🙂 Ти зараз не в чаті й не в пошуку. Натисни «🔍 Шукати співрозмовника» 👇"
+
+
+@dp.message(F.text == BTN_BACK_CHAT)
+@dp.message(F.text == BTN_BACK_ROOM)
+@dp.message(Command("where", "chat"))
+async def where_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    extra, line = {}, ""
+    if uid in active_chats:
+        kb = get_chat_keyboard()
+        extra, line = resume_kwargs(uid)
+    elif uid in user_room:
+        kb = get_room_keyboard()
+    elif uid in friend_mode:
+        kb = get_friend_mode_keyboard()
+    else:
+        kb = get_main_keyboard()
+    text = where_text(uid) + (f"\n\n{line}" if line else "")
+    try:
+        await message.answer(text, reply_markup=kb, **extra)
+    except TelegramAPIError:  # повідомлення видалене чи недоступне — просто без цитати
+        await message.answer(where_text(uid), reply_markup=kb)
+
+# ---------------------------------------------------------------------------
+# ✨ Розваги: гороскоп, карта дня, сумісність знаків, що нового, канал зізнань
+# ---------------------------------------------------------------------------
+import hashlib
+
 ZODIAC = {k: (uk, el) for k, uk, el in [('aries', '♈ Овен', 'fire'), ('taurus', '♉ Телець', 'earth'), ('gemini', '♊ Близнюки', 'air'), ('cancer', '♋ Рак', 'water'), ('leo', '♌ Лев', 'fire'), ('virgo', '♍ Діва', 'earth'), ('libra', '♎ Терези', 'air'), ('scorpio', '♏ Скорпіон', 'water'), ('sagittarius', '♐ Стрілець', 'fire'), ('capricorn', '♑ Козоріг', 'earth'), ('aquarius', '♒ Водолій', 'air'), ('pisces', '♓ Риби', 'water')]}
 H_DAY = [
     'Сьогодні вдалий день, щоб почати те, що давно відкладав(-ла).',
@@ -1934,7 +1991,7 @@ def rooms_intro_text(user_id: int) -> str:
     text = (
         "👥 <b>Кімнати за інтересами</b>\n\n"
         f"Обери тему — потрапиш у групу до {ROOM_CAPACITY} людей, які говорять про те саме. "
-        "У кімнатах поки підтримується лише текст — це для безпеки спілкування в групі."
+        "У кімнатах — текст, музика 🎵 і стікери 😀. Фото й відео — лише в приватному чаті."
     )
     if user_id in queue:
         text += "\n\n🔔 Пошук співрозмовника не зупиниться — щойно когось знайду, покличу тебе."
@@ -2208,61 +2265,6 @@ async def comeback_tick():
     if sent:
         stat_add("comeback", sent)
     request_save()
-
-
-# ---------------------------------------------------------------------------
-# 🎃 Хелловін: тиждень масок (27.10–01.11) — страшні маски голосу безкоштовно, лімітовані подарунки,
-# «Страшна правда чи дія», Ніч страшилок 31.10 о 23:00 і значок 🎃 за чат 31 жовтня
-# ---------------------------------------------------------------------------
-HW_FROM = _parse_dt_env("HALLOWEEN_FROM", "2026-10-27T00:00")
-HW_TO = _parse_dt_env("HALLOWEEN_TO", "2026-11-02T00:00")
-HW_NIGHT = _parse_dt_env("HALLOWEEN_NIGHT", "2026-10-31T23:00")  # Ніч страшилок триває годину
-HW_BADGE_DAY = HW_NIGHT.date().isoformat()  # хто поспілкувався цього дня — отримує значок 🎃
-HW_NIGHT_REMIND_MIN = 5
-HALLOWEEN_VOICES = {"ghost", "demon"}
-
-SPOOKY_TRUTHS = [
-    "Чого ти боявся(-лася) в дитинстві найбільше?",
-    "Розкажи найстрашніший сон, який пам'ятаєш.",
-    "Ти віриш у привидів? Чому?",
-    "Що найдивніше траплялося з тобою вночі?",
-    "У який фільм жахів ти ніколи не подивишся вдруге?",
-    "Чи був у тебе момент, коли здавалося, що вдома хтось є?",
-    "Який звук уночі лякає тебе найбільше?",
-    "Куди б ти ніколи не пішов (не пішла) сам(а) вночі?",
-]
-SPOOKY_DARES = [
-    "Напиши страшну історію рівно в три речення 👻",
-    "Надішли голосове моторошним шепотом (маска «Привид» безкоштовна до 1.11) 🎙",
-    "Опиши свій ідеальний хелловінський костюм одним реченням 🎃",
-    "Вигадай назву для фільму жахів про ваш чат 🎬",
-    "Надішли найстрашніший стікер, який у тебе є 😱",
-    "Розкажи міську легенду зі свого міста (або вигадай її) 🏚",
-]
-
-
-def halloween_active(now: datetime | None = None) -> bool:
-    now = now or datetime.now(KYIV_TZ)
-    return HW_FROM <= now < HW_TO
-
-
-def hw_night_live(now: datetime | None = None) -> bool:
-    now = now or datetime.now(KYIV_TZ)
-    return HW_NIGHT <= now < HW_NIGHT + timedelta(hours=1)
-
-
-def hw_text() -> str:
-    return (
-        "🎃 <b>Тиждень Хелловіну в ANONimchyk</b> · до 1 листопада\n\n"
-        "👻 Маски голосу <b>«Привид»</b> і <b>«Демон»</b> — безкоштовно для всіх: /voice\n"
-        "🎁 Лімітовані подарунки 🎃 Гарбуз · 🦇 Кажан · 👻 Привид — тільки цього тижня\n"
-        "🎲 «Страшна правда чи дія» — у грі під час чату\n"
-        f"🎃 <b>Полювання на гарбузи</b>: після кожного справжнього чату є шанс знайти гарбуз. "
-        f"Збери {HW_PUMPKINS_NEED} — отримаєш Premium на добу!\n\n"
-        f"🌙 <b>{HW_NIGHT.day}.{HW_NIGHT.month:02d} · {HW_NIGHT.hour}:00 — Ніч страшилок!</b> "
-        "Заходь, розкажи страшну історію анонімно. Усі, хто поспілкується "
-        f"{HW_NIGHT.day} жовтня, отримають значок 🎃 у профілі назавжди."
-    )
 
 
 # === КІНЕЦЬ part5.py ===

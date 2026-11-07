@@ -965,6 +965,9 @@ EN_PAIRS2 = {
     "⏳ Проговорили (чати + друзі): <b>": "⏳ Talk time (chats + friends): <b>",
     " год</b>": " h</b>",
     " хв</b>": " min</b>",
+    # 07.11-c — кімнати: музика і стікери
+    "📷 У кімнатах можна писати текст, ділитися музикою 🎵 і стікерами 😀. Фото, відео й голосові — тільки в приватному чаті 1-на-1.": "📷 In rooms you can write text and share music 🎵 and stickers 😀. Photos, videos and voice messages — only in a private 1-on-1 chat.",
+    "У кімнатах — текст, музика 🎵 і стікери 😀. Фото й відео — лише в приватному чаті.": "Rooms support text, music 🎵 and stickers 😀. Photos and videos — only in a private chat.",
 }
 
 # === КІНЕЦЬ lang_en2.py ===

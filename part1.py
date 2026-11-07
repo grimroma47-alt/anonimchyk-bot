@@ -21,6 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    FSInputFile,
     BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -36,7 +37,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
-BOT_VERSION = "07.11-b"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
+BOT_VERSION = "07.11-c"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -438,6 +439,7 @@ user_counter = 1000
 banned_users: set[int] = set()
 # Статистика для адміна: дата (YYYY-MM-DD, Київ) -> лічильники за день. Зберігається в базі.
 stats_days: dict[str, dict] = {}
+topup_reset_done = False  # разове обнулення тестових поповнень у статистиці (07.11)
 # Поточні чати: user_id -> {"start": час, "mode": режим, "msgs": скільки написав} (лише в пам'яті)
 chat_meta: dict[int, dict] = {}
 compat_last: dict[int, str] = {}  # 💯 сумісність щойно завершеного чату
@@ -1758,7 +1760,7 @@ async def check_and_credit_invoice(invoice_id: str) -> bool:
     pending_crypto_invoices.pop(invoice_id, None)
     u = init_user(info["user_id"])
     u["balance"] += info["credit"]
-    record_topup("crypto", info["credit"])
+    record_topup("crypto", info["credit"], info["user_id"])
     bonus = apply_topup_bonus(u, info["credit"])
     request_save()
     if bonus:
@@ -1982,6 +1984,7 @@ def _make_snapshot() -> bytes:
             "letters_db": letters_db,
             "withdraw_db": withdraw_db,
             "collect_sold": collect_sold,
+            "topup_reset_v1": topup_reset_done,
         },
         protocol=4,
     )
@@ -1991,7 +1994,7 @@ def _apply_snapshot(blob: bytes):
     import copy
     import pickle
 
-    global user_counter, report_counter, gift_revenue_total, lottery_revenue_total, ad_counter
+    global user_counter, report_counter, gift_revenue_total, lottery_revenue_total, ad_counter, topup_reset_done
     data = pickle.loads(blob)
 
     users_db.clear()
@@ -2015,6 +2018,13 @@ def _apply_snapshot(blob: bytes):
     ad_counter = data.get("ad_counter", ad_counter)
     stats_days.clear()
     stats_days.update(data.get("stats_days", {}))
+    topup_reset_done = bool(data.get("topup_reset_v1"))
+    if not topup_reset_done:  # 07.11: обнуляємо внесені раніше (тестові) поповнення в статистиці — разово
+        for _d in stats_days.values():
+            for _k in ("topup", "topup_n", "topup_list"):
+                _d.pop(_k, None)
+        topup_reset_done = True
+        logging.info("Статистику поповнень обнулено (разово)")
     banners.clear()
     banners.update(data.get("banners", {}))
     ref_contest.clear()
@@ -2312,25 +2322,6 @@ async def start_handler(message: types.Message, state: FSMContext):
         )
         return
     await send_welcome(message.chat.id, message.from_user.first_name, u, state, message)
-
-
-async def send_welcome(chat_id: int, first_name, u: dict, state: FSMContext, message=None):
-    user_id = chat_id
-    welcome = (
-        f"Привіт, {protect_text(esc(first_name))}! Вітаємо в анонімному чаті! 🤫\n\n"
-        f"Твій унікальний номер: <b>{u['custom_id']}</b>\n"
-        "Змінити профіль можна будь-коли: ⚙️ Налаштування → ✏️ Мій профіль.\n\n"
-        "📜 Користуючись ботом, ти погоджуєшся з правилами: /rules"
-    )
-    if not u.get("founder_no") and founder_promo_line():
-        welcome += "\n\n" + founder_promo_line()
-    if not await send_banner(user_id, "start", caption=welcome, reply_markup=get_main_keyboard()):
-        if message is not None:
-            await message.answer(welcome, reply_markup=get_main_keyboard())
-        else:
-            await safe_send(chat_id, welcome, reply_markup=get_main_keyboard())
-    if not profile_complete(u):
-        await start_onboarding(chat_id, state)
 
 
 # === КІНЕЦЬ part1.py ===

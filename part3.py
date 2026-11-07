@@ -1,3 +1,12 @@
+@dp.message(F.text == BTN_FRIEND_EXIT)
+async def friend_mode_exit(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    friend_mode.pop(uid, None)
+    note = "💬 Ти знову в анонімному чаті — пиши співрозмовнику." if uid in active_chats else "🏠 Головне меню"
+    await message.answer(f"🚪 Переписку закрито.\n{note}", reply_markup=_after_friend_kb(uid))
+
+
 @dp.callback_query(F.data.startswith("friend_remove_"))
 async def friend_remove(call: types.CallbackQuery):
     target_id = int(call.data[len("friend_remove_"):])
@@ -236,6 +245,45 @@ FUNNY_GIFT_TEXT = {
 }
 
 
+# 🎆 Анімації особливих подарунків: файли лежать поруч із bot.py (завантаж їх у репозиторій)
+GIFT_ANIM_FILES = {"sp_fireworks": "gift_fireworks.mp4", "sp_fireheart": "gift_fireheart.mp4", "sp_mask": "gift_mask.mp4"}
+gift_anim_ids: dict[str, str] = {}  # після першого надсилання Telegram дає file_id — далі шлемо миттєво
+
+
+def _anim_dir() -> str:
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+
+async def send_gift_animation(chat_id: int, key: str, caption: str) -> bool:
+    """Надсилає анімацію подарунка з підписом. Якщо файлу немає чи щось не так — False (тоді йде звичайний текст)."""
+    fname = GIFT_ANIM_FILES.get(key)
+    if not fname:
+        return False
+    u = users_db.get(chat_id)
+    if u is not None and u.get("blocked_bot"):
+        return False
+    src = gift_anim_ids.get(key)
+    if not src:
+        path = os.path.join(_anim_dir(), fname)
+        if not os.path.exists(path):
+            return False
+        src = FSInputFile(path)
+    try:
+        msg = await bot.send_animation(chat_id, src, caption=caption)
+        if msg.animation:
+            gift_anim_ids[key] = msg.animation.file_id
+        elif msg.video:
+            gift_anim_ids[key] = msg.video.file_id
+        return True
+    except TelegramAPIError as e:
+        logging.warning("Анімація подарунка %s не надіслана: %s", key, e)
+        gift_anim_ids.pop(key, None)
+        return False
+
+
 async def send_with_effect(chat_id: int, text: str, effect: str | None = None) -> bool:
     """Надсилає повідомлення з повноекранним ефектом; якщо ефект не спрацював — просто текстом."""
     if effect:
@@ -385,7 +433,8 @@ async def send_gift_item(call: types.CallbackQuery):
         + f"На баланс нараховано {recipient_amount:.2f} грн."
         + (f"\n💸 {uah(earned)} з них можна буде вивести на карту через {EARN_HOLD_DAYS} днів." if earned else "")
     )
-    await send_with_effect(partner_id, text, effect)
+    if not (key in GIFT_ANIM_FILES and await send_gift_animation(partner_id, key, text)):
+        await send_with_effect(partner_id, text, effect)
     await call.answer()
 
 
@@ -504,6 +553,8 @@ async def admin_chatlog_detail(call: types.CallbackQuery):
     await call.answer()
 
 
+
+
 STATS_PERIODS = {
     "today": ("Сьогодні", 1, 0),
     "yday": ("Вчора", 1, 1),
@@ -538,6 +589,8 @@ def _sum_stats(days: list[str]) -> dict:
                 bucket = total.setdefault(key, {})
                 for sub, amount in val.items():
                     bucket[sub] = bucket.get(sub, 0) + amount
+            elif isinstance(val, (list, tuple)):
+                total[key] = list(total.get(key) or []) + list(val)  # new_ids, topup_list — склеюємо
             else:
                 total[key] = total.get(key, 0) + val
     return total
@@ -608,7 +661,7 @@ def admin_stats_text(period: str) -> str:
         f"«Ми скучили» {t.get('comeback', 0)}" + (f" · 🎃 гарбузів {t.get('pumpkins', 0)}" if t.get('pumpkins') else ""),
         "🚨 Скарги: " + (" ".join(f"{REPORT_REASONS.get(k, k).split(' ')[0]}{n}" for k, n in t.get("reports", {}).items()) or "0"),
         "",
-        f"💰 Поповнення: <b>{_money(topup_total)} грн</b> ({t['topup_n']} {_plural(t['topup_n'], 'оплата', 'оплати', 'оплат')})",
+        f"💰 Поповнення: <b>{_money(topup_total)} грн</b> ({t.get('topup_n', 0)} {_plural(t.get('topup_n', 0), 'оплата', 'оплати', 'оплат')})",
     ]
     if topup_parts:
         lines.append(f"     {topup_parts}")
@@ -655,12 +708,75 @@ def admin_stats_keyboard(period: str):
             row[:2],
             row[2:],
             [InlineKeyboardButton(text=f"🆕 Нові учасники ({new_n}) →", callback_data=f"adm_new_{period}_0")],
+            [InlineKeyboardButton(text=f"💰 Реальні поповнення ({len(topups_for_period(period))}) →", callback_data=f"adm_top_{period}_0")],
             [InlineKeyboardButton(text="🔄 Оновити", callback_data=f"adm_st_{period}")],
         ]
     )
 
 
 NEW_LIST_PER_PAGE = 10
+TOPUP_SOURCE_LABELS = {"stars": "⭐ Stars", "jar": "🏦 Банка", "card": "💳 Картка", "crypto": "🪙 Крипта"}
+
+
+def topups_for_period(period: str) -> list:
+    """Реальні поповнення за період (Stars, Банка, картка, крипта), найновіші зверху."""
+    _title, count, skip = STATS_PERIODS.get(period, STATS_PERIODS["today"])
+    items = []
+    for day in _days_back(count, skip):
+        items += list(stats_days.get(day, {}).get("topup_list", []))
+    items.sort(key=lambda x: x[0], reverse=True)
+    return items
+
+
+@dp.callback_query(F.data.startswith("adm_top_"))
+@admin_only
+async def adm_topups(call: types.CallbackQuery):
+    try:
+        period, page = call.data[len("adm_top_"):].rsplit("_", 1)
+        page = int(page)
+    except ValueError:
+        period, page = "today", 0
+    if period not in STATS_PERIODS:
+        period = "today"
+    title = STATS_PERIODS[period][0]
+    items = topups_for_period(period)
+    total = sum(x[2] for x in items)
+    pages = max(1, (len(items) + NEW_LIST_PER_PAGE - 1) // NEW_LIST_PER_PAGE)
+    page = min(max(page, 0), pages - 1)
+    chunk = items[page * NEW_LIST_PER_PAGE:(page + 1) * NEW_LIST_PER_PAGE]
+    lines = [
+        f"💰 <b>Реальні поповнення — {title.lower() if period in ('today', 'yday') else 'за ' + title}</b>",
+        f"Разом: <b>{_money(total)} грн</b> · {len(items)} {_plural(len(items), 'оплата', 'оплати', 'оплат')}",
+        "",
+    ]
+    if not chunk:
+        lines.append("Поки жодного поповнення 🙂")
+    for i, (ts, uid, amount, src) in enumerate(chunk, start=page * NEW_LIST_PER_PAGE + 1):
+        u = users_db.get(uid) or {}
+        if u.get("tg_username"):
+            who = f"@{esc(u['tg_username'])}"
+        elif uid:
+            who = f'<a href="tg://user?id={uid}">{esc(u.get("tg_name") or "профіль")}</a>'
+        else:
+            who = "—"
+        when = datetime.fromtimestamp(ts, KYIV_TZ).strftime("%d.%m %H:%M")
+        lines.append(
+            f"{i}. <b>{esc(u.get('custom_id', ''))}</b> · {who} · 🕐 {when}\n"
+            f"     💰 <b>{amount:.0f} грн</b> · {TOPUP_SOURCE_LABELS.get(src, src)}"
+        )
+        lines.append("")
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_top_{period}_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_top_{period}_{page + 1}"))
+    kb = [nav] if nav else []
+    kb.append([InlineKeyboardButton(text="⬅️ До статистики", callback_data=f"adm_st_{period}")])
+    try:
+        await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), disable_web_page_preview=True)
+    except TelegramAPIError:
+        pass
+    await call.answer()
 
 
 def new_users_for_period(period: str) -> list[int]:
@@ -1300,7 +1416,7 @@ async def _resolve_payment(code: str, approve: bool) -> str:
         p["status"] = "confirmed"
         u = init_user(p["user_id"])
         u["balance"] += p["amount"]
-        record_topup("jar" if p.get("method") == "jar" else "card", p["amount"])
+        record_topup("jar" if p.get("method") == "jar" else "card", p["amount"], p["user_id"])
         bonus = apply_topup_bonus(u, p["amount"])
         request_save()
         text = f"✅ Оплату {code} підтверджено! Баланс поповнено на {p['amount']} грн."
@@ -1805,9 +1921,13 @@ def stat_add(key: str, n: float = 1, sub: str | None = None):
         logging.warning("Статистика: %s", e)
 
 
-def record_topup(source: str, amount: float):
+def record_topup(source: str, amount: float, uid: int | None = None):
     stat_add("topup", float(amount), sub=source)
     stat_add("topup_n")
+    try:  # 💰 список реальних поповнень по днях: хто, скільки, коли, яким способом
+        stats_day().setdefault("topup_list", []).append([time.time(), uid, float(amount), source])
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Список поповнень: %s", e)
 
 
 def record_spend(category: str, amount: float):
@@ -2297,137 +2417,6 @@ async def mood_set(call: types.CallbackQuery):
     except TelegramAPIError:
         pass
     await call.answer(f"Настрій: {MOODS[key]}")
-
-
-@dp.callback_query(F.data == "mood_clear")
-async def mood_clear(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    u["mood"], u["mood_at"], u["song"], u["song_at"] = None, 0.0, None, 0.0
-    request_save()
-    try:
-        await call.message.edit_text(mood_text(u), reply_markup=mood_keyboard(u))
-    except TelegramAPIError:
-        pass
-    await call.answer("Скинуто")
-
-
-@dp.callback_query(F.data == "mood_song")
-async def mood_song_ask(call: types.CallbackQuery, state: FSMContext):
-    if call.from_user.id in active_chats:
-        await call.answer("Пісню можна змінити після чату 🙂", show_alert=True)
-        return
-    await state.set_state(MoodStates.song)
-    await call.message.answer(
-        "🎵 Напиши пісню, яка зараз у тебе в настрої — виконавця і назву "
-        f"(до {SONG_MAX} символів).\nНаприклад: <i>Океан Ельзи — Обійми</i>\n\n"
-        "Без посилань. Скасувати: /cancel"
-    )
-    await call.answer()
-
-
-@dp.message(MoodStates.song, F.text)
-async def mood_song_save(message: types.Message, state: FSMContext):
-    text = " ".join((message.text or "").split())
-    if text.startswith("/"):
-        await state.clear()
-        await message.answer("Дію скасовано.", reply_markup=get_main_keyboard())
-        return
-    if len(text) < 2 or len(text) > SONG_MAX:
-        await message.answer(f"Напиши від 2 до {SONG_MAX} символів, наприклад: Океан Ельзи — Обійми")
-        return
-    if _SONG_BAD.search(text):
-        await message.answer("Без посилань і @нікнеймів, будь ласка — лише виконавець і назва пісні 🙂")
-        return
-    u = init_user(message.from_user.id)
-    u["song"], u["song_at"] = text, time.time()
-    request_save()
-    await state.clear()
-    await message.answer(
-        "✅ Готово! Співрозмовники побачать: 🎵 «" + protect_text(esc(text)) + "»",
-        reply_markup=get_main_keyboard(),
-    )
-    await message.answer(mood_text(u), reply_markup=mood_keyboard(u))
-
-
-def vibe_note_for(me: dict, other: dict) -> str:
-    """Що бачить людина на початку чату: настрій і пісня співрозмовника + тема дня."""
-    lines = []
-    mine, theirs = current_mood(me), current_mood(other)
-    if theirs and theirs == mine:
-        lines.append(f"🎭 Ви на одній хвилі: <b>{MOODS[theirs]}</b>")
-    elif theirs:
-        lines.append(f"🎭 Настрій співрозмовника: <b>{MOODS[theirs]}</b>")
-    song = current_song(other)
-    if song:
-        lines.append("🎵 Співрозмовник зараз слухає: «" + protect_text(esc(song)) + "»")
-    if other.get("bio"):
-        lines.append("📝 Про співрозмовника: «" + protect_text(esc(other["bio"])) + "»")
-    lines.append(f"💬 Тема дня: <b>{topic_of_day()}</b>")
-    if hw_night_live():
-        lines.append("🌙 <b>Зараз Ніч страшилок</b> — розкажіть одне одному найстрашнішу історію 👻")
-    return "\n".join(lines)
-
-
-def topic_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎲 Інша тема", callback_data="topic_new")]])
-
-
-async def send_vibe_notes(user_id: int, u: dict, partner_id: int, p: dict):
-    await safe_send(user_id, vibe_note_for(u, p), reply_markup=topic_kb())
-    await safe_send(partner_id, vibe_note_for(p, u), reply_markup=topic_kb())
-
-
-@dp.message(Command("topic"))
-async def topic_cmd(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    partner_id = active_chats.get(user_id)
-    if partner_id is None:
-        await state.clear()
-        init_user(user_id)
-        await message.answer(
-            f"💬 <b>Тема дня:</b> {topic_of_day()}\n\n"
-            "Під час чату натисни /topic — і бот підкине вам обом нову тему для розмови 🎲"
-        )
-        return
-    err = await new_topic_for_pair(user_id, partner_id)
-    if err:
-        await message.answer(err)
-
-
-async def new_topic_for_pair(user_id: int, partner_id: int) -> str | None:
-    """Підкидає обом нову тему. Повертає текст помилки, якщо тему щойно змінювали."""
-    now = time.time()
-    if now - max(topic_last.get(user_id, 0), topic_last.get(partner_id, 0)) < TOPIC_COOLDOWN:
-        return "⏳ Тему щойно змінювали — спершу обговоріть цю 🙂"
-    topic_last[user_id] = now
-    text = f"🎲 Нова тема для розмови: <b>{random_topic(topic_of_day())}</b>"
-    await safe_send(user_id, text, reply_markup=topic_kb())
-    await safe_send(partner_id, text, reply_markup=topic_kb())
-    return None
-
-
-@dp.callback_query(F.data == "topic_new")
-async def topic_new_cb(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    partner_id = active_chats.get(user_id)
-    if partner_id is None:
-        await call.answer("Чат уже завершено — нова тема буде в наступному 🙂", show_alert=True)
-        return
-    err = await new_topic_for_pair(user_id, partner_id)
-    await call.answer(err or "")
-
-
-async def maybe_warn_low_rating(user_id: int, u: dict):
-    if is_low_rated(u) and not u.get("low_warned"):
-        u["low_warned"] = True
-        await safe_send(
-            user_id,
-            "⚠️ Співрозмовники часто ставлять тобі 👎.\n"
-            "Через це бот рідше підбирає тебе іншим. Будь привітнішим — "
-            "і рейтинг підросте, а з ним і кількість цікавих чатів 🙂",
-        )
-    elif not is_low_rated(u) and u.get("low_warned"):
-        u["low_warned"] = False
 
 
 # === КІНЕЦЬ part3.py ===
