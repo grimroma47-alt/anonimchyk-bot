@@ -2230,6 +2230,20 @@ def _remember_friend_msg(recipient_id: int, message_id: int, sender_id: int):
     friend_msg_map[(recipient_id, message_id)] = sender_id
 
 
+FRIEND_TALK_GAP = 300  # повідомлення друзів з паузою до 5 хв — це одна розмова (рахуємо її час)
+friend_talk_last: dict[frozenset, float] = {}
+
+
+def friend_talk_tick(a: int, b: int):
+    """💬 Час розмов друзів: додаємо паузу між їхніми повідомленнями, якщо вона до 5 хв."""
+    key = frozenset((a, b))
+    now = time.time()
+    last = friend_talk_last.get(key)
+    friend_talk_last[key] = now
+    if last is not None and 0 < now - last <= FRIEND_TALK_GAP:
+        stat_add("talk_min", round((now - last) / 60, 2))
+
+
 async def deliver_friend_message(sender_id: int, target_id: int, message: types.Message) -> str | None:
     """Надсилає повідомлення другу. Повертає текст помилки або None, якщо все ок."""
     u = init_user(sender_id)
@@ -2261,6 +2275,7 @@ async def deliver_friend_message(sender_id: int, target_id: int, message: types.
             return "Не вдалося доставити — друг зараз недоступний."
         _remember_friend_msg(target_id, sent.message_id, sender_id)
         p.setdefault("friend_last", {})[sender_id] = sent.message_id
+        friend_talk_tick(sender_id, target_id)
         return None
 
     kb = InlineKeyboardMarkup(
@@ -2283,6 +2298,7 @@ async def deliver_friend_message(sender_id: int, target_id: int, message: types.
     p.setdefault("friend_last", {})[sender_id] = sent.message_id
     unread = p.setdefault("friend_unread", {})
     unread[sender_id] = min(99, (unread.get(sender_id) or 0) + 1)
+    friend_talk_tick(sender_id, target_id)
     return None
 
 
@@ -2336,35 +2352,6 @@ async def friend_mode_exit(message: types.Message, state: FSMContext):
     friend_mode.pop(uid, None)
     note = "💬 Ти знову в анонімному чаті — пиши співрозмовнику." if uid in active_chats else "🏠 Головне меню"
     await message.answer(f"🚪 Переписку закрито.\n{note}", reply_markup=_after_friend_kb(uid))
-
-
-@dp.callback_query(F.data.startswith("friend_remove_"))
-async def friend_remove(call: types.CallbackQuery):
-    target_id = int(call.data[len("friend_remove_"):])
-    u = init_user(call.from_user.id)
-    u.get("friends", set()).discard(target_id)
-    p = users_db.get(target_id)
-    if p:
-        p.get("friends", set()).discard(call.from_user.id)
-    for a, b in ((call.from_user.id, target_id), (target_id, call.from_user.id)):
-        if friend_mode.get(a) == b:
-            friend_mode.pop(a, None)
-        ua = users_db.get(a) or {}
-        (ua.get("friend_unread") or {}).pop(b, None)
-        (ua.get("friend_last") or {}).pop(b, None)
-
-    kb = get_friends_keyboard(u)
-    if kb is None:
-        try:
-            await call.message.edit_text("👫 У тебе більше немає друзів у списку.")
-        except TelegramAPIError:
-            await call.message.answer("👫 У тебе більше немає друзів у списку.")
-    else:
-        try:
-            await call.message.edit_reply_markup(reply_markup=kb)
-        except TelegramAPIError:
-            pass
-    await call.answer("Прибрано з друзів.")
 
 
 # === КІНЕЦЬ part2.py ===

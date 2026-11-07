@@ -960,6 +960,11 @@ EN_PAIRS2 = {
     "Купи про запас і даруй у чаті кнопкою «🎁 Подарувати». Отримувач одразу отримує ": "Buy in advance and gift in chat with «🎁 Gift». The recipient instantly gets ",
     "% вартості на баланс.\n\n💰 Твій баланс: ": "% of the price on balance.\n\n💰 Your balance: ",
     "\n💸 Зароблено з поповнень друзів: ": "\n💸 Earned from friends' top-ups: ",
+    # 07.11-b — лічильник «Проговорили»
+    "💬 Проговорили за тиждень: <b>": "💬 Talked this week: <b>",
+    "⏳ Проговорили (чати + друзі): <b>": "⏳ Talk time (chats + friends): <b>",
+    " год</b>": " h</b>",
+    " хв</b>": " min</b>",
 }
 
 # === КІНЕЦЬ lang_en2.py ===

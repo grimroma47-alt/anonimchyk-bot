@@ -1,3 +1,108 @@
+def hw_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Знайти співрозмовника", callback_data="wp_go:normal")],
+        [InlineKeyboardButton(text="👻 Маска голосу", callback_data="vm_menu")],
+    ])
+
+
+@dp.message(F.text == BTN_HALLOWEEN)
+@dp.message(Command("halloween"))
+async def hw_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    init_user(message.from_user.id)
+    await send_banner(message.from_user.id, "halloween")
+    if not halloween_active():
+        await message.answer("🎃 Хелловінський тиждень уже завершився — до наступного року! 👻")
+        return
+    await message.answer(hw_text(), reply_markup=hw_kb())
+
+
+@dp.callback_query(F.data == "hw_open")
+async def hw_open(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer(hw_text() if halloween_active() else "🎃 Хелловін уже минув 👻", reply_markup=hw_kb())
+
+
+def hw_mark_badge(*uids: int):
+    if datetime.now(KYIV_TZ).date().isoformat() != HW_BADGE_DAY:
+        return
+    for x in uids:
+        u = users_db.get(x)
+        if u is not None and not u.get("hw2026"):
+            u["hw2026"] = True
+
+
+HW_PUMPKINS_NEED = 3
+HW_PUMPKIN_CHANCE = float(os.getenv("HW_PUMPKIN_CHANCE", "0.35"))
+HW_PUMPKIN_PREMIUM_MAX = 2  # скільки разів за Хелловін можна виграти Premium гарбузами
+
+
+async def hw_pumpkin_roll(user_id: int):
+    u = users_db.get(user_id)
+    if u is None or u.get("hw_prem_got", 0) >= HW_PUMPKIN_PREMIUM_MAX or random.random() > HW_PUMPKIN_CHANCE:
+        return
+    n = u.get("hw_pumpkins", 0) + 1
+    if n >= HW_PUMPKINS_NEED:
+        u["hw_pumpkins"] = 0
+        u["hw_prem_got"] = u.get("hw_prem_got", 0) + 1
+        current = u["perks"].get("premium", 0)
+        if current != float("inf"):
+            u["perks"]["premium"] = max(time.time(), current) + DAY
+        request_save()
+        await safe_send(user_id, "🎃🎃🎃 <b>Три гарбузи!</b> Premium на добу вже активовано — фільтри й усі маски голосу твої 💜")
+        return
+    u["hw_pumpkins"] = n
+    stat_add("pumpkins")
+    request_save()
+    await safe_send(
+        user_id,
+        f"🎃 Ти знайшов(-ла) гарбуз! <b>{n}/{HW_PUMPKINS_NEED}</b>\n"
+        f"Збери {HW_PUMPKINS_NEED} — і отримаєш Premium на добу. Гарбузи ховаються в справжніх розмовах 😉",
+    )
+
+
+async def hw_night_tick():
+    """31.10 о 22:55 — запрошення на Ніч страшилок (тим, хто отримує нагадування про Годину знайомств)."""
+    now = datetime.now(KYIV_TZ)
+    start = HW_NIGHT - timedelta(minutes=HW_NIGHT_REMIND_MIN)
+    if not (start <= now < HW_NIGHT) or launch_state.get("hw_night") or not _contest_can_write():
+        return
+    launch_state["hw_night"] = True
+    request_save()
+    text = (
+        f"🌙 <b>Ніч страшилок — о {HW_NIGHT.hour}:00!</b> 👻\n\n"
+        "Заходь, знайди співрозмовника й розкажіть одне одному найстрашнішу історію — анонімно.\n"
+        "Маска голосу «Привид» безкоштовна — розкажи моторошним голосом 🎙\n\n"
+        "🎃 Усі, хто поспілкується сьогодні, отримають значок у профілі назавжди!"
+    )
+    kb = hw_kb()
+    for uid in meet_recipients():
+        if uid in active_chats or uid in queue:
+            continue
+        await safe_send(uid, text, reply_markup=kb)
+        await asyncio.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# 🚨 Скарги з причиною і доказом від постраждалого (як у великих месенджерах):
+# під час чату в пам'яті лише останні 10 повідомлень кожного співрозмовника (текст; медіа — позначкою),
+# після чату вони стираються. Модератор отримує їх ТІЛЬКИ якщо той, хто скаржиться, сам погодився.
+# Самі повідомлення в базі не зберігаються — лише в повідомленні адміну.
+# ---------------------------------------------------------------------------
+EVIDENCE_KEEP = 10
+MINOR_FAST_BAN = 2  # стільки скарг «👶» від різних людей — бан одразу, до перевірки адміном
+recent_msgs: dict[int, list] = {}  # user_id -> [(час, текст)] його останні повідомлення в поточному чаті
+report_pending: dict[int, dict] = {}  # хто скаржиться -> {"on", "msgs", "ts", "reason"}
+
+REPORT_REASONS = {
+    "insult": "🤬 Образи, погрози",
+    "nsfw": "🔞 Непристойності",
+    "spam": "📢 Спам, реклама, шахрайство",
+    "minor": "👶 Неповнолітній / пристає до неповнолітніх",
+    "other": "❓ Інше",
+}
+
+
 def msg_mark(message) -> str:
     text = getattr(message, "text", None)
     if text is not None:

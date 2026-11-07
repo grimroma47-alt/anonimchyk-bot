@@ -1,3 +1,32 @@
+@dp.callback_query(F.data.startswith("friend_remove_"))
+async def friend_remove(call: types.CallbackQuery):
+    target_id = int(call.data[len("friend_remove_"):])
+    u = init_user(call.from_user.id)
+    u.get("friends", set()).discard(target_id)
+    p = users_db.get(target_id)
+    if p:
+        p.get("friends", set()).discard(call.from_user.id)
+    for a, b in ((call.from_user.id, target_id), (target_id, call.from_user.id)):
+        if friend_mode.get(a) == b:
+            friend_mode.pop(a, None)
+        ua = users_db.get(a) or {}
+        (ua.get("friend_unread") or {}).pop(b, None)
+        (ua.get("friend_last") or {}).pop(b, None)
+
+    kb = get_friends_keyboard(u)
+    if kb is None:
+        try:
+            await call.message.edit_text("👫 У тебе більше немає друзів у списку.")
+        except TelegramAPIError:
+            await call.message.answer("👫 У тебе більше немає друзів у списку.")
+    else:
+        try:
+            await call.message.edit_reply_markup(reply_markup=kb)
+        except TelegramAPIError:
+            pass
+    await call.answer("Прибрано з друзів.")
+
+
 # ---------------------------------------------------------------------------
 # Лідерборд найщедріших дарувальників
 # ---------------------------------------------------------------------------
@@ -405,91 +434,72 @@ def admin_only(func):
     return wrapper
 
 
+def _chatlog_user_label(uid: int) -> str:
+    u = users_db.get(uid) or {}
+    return esc(u.get("nickname") or u.get("custom_id") or uid)
+
+
 @dp.callback_query(F.data.startswith("adm_chats_"))
 @admin_only
-async def admin_chats_list(call: types.CallbackQuery):
+async def admin_chatlog_list(call: types.CallbackQuery):
     chatlog_reset_if_new_day()
-    try:
-        page = max(0, int(call.data.rsplit("_", 1)[1]))
-    except (ValueError, IndexError):
-        page = 0
-    entries = list(chatlog.items())
-    entries.reverse()
-    per_page = 8
-    start = page * per_page
-    chunk = entries[start:start + per_page]
-    if not chunk and page > 0:
-        await call.answer("Ця сторінка порожня")
-        return
+    page = max(0, int(call.data.rsplit("_", 1)[1]))
+    entries = list(reversed(list(chatlog.values())))
+    page_size = 8
+    pages = max(1, (len(entries) + page_size - 1) // page_size)
+    page = min(page, pages - 1)
+    chunk = entries[page * page_size:(page + 1) * page_size]
     rows = []
-    for chat_id, item in chunk:
-        a, b = item["users"]
-        ua, ub = users_db.get(a) or {}, users_db.get(b) or {}
-        na = ua.get("nickname") or ua.get("custom_id") or str(a)
-        nb = ub.get("nickname") or ub.get("custom_id") or str(b)
-        stamp = datetime.fromtimestamp(item["started"], KYIV_TZ).strftime("%H:%M")
-        count = len(item["messages"])
-        rows.append([InlineKeyboardButton(
-            text=f"💬 {na[:18]} ↔ {nb[:18]} · {stamp} · {count}",
-            callback_data=f"adm_chat_{chat_id}",
-        )])
+    for item in chunk:
+        a, b = item["a"], item["b"]
+        stamp = datetime.fromtimestamp(item["started"], KYIV_TZ).strftime("%d.%m %H:%M")
+        label = f"{_chatlog_user_label(a)} ↔ {_chatlog_user_label(b)} · {stamp} · {len(item['messages'])} пов."
+        rows.append([InlineKeyboardButton(text=label[:64], callback_data=f"adm_chat_{item['id']}")])
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm_chats_{page-1}"))
-    if start + per_page < len(entries):
-        nav.append(InlineKeyboardButton(text="Далі ➡️", callback_data=f"adm_chats_{page+1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton(text="🔄 Оновити", callback_data=f"adm_chats_{page}")])
-    await call.message.answer(
-        f"💬 <b>Анонімні чати за сьогодні</b>\n"
-        f"Збережено: {len(entries)}/{CHATLOG_MAX_CHATS}\n"
-        f"Обери розмову:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_chats_{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="adm_chats_0"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_chats_{page+1}"))
+    rows.append(nav)
+    text = f"💬 <b>Анонімні чати за сьогодні</b>\nЗбережено: {len(entries)}/{CHATLOG_MAX_CHATS}"
+    if not entries:
+        text += "\n\nПоки що чатів немає."
+    await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("adm_chat_"))
 @admin_only
-async def admin_chat_detail(call: types.CallbackQuery):
+async def admin_chatlog_detail(call: types.CallbackQuery):
     chatlog_reset_if_new_day()
     try:
-        chat_id = int(call.data.rsplit("_", 1)[1])
-    except (ValueError, IndexError):
+        entry_id = int(call.data.rsplit("_", 1)[1])
+    except ValueError:
         await call.answer("Чат не знайдено", show_alert=True)
         return
-    item = chatlog.get(chat_id)
+    item = chatlog.get(entry_id)
     if item is None:
-        await call.answer("Історія вже очищена або чат видалено", show_alert=True)
+        await call.answer("Цей чат уже видалено", show_alert=True)
         return
-    a, b = item["users"]
-    ua, ub = users_db.get(a) or {}, users_db.get(b) or {}
-    na = ua.get("nickname") or ua.get("custom_id") or str(a)
-    nb = ub.get("nickname") or ub.get("custom_id") or str(b)
-    started = datetime.fromtimestamp(item["started"], KYIV_TZ).strftime("%d.%m.%Y о %H:%M")
-    mode = {"normal": "Звичайний", "flirt": "Флірт", "voice": "Голосовий"}.get(item["mode"], item["mode"])
+    a, b = item["a"], item["b"]
+    started = datetime.fromtimestamp(item["started"], KYIV_TZ).strftime("%d.%m.%Y %H:%M:%S")
     await call.message.answer(
-        f"💬 <b>Історія чату</b>\n"
-        f"👤 {esc(na)}  ↔️  👤 {esc(nb)}\n"
-        f"🕒 {started} · {esc(mode)}\n"
-        f"Повідомлень: {len(item['messages'])}\n"
-        "━━━━━━━━━━━━━━"
+        f"💬 <b>Історія анонімного чату</b>\n"
+        f"{_chatlog_user_label(a)} ↔ {_chatlog_user_label(b)}\n"
+        f"Початок: {started}\nПовідомлень: {len(item['messages'])}"
     )
-    if not item["messages"]:
-        await call.message.answer("Поки що в цій розмові немає повідомлень.")
-    else:
-        for msg in item["messages"]:
-            sender = na if msg["from"] == a else nb
-            clock = datetime.fromtimestamp(msg["time"], KYIV_TZ).strftime("%H:%M")
-            bubble = "🟦" if msg["from"] == a else "🟩"
-            body = esc(msg["text"])
-            await call.message.answer(f"{bubble} <b>{esc(sender)}</b>  <i>{clock}</i>\n{body}")
+    # Відображаємо розмову звичайними повідомленнями, не кодом.
+    for msg in item["messages"]:
+        stamp = datetime.fromtimestamp(msg["time"], KYIV_TZ).strftime("%H:%M:%S")
+        sender = _chatlog_user_label(msg["user"])
+        body = esc(msg["text"])
+        await call.message.answer(f"<b>{sender}</b> <i>{stamp}</i>\n{body}")
     await call.message.answer(
-        "Кінець розмови.",
+        "Кінець історії.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="⬅️ До списку чатів", callback_data="adm_chats_0")
-        ]]),
+        ]])
     )
     await call.answer()
 
@@ -590,6 +600,8 @@ def admin_stats_text(period: str) -> str:
         f"🙋 Активних: <b>{len(t['active'])}</b>",
         f"💬 Чатів: <b>{t['chats']}</b> (справжніх від 1 хв: {t['real_chats']})",
         f"     ❤️ флірт {t['flirt']} · 🧩 інтереси {t['interest']} · 👫 друзі {t['friends']}",
+        f"⏳ Проговорили (чати + друзі): <b>{talk_label(float(t.get('talk_min') or 0))}</b>"
+        + (f" {int(float(t.get('talk_min') or 0)) % 60} хв" if float(t.get('talk_min') or 0) >= 60 else ""),
         f"✉️ Повідомлень: {t['msgs']}",
         f"👋 Покликано «хтось шукає»: {t.get('wait_pings', 0)}",
         f"🧭 Кімнати: входів {t.get('room_join', 0)} · фоновий пошук {t.get('bg_search', 0)} · "
@@ -1894,8 +1906,8 @@ def task_event(user_id: int, event: str, n: int = 1):
 
 
 def on_chat_started(a: int, b: int, mode: str):
-    chatlog_start(a, b, mode)
     hw_mark_badge(a, b)
+    chatlog_start(a, b, mode)
     now = time.time()
     for x in (a, b):
         chat_meta[x] = {"start": now, "mode": mode, "msgs": 0}
@@ -2001,6 +2013,7 @@ def on_chat_ended(a: int, b: int):
         if duration < REAL_CHAT_SECONDS or ma["msgs"] < 1 or mb["msgs"] < 1:
             return  # «натиснув і втік» не рахується — щоб завдання не накручували
         stat_add("real_chats")
+        stat_add("talk_min", round(duration / 60, 2))  # 💬 «Проговорили за тиждень»
         long_chat = duration >= LONG_CHAT_SECONDS and ma["msgs"] >= 3 and mb["msgs"] >= 3
         mode = ma["mode"]
         for x in (a, b):
@@ -2415,39 +2428,6 @@ async def maybe_warn_low_rating(user_id: int, u: dict):
         )
     elif not is_low_rated(u) and u.get("low_warned"):
         u["low_warned"] = False
-
-
-def profile_interests_keyboard(u: dict, tab: str = "main"):
-    chosen = u.get("interests") or set()
-    topics = HOBBY_TOPICS if tab == "hobby" else ROOM_TOPICS
-    buttons = [
-        InlineKeyboardButton(text=("✅ " if k in chosen else "") + label, callback_data=f"pi_t_{tab}_{k}")
-        for k, label in topics.items()
-    ]
-    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-    tabs = [
-        InlineKeyboardButton(text=("• " if tab != "hobby" else "") + "🧩 Інтереси", callback_data="pi_tab_main"),
-        InlineKeyboardButton(text=("• " if tab == "hobby" else "") + "🎯 Захоплення", callback_data="pi_tab_hobby"),
-    ]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[tabs] + rows + [[InlineKeyboardButton(text="✅ Готово", callback_data="pi_done")]]
-    )
-
-
-def profile_interests_text(u: dict) -> str:
-    return (
-        f"🧩 <b>Мої інтереси</b> (до {MAX_PROFILE_INTERESTS})\n\n"
-        f"Обрано: {interests_line(u)}\n\n"
-        "Бот спершу шукатиме співрозмовників зі спільними інтересами, "
-        "а після з'єднання покаже, про що вам цікаво поговорити."
-    )
-
-
-@dp.message(Command("myinterests"))
-async def my_interests_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    u = init_user(message.from_user.id)
-    await message.answer(profile_interests_text(u), reply_markup=profile_interests_keyboard(u))
 
 
 # === КІНЕЦЬ part3.py ===

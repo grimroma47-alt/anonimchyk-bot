@@ -36,7 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
-BOT_VERSION = "07.11-a"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
+BOT_VERSION = "07.11-b"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -367,7 +367,8 @@ queue_since: dict[int, float] = {}  # user_id -> коли став у чергу
 search_mode: dict[int, str] = {}  # user_id у черзі -> "normal" або "flirt" (флірт шукає лише флірт)
 active_chats: dict[int, int] = {}
 
-# Історія анонімних чатів: лише RAM, очищення щодня опівночі за Києвом.
+
+# Архів анонімних приватних чатів: лише RAM, очищення щодня за київським часом.
 CHATLOG_MAX_CHATS = 150
 CHATLOG_MAX_MESSAGES = 200
 CHATLOG_MAX_MEDIA = 100
@@ -387,19 +388,17 @@ def chatlog_reset_if_new_day():
 def chatlog_start(a: int, b: int, mode: str):
     global chatlog_next_id
     chatlog_reset_if_new_day()
-    # Дружні переписки та тематичні кімнати не записуємо.
+    # Не записуємо переписки з друзями та тематичні кімнати.
     if mode == "friend" or a in user_room or b in user_room:
         return
-    key = chatlog_next_id
+    entry_id = chatlog_next_id
     chatlog_next_id += 1
-    chatlog[key] = {
-        "users": (a, b),
-        "mode": mode,
-        "started": time.time(),
-        "messages": [],
+    chatlog[entry_id] = {
+        "id": entry_id, "a": a, "b": b, "mode": mode,
+        "started": time.time(), "messages": [],
     }
     while len(chatlog) > CHATLOG_MAX_CHATS:
-        chatlog.pop(next(iter(chatlog)), None)
+        del chatlog[min(chatlog)]
 
 
 def chatlog_record(user_id: int, message):
@@ -407,33 +406,33 @@ def chatlog_record(user_id: int, message):
     partner_id = active_chats.get(user_id)
     if partner_id is None:
         return
-    # Знаходимо саме поточну сесію пари.
-    entry = next(
-        (item for item in reversed(list(chatlog.values()))
-         if set(item["users"]) == {user_id, partner_id}),
-        None,
-    )
+    # Знаходимо найновішу сесію саме цієї пари.
+    entry = next((v for v in reversed(list(chatlog.values()))
+                  if {v["a"], v["b"]} == {user_id, partner_id}), None)
     if entry is None:
         return
-    mark = msg_mark(message) if callable(globals().get("msg_mark")) else (getattr(message, "text", None) or "[медіа]")
+    marker = msg_mark(message) if callable(globals().get("msg_mark")) else (
+        getattr(message, "text", None) or "[медіа]"
+    )
     is_media = not bool(getattr(message, "text", None))
     entry["messages"].append({
-        "time": time.time(),
-        "from": user_id,
-        "text": str(mark)[:500],
+        "user": user_id, "time": time.time(), "text": str(marker)[:800],
         "media": is_media,
     })
-    messages = entry["messages"]
-    del messages[:-CHATLOG_MAX_MESSAGES]
-    media_indexes = [i for i, item in enumerate(messages) if item["media"]]
-    for index in reversed(media_indexes[:-CHATLOG_MAX_MEDIA]):
-        del messages[index]
+    # Спершу обмеження загальної кількості, потім — медіа.
+    del entry["messages"][:-CHATLOG_MAX_MESSAGES]
+    media_items = [i for i, m in enumerate(entry["messages"]) if m["media"]]
+    while len(media_items) > CHATLOG_MAX_MEDIA:
+        del entry["messages"][media_items[0]]
+        media_items = [i for i, m in enumerate(entry["messages"]) if m["media"]]
 
 
 async def chatlog_reset_loop():
+    chatlog_reset_if_new_day()
     while True:
         await asyncio.sleep(30)
         chatlog_reset_if_new_day()
+
 user_counter = 1000
 
 banned_users: set[int] = set()
