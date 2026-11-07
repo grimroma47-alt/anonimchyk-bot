@@ -941,6 +941,25 @@ EN_PAIRS2 = {
     "% від кожного поповнення твоїх друзів — реальні гроші на вивід!": "% of every top-up by your friends — real money you can withdraw!",
     "💸 Плюс ": "💸 Plus ",
     "% від кожного поповнення друзів — на вивід на карту.": "% of every friend's top-up — withdrawable to a card.",
+    # 07.11 — меню: де я, перезапуск, баланс, подарунки, запросити
+    "📍 Де я?": "📍 Where am I?",
+    "🔄 Перезапустити (якщо щось зависло)": "🔄 Restart (if something is stuck)",
+    "💰 Мій баланс": "💰 My balance",
+    "🎁 Магазин подарунків": "🎁 Gift shop",
+    "🤝 Запросити друга": "🤝 Invite a friend",
+    "👫 <b>Ти в переписці з другом</b> ": "👫 <b>You're chatting with your friend</b> ",
+    "Пиши — повідомлення йдуть другу. Вийти: «": "Write — messages go to your friend. Leave: «",
+    "🔄 Ти зараз у чаті. Завершити його й повернутися в головне меню?": "🔄 You're in a chat now. End it and go back to the main menu?",
+    "❌ Так, завершити чат": "❌ Yes, end chat",
+    "💬 Ні, лишитись": "💬 No, stay",
+    "🔄 Готово! Ти в кімнаті — меню кімнати повернуто. Щоб вийти, натисни «🚪 Вийти з кімнати».": "🔄 Done! You're in a room — room menu restored. To leave, tap «🚪 Leave room».",
+    "🔄 Готово! Усе скинуто, ось головне меню 👇": "🔄 Done! Everything reset, here's the main menu 👇",
+    "💬 Лишаємось у чаті — пиши далі 🙂": "💬 Staying in the chat — keep writing 🙂",
+    "🔄 Чат завершено. Ось головне меню 👇": "🔄 Chat ended. Here's the main menu 👇",
+    "Зліва — звичайні, справа — ✨ <b>особливі</b>: феєрверк на весь екран, маска-сюрприз, передбачення, листівка, ключик-таємниця, колекційний 🌙 Місяць з номером і смішні дрібнички.": "Left — classic, right — ✨ <b>special</b>: full-screen fireworks, surprise mask, prophecy, postcard, secret key, a numbered collectible 🌙 Moon and funny little things.",
+    "Купи про запас і даруй у чаті кнопкою «🎁 Подарувати». Отримувач одразу отримує ": "Buy in advance and gift in chat with «🎁 Gift». The recipient instantly gets ",
+    "% вартості на баланс.\n\n💰 Твій баланс: ": "% of the price on balance.\n\n💰 Your balance: ",
+    "\n💸 Зароблено з поповнень друзів: ": "\n💸 Earned from friends' top-ups: ",
 }
 
 # === КІНЕЦЬ lang_en2.py ===

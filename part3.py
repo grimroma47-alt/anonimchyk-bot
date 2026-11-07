@@ -1,3 +1,75 @@
+# ---------------------------------------------------------------------------
+# Лідерборд найщедріших дарувальників
+# ---------------------------------------------------------------------------
+async def show_top_gifters(message: types.Message):
+    top = sorted(
+        users_db.items(), key=lambda kv: kv[1].get("gifts_sent_count", 0), reverse=True
+    )[:10]
+    top = [(uid, u) for uid, u in top if u.get("gifts_sent_count", 0) > 0]
+
+    if not top:
+        await message.answer("Поки що ніхто не дарував подарунків. Будь першим! 🎁")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 <b>Топ дарувальників подарунків</b>\n"]
+    for i, (uid, u) in enumerate(top, start=1):
+        rank = medals[i - 1] if i <= 3 else f"{i}."
+        lines.append(f"{rank} {esc(u['nickname'])} — {u.get('gifts_sent_count', 0)} 🎁")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(F.text == BTN_TOP)
+@dp.message(Command("top"))
+async def top_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    await show_top_gifters(message)
+
+
+@dp.message(F.text == BTN_REPORT)
+async def report_handler(message: types.Message):
+    """Скарга з чату: причина → (за бажанням) доказ → скарга адміну. Див. submit_report."""
+    user_id = message.from_user.id
+    partner_id = active_chats.get(user_id)
+    if partner_id is None:
+        await message.answer("Скарга можлива лише під час чату.", reply_markup=get_main_keyboard())
+        return
+    report_pending[user_id] = {"on": partner_id, "msgs": list(recent_msgs.get(partner_id, [])), "ts": time.time()}
+    await message.answer("🚨 Що сталося? Обери причину — так модератор розбереться швидше:", reply_markup=report_reason_kb())
+
+
+# ---------------------------------------------------------------------------
+# Подарунки співрозмовнику (тільки під час активного чату)
+# ---------------------------------------------------------------------------
+def gift_target(user_id: int) -> tuple[int | None, str]:
+    """Кому зараз дарувати / дзвонити: другу з відкритої переписки або співрозмовнику в чаті."""
+    fid = friend_mode.get(user_id)
+    if fid is not None:
+        u, f = users_db.get(user_id) or {}, users_db.get(fid)
+        if f and fid in (u.get("friends") or set()) and user_id in (f.get("friends") or set()) \
+                and not is_blacklisted(u, user_id, f, fid) and fid not in banned_users:
+            return fid, "friend"
+        return None, "friend"
+    pid = active_chats.get(user_id)
+    return (pid, "chat") if pid is not None else (None, "")
+
+
+def gift_from_label(user_id: int, kind: str) -> str:
+    if kind == "friend":
+        return f"💜 Твій друг <b>{esc((users_db.get(user_id) or {}).get('nickname') or '')}</b>"
+    return "Співрозмовник"
+
+
+def gift_verb(user_id: int) -> str:
+    """«подарував» / «подарувала» за статтю дарувальника (а не того, хто читає)."""
+    g = (users_db.get(user_id) or {}).get("gender")
+    return "подарувала" if g == "Дівчина" else "подарував" if g == "Хлопець" else "подарував(-ла)"
+
+
+def _gift_kb(user_id: int):
+    return get_friend_mode_keyboard() if friend_mode.get(user_id) is not None else get_chat_keyboard()
+
+
 @dp.message(F.text == BTN_GIFT)
 async def gift_menu(message: types.Message, state: FSMContext):
     await state.clear()
@@ -2286,87 +2358,6 @@ async def my_interests_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     u = init_user(message.from_user.id)
     await message.answer(profile_interests_text(u), reply_markup=profile_interests_keyboard(u))
-
-
-@dp.callback_query(F.data == "pi_open")
-async def my_interests_open(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    await call.message.answer(profile_interests_text(u), reply_markup=profile_interests_keyboard(u))
-    await call.answer()
-
-
-@dp.callback_query(F.data.startswith("pi_tab_"))
-async def my_interests_tab(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    tab = "hobby" if call.data == "pi_tab_hobby" else "main"
-    try:
-        await call.message.edit_reply_markup(reply_markup=profile_interests_keyboard(u, tab))
-    except TelegramAPIError:
-        pass
-    await call.answer()
-
-
-@dp.callback_query(F.data.startswith("pi_t_"))
-async def my_interests_toggle(call: types.CallbackQuery):
-    tab, _, key = call.data[len("pi_t_"):].partition("_")
-    if key not in INTEREST_LABELS:
-        await call.answer("Невідома тема", show_alert=True)
-        return
-    u = init_user(call.from_user.id)
-    chosen = u.setdefault("interests", set())
-    if key in chosen:
-        chosen.discard(key)
-    elif len(chosen) >= MAX_PROFILE_INTERESTS:
-        await call.answer(f"Можна обрати до {MAX_PROFILE_INTERESTS}. Спершу зніми якийсь ✅", show_alert=True)
-        return
-    else:
-        chosen.add(key)
-    request_save()
-    try:
-        await call.message.edit_text(profile_interests_text(u), reply_markup=profile_interests_keyboard(u, tab))
-    except TelegramAPIError:
-        pass
-    await call.answer()
-
-
-@dp.callback_query(F.data == "pi_done")
-async def my_interests_done(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    try:
-        await call.message.edit_text(f"✅ Твої інтереси: {interests_line(u)}\n\nЗмінити: /myinterests")
-    except TelegramAPIError:
-        pass
-    await call.answer("Збережено")
-
-
-# ---------------------------------------------------------------------------
-# Підказка про фільтр за статтю: якщо безкоштовний юзер довго чекає у звичайному пошуку
-# ---------------------------------------------------------------------------
-FILTER_NUDGE_DELAY = int(os.getenv("FILTER_NUDGE_DELAY", "40"))  # секунд очікування
-FILTER_NUDGE_COOLDOWN = 24 * 3600  # не частіше разу на добу
-filter_nudge_last: dict[int, float] = {}
-
-
-# ---------------------------------------------------------------------------
-# 🛟 Порожня черга: якщо у флірті/темі довго нікого — пропонуємо звичайний пошук
-# ---------------------------------------------------------------------------
-STUCK_DELAY = int(os.getenv("STUCK_DELAY", "30"))  # секунд очікування до пропозиції
-stuck_offered: dict[int, float] = {}  # user_id -> коли пропонували (щоб не повторювати в тому ж пошуку)
-
-
-def normal_waiting_for(user_id: int) -> int:
-    """Скільки людей у звичайному пошуку, з якими цю людину реально може з'єднати."""
-    u = init_user(user_id)
-    n = 0
-    for cid in queue:
-        if cid == user_id or search_mode.get(cid, "normal") != "normal":
-            continue
-        p = init_user(cid)
-        if is_blacklisted(u, user_id, p, cid):
-            continue
-        if passes_filters(u, p) and passes_filters(p, u):
-            n += 1
-    return n
 
 
 # === КІНЕЦЬ part3.py ===

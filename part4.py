@@ -1,3 +1,84 @@
+@dp.callback_query(F.data == "pi_open")
+async def my_interests_open(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    await call.message.answer(profile_interests_text(u), reply_markup=profile_interests_keyboard(u))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pi_tab_"))
+async def my_interests_tab(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    tab = "hobby" if call.data == "pi_tab_hobby" else "main"
+    try:
+        await call.message.edit_reply_markup(reply_markup=profile_interests_keyboard(u, tab))
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pi_t_"))
+async def my_interests_toggle(call: types.CallbackQuery):
+    tab, _, key = call.data[len("pi_t_"):].partition("_")
+    if key not in INTEREST_LABELS:
+        await call.answer("Невідома тема", show_alert=True)
+        return
+    u = init_user(call.from_user.id)
+    chosen = u.setdefault("interests", set())
+    if key in chosen:
+        chosen.discard(key)
+    elif len(chosen) >= MAX_PROFILE_INTERESTS:
+        await call.answer(f"Можна обрати до {MAX_PROFILE_INTERESTS}. Спершу зніми якийсь ✅", show_alert=True)
+        return
+    else:
+        chosen.add(key)
+    request_save()
+    try:
+        await call.message.edit_text(profile_interests_text(u), reply_markup=profile_interests_keyboard(u, tab))
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+@dp.callback_query(F.data == "pi_done")
+async def my_interests_done(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    try:
+        await call.message.edit_text(f"✅ Твої інтереси: {interests_line(u)}\n\nЗмінити: /myinterests")
+    except TelegramAPIError:
+        pass
+    await call.answer("Збережено")
+
+
+# ---------------------------------------------------------------------------
+# Підказка про фільтр за статтю: якщо безкоштовний юзер довго чекає у звичайному пошуку
+# ---------------------------------------------------------------------------
+FILTER_NUDGE_DELAY = int(os.getenv("FILTER_NUDGE_DELAY", "40"))  # секунд очікування
+FILTER_NUDGE_COOLDOWN = 24 * 3600  # не частіше разу на добу
+filter_nudge_last: dict[int, float] = {}
+
+
+# ---------------------------------------------------------------------------
+# 🛟 Порожня черга: якщо у флірті/темі довго нікого — пропонуємо звичайний пошук
+# ---------------------------------------------------------------------------
+STUCK_DELAY = int(os.getenv("STUCK_DELAY", "30"))  # секунд очікування до пропозиції
+stuck_offered: dict[int, float] = {}  # user_id -> коли пропонували (щоб не повторювати в тому ж пошуку)
+
+
+def normal_waiting_for(user_id: int) -> int:
+    """Скільки людей у звичайному пошуку, з якими цю людину реально може з'єднати."""
+    u = init_user(user_id)
+    n = 0
+    for cid in queue:
+        if cid == user_id or search_mode.get(cid, "normal") != "normal":
+            continue
+        p = init_user(cid)
+        if is_blacklisted(u, user_id, p, cid):
+            continue
+        if passes_filters(u, p) and passes_filters(p, u):
+            n += 1
+    return n
+
+
 def schedule_stuck_offer(user_id: int, mode: str):
     if mode not in ("flirt", "voice") and not mode.startswith("int:"):
         return
@@ -2070,6 +2151,13 @@ def chat_mode_label(mode: str) -> str:
 
 def where_text(user_id: int) -> str:
     now = time.time()
+    fid = friend_mode.get(user_id)
+    if fid and user_id not in active_chats:
+        f = users_db.get(fid) or {}
+        return (
+            f"👫 <b>Ти в переписці з другом</b> {esc(f.get('nickname') or '')}\n"
+            f"Пиши — повідомлення йдуть другу. Вийти: «{BTN_FRIEND_EXIT}»."
+        )
     if user_id in active_chats:
         meta = chat_meta.get(user_id) or {}
         p = users_db.get(active_chats[user_id]) or {}
@@ -2103,6 +2191,8 @@ async def where_cmd(message: types.Message, state: FSMContext):
         extra, line = resume_kwargs(uid)
     elif uid in user_room:
         kb = get_room_keyboard()
+    elif uid in friend_mode:
+        kb = get_friend_mode_keyboard()
     else:
         kb = get_main_keyboard()
     text = where_text(uid) + (f"\n\n{line}" if line else "")
@@ -2180,95 +2270,6 @@ NEWS_CHANNEL = os.getenv("NEWS_CHANNEL", "")  # напр. @ANONimchyk_news
 
 def _seed(*parts) -> int:
     return int(hashlib.md5(":".join(map(str, parts)).encode()).hexdigest(), 16)
-
-
-def fun_menu_kb():
-    rows = [
-        [InlineKeyboardButton(text="🔮 Гороскоп на сьогодні", callback_data="fun_horo")],
-        [InlineKeyboardButton(text="🃏 Карта дня", callback_data="fun_tarot"),
-         InlineKeyboardButton(text="💞 Сумісність знаків", callback_data="fun_compat")],
-        [InlineKeyboardButton(text="📰 Що нового", callback_data="fun_news"),
-         InlineKeyboardButton(text="🤫 Канал зізнань", url=confess_channel_link())],
-    ]
-    if HOROSCOPE_CHANNEL:
-        rows.append([InlineKeyboardButton(text="🌙 Канал «ANONimchyk Гороскоп»", url=f"https://t.me/{HOROSCOPE_CHANNEL.lstrip('@')}")])
-    if NEWS_CHANNEL:
-        rows.append([InlineKeyboardButton(text="📣 Канал «ANONimchyk News»", url=f"https://t.me/{NEWS_CHANNEL.lstrip('@')}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-FUN_MENU_TEXT = "✨ <b>Розваги</b>\nЧим зайнятись, поки шукаєш співрозмовника 👇\n<i>Гороскоп і карти — для настрою й розваги 😉</i>"
-
-
-@dp.message(F.text == BTN_FUN)
-@dp.message(Command("fun"))
-async def fun_menu(message: types.Message, state: FSMContext):
-    await state.clear()
-    await send_banner(message.from_user.id, "fun")
-    await message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
-
-
-@dp.callback_query(F.data == "fun_menu")
-async def fun_menu_cb(call: types.CallbackQuery):
-    await call.message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
-    await call.answer()
-
-
-def zodiac_kb(prefix: str):
-    keys = list(ZODIAC)
-    rows = [[InlineKeyboardButton(text=ZODIAC[k][0], callback_data=f"{prefix}{k}") for k in keys[i:i + 3]]
-            for i in range(0, 12, 3)]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def horoscope_text(sign: str, day) -> str:
-    s = _seed("horo", sign, day.isoformat())
-    return (
-        f"🔮 <b>{ZODIAC[sign][0]} · {day.strftime('%d.%m')}</b>\n\n"
-        f"{H_DAY[s % len(H_DAY)]}\n\n"
-        f"💜 {H_LOVE[(s // 7) % len(H_LOVE)]}\n\n"
-        f"✨ {H_TIP[(s // 49) % len(H_TIP)]}\n\n"
-        f"🍀 Щасливе число: <b>{(s // 343) % 33 + 1}</b> · колір: <b>{H_COLORS[(s // 11) % len(H_COLORS)]}</b>"
-    )
-
-
-def horo_after_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔁 Змінити знак", callback_data="fun_horo_pick"),
-         InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")],
-    ])
-
-
-@dp.callback_query(F.data == "fun_horo")
-async def fun_horo(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
-    sign = u.get("zodiac")
-    await call.answer()
-    if sign in ZODIAC:
-        await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
-        stat_add("horoscope")
-        return
-    await call.message.answer("🔮 Обери свій знак — я запам'ятаю, і далі гороскоп буде в один дотик:", reply_markup=zodiac_kb("fun_z:"))
-
-
-@dp.callback_query(F.data == "fun_horo_pick")
-async def fun_horo_pick(call: types.CallbackQuery):
-    await call.answer()
-    await call.message.answer("🔮 Обери свій знак:", reply_markup=zodiac_kb("fun_z:"))
-
-
-@dp.callback_query(F.data.startswith("fun_z:"))
-async def fun_zodiac_set(call: types.CallbackQuery):
-    sign = call.data.split(":", 1)[1]
-    if sign not in ZODIAC:
-        await call.answer()
-        return
-    u = init_user(call.from_user.id)
-    u["zodiac"] = sign
-    request_save()
-    await call.answer(f"Запам'ятав: {ZODIAC[sign][0]}")
-    await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
-    stat_add("horoscope")
 
 
 # === КІНЕЦЬ part4.py ===

@@ -654,6 +654,7 @@ async def daily_checkin(message: types.Message, state: FSMContext):
 # Гаманець
 # ---------------------------------------------------------------------------
 @dp.message(F.text == BTN_WALLET)
+@dp.message(Command("balance"))
 async def wallet_handler(message: types.Message, state: FSMContext):
     await state.clear()
     u = init_user(message.from_user.id)
@@ -846,6 +847,21 @@ async def shop_handler(message: types.Message, state: FSMContext):
         "Купи подарунок про запас — даруватимеш його співрозмовникам у чаті, "
         f"коли захочеш. Отримувач одразу отримає {GIFT_RECIPIENT_SHARE * 100:.0f}% "
         "вартості на баланс.",
+        reply_markup=get_gift_catalog_keyboard(),
+    )
+
+
+@dp.message(Command("gifts"))
+async def gifts_cmd(message: types.Message, state: FSMContext):
+    """🎁 Одразу магазин подарунків (зліва звичайні, справа ✨ особливі)."""
+    await state.clear()
+    u = init_user(message.from_user.id)
+    await message.answer(
+        "🎁 <b>Магазин подарунків</b>\n\n"
+        "Зліва — звичайні, справа — ✨ <b>особливі</b>: феєрверк на весь екран, маска-сюрприз, передбачення, "
+        "листівка, ключик-таємниця, колекційний 🌙 Місяць з номером і смішні дрібнички.\n"
+        f"Купи про запас і даруй у чаті кнопкою «🎁 Подарувати». Отримувач одразу отримує "
+        f"{GIFT_RECIPIENT_SHARE * 100:.0f}% вартості на баланс.\n\n💰 Твій баланс: {u['balance']:.2f} грн",
         reply_markup=get_gift_catalog_keyboard(),
     )
 
@@ -1376,26 +1392,38 @@ async def premium_menu(message: types.Message, state: FSMContext):
     await message.answer(text, reply_markup=kb)
 
 
-@dp.callback_query(F.data == "prem_free")
-async def premium_free(call: types.CallbackQuery):
-    u = init_user(call.from_user.id)
+def invite_text(user_id: int) -> str:
+    u = init_user(user_id)
     link = (
-        f"https://t.me/{BOT_USERNAME}?start=ref_{call.from_user.id}"
+        f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
         if BOT_USERNAME
         else "(посилання буде доступне трохи пізніше)"
     )
     done = u.get("referral_count", 0)
     left = REFERRAL_PREMIUM_EVERY - (done % REFERRAL_PREMIUM_EVERY) if REFERRAL_PREMIUM_EVERY else 0
-    await call.message.answer(
+    earned = u.get("ref_earned", 0.0)
+    return (
         "🎁 <b>Premium безкоштовно</b>\n\n"
         f"Запроси {REFERRAL_PREMIUM_EVERY} друзів за своїм посиланням — отримаєш "
         f"<b>{REFERRAL_PREMIUM_DAYS} днів Premium</b>. А за кожного друга ще й +{REFERRAL_BONUS:.0f} грн на баланс.\n"
         f"💸 Плюс {REF_TOPUP_SHARE * 100:.0f}% від кожного поповнення друзів — на вивід на карту.\n\n"
         f"Твоє посилання:\n<code>{esc(link)}</code>\n\n"
-        f"Запрошено: {done}. До наступного Premium: {left}.",
-        reply_markup=contest_keyboard(call.from_user.id),
+        f"Запрошено: {done}. До наступного Premium: {left}."
+        + (f"\n💸 Зароблено з поповнень друзів: {uah(earned)}" if earned else "")
     )
+
+
+@dp.message(Command("invite"))
+async def invite_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(invite_text(message.from_user.id), reply_markup=contest_keyboard(message.from_user.id))
+
+
+@dp.callback_query(F.data == "prem_free")
+async def premium_free(call: types.CallbackQuery):
+    await call.message.answer(invite_text(call.from_user.id), reply_markup=contest_keyboard(call.from_user.id))
     await call.answer()
+
 
 
 # ---------------------------------------------------------------------------
@@ -1828,6 +1856,49 @@ async def stop_chat(message: types.Message, state: FSMContext):
     await auto_search_after_chat(partner_id)
 
 
+@dp.message(Command("restart"))
+async def restart_cmd(message: types.Message, state: FSMContext):
+    """🔄 М'яко скидає «завислий» стан і повертає меню. Чат зі співрозмовником НЕ обриває без підтвердження."""
+    await state.clear()
+    uid = message.from_user.id
+    if uid in active_chats:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Так, завершити чат", callback_data="restart_end"),
+            InlineKeyboardButton(text="💬 Ні, лишитись", callback_data="restart_stay"),
+        ]])
+        await message.answer("🔄 Ти зараз у чаті. Завершити його й повернутися в головне меню?", reply_markup=kb)
+        return
+    if uid in queue:
+        queue.remove(uid)
+    friend_mode.pop(uid, None)
+    if uid in user_room:
+        await message.answer(
+            "🔄 Готово! Ти в кімнаті — меню кімнати повернуто. Щоб вийти, натисни «🚪 Вийти з кімнати».",
+            reply_markup=get_room_keyboard(),
+        )
+        return
+    await message.answer("🔄 Готово! Усе скинуто, ось головне меню 👇", reply_markup=get_main_keyboard())
+
+
+@dp.callback_query(F.data.in_({"restart_end", "restart_stay"}))
+async def restart_choice(call: types.CallbackQuery, state: FSMContext):
+    uid = call.from_user.id
+    if call.data == "restart_stay":
+        await call.message.answer("💬 Лишаємось у чаті — пиши далі 🙂", reply_markup=get_chat_keyboard())
+        await call.answer()
+        return
+    partner_id = end_chat(uid)
+    await state.clear()
+    friend_mode.pop(uid, None)
+    await call.message.answer("🔄 Чат завершено. Ось головне меню 👇", reply_markup=get_main_keyboard())
+    if partner_id is not None:
+        await safe_send(partner_id, "Співрозмовник завершив чат.", reply_markup=get_main_keyboard())
+        await send_post_chat_menu(uid, partner_id)
+        await send_post_chat_menu(partner_id, uid)
+        await auto_search_after_chat(partner_id)
+    await call.answer()
+
+
 @dp.message(F.text == BTN_NEXT)
 @dp.message(Command("next"))
 async def next_chat(message: types.Message, state: FSMContext):
@@ -2120,6 +2191,8 @@ def _in_friend_mode(message) -> bool:
     t = getattr(message, "text", None) or ""
     if t in (BTN_FRIEND_EXIT, BTN_CALL, BTN_GIFT):
         return False  # кнопки самої переписки — обробляються своїми обробниками
+    if t.startswith("/where"):
+        return False  # «📍 Де я?» — лише показує, де ти, переписку не закриває
     if t.startswith("/") or t in _menu_texts():
         friend_mode.pop(user.id, None)  # пішов у меню — переписку закрито, далі звичайна обробка
         return False
@@ -2292,78 +2365,6 @@ async def friend_remove(call: types.CallbackQuery):
         except TelegramAPIError:
             pass
     await call.answer("Прибрано з друзів.")
-
-
-# ---------------------------------------------------------------------------
-# Лідерборд найщедріших дарувальників
-# ---------------------------------------------------------------------------
-async def show_top_gifters(message: types.Message):
-    top = sorted(
-        users_db.items(), key=lambda kv: kv[1].get("gifts_sent_count", 0), reverse=True
-    )[:10]
-    top = [(uid, u) for uid, u in top if u.get("gifts_sent_count", 0) > 0]
-
-    if not top:
-        await message.answer("Поки що ніхто не дарував подарунків. Будь першим! 🎁")
-        return
-
-    medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 <b>Топ дарувальників подарунків</b>\n"]
-    for i, (uid, u) in enumerate(top, start=1):
-        rank = medals[i - 1] if i <= 3 else f"{i}."
-        lines.append(f"{rank} {esc(u['nickname'])} — {u.get('gifts_sent_count', 0)} 🎁")
-    await message.answer("\n".join(lines))
-
-
-@dp.message(F.text == BTN_TOP)
-@dp.message(Command("top"))
-async def top_handler(message: types.Message, state: FSMContext):
-    await state.clear()
-    await show_top_gifters(message)
-
-
-@dp.message(F.text == BTN_REPORT)
-async def report_handler(message: types.Message):
-    """Скарга з чату: причина → (за бажанням) доказ → скарга адміну. Див. submit_report."""
-    user_id = message.from_user.id
-    partner_id = active_chats.get(user_id)
-    if partner_id is None:
-        await message.answer("Скарга можлива лише під час чату.", reply_markup=get_main_keyboard())
-        return
-    report_pending[user_id] = {"on": partner_id, "msgs": list(recent_msgs.get(partner_id, [])), "ts": time.time()}
-    await message.answer("🚨 Що сталося? Обери причину — так модератор розбереться швидше:", reply_markup=report_reason_kb())
-
-
-# ---------------------------------------------------------------------------
-# Подарунки співрозмовнику (тільки під час активного чату)
-# ---------------------------------------------------------------------------
-def gift_target(user_id: int) -> tuple[int | None, str]:
-    """Кому зараз дарувати / дзвонити: другу з відкритої переписки або співрозмовнику в чаті."""
-    fid = friend_mode.get(user_id)
-    if fid is not None:
-        u, f = users_db.get(user_id) or {}, users_db.get(fid)
-        if f and fid in (u.get("friends") or set()) and user_id in (f.get("friends") or set()) \
-                and not is_blacklisted(u, user_id, f, fid) and fid not in banned_users:
-            return fid, "friend"
-        return None, "friend"
-    pid = active_chats.get(user_id)
-    return (pid, "chat") if pid is not None else (None, "")
-
-
-def gift_from_label(user_id: int, kind: str) -> str:
-    if kind == "friend":
-        return f"💜 Твій друг <b>{esc((users_db.get(user_id) or {}).get('nickname') or '')}</b>"
-    return "Співрозмовник"
-
-
-def gift_verb(user_id: int) -> str:
-    """«подарував» / «подарувала» за статтю дарувальника (а не того, хто читає)."""
-    g = (users_db.get(user_id) or {}).get("gender")
-    return "подарувала" if g == "Дівчина" else "подарував" if g == "Хлопець" else "подарував(-ла)"
-
-
-def _gift_kb(user_id: int):
-    return get_friend_mode_keyboard() if friend_mode.get(user_id) is not None else get_chat_keyboard()
 
 
 # === КІНЕЦЬ part2.py ===

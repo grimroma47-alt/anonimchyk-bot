@@ -1,3 +1,94 @@
+def msg_mark(message) -> str:
+    text = getattr(message, "text", None)
+    if text is not None:
+        return text[:500]
+    if getattr(message, "photo", None):
+        mark = "[фото]"
+    elif getattr(message, "voice", None):
+        mark = "[голосове]"
+    elif getattr(message, "video_note", None):
+        mark = "[кружечок]"
+    elif getattr(message, "video", None):
+        mark = "[відео]"
+    elif getattr(message, "animation", None):
+        mark = "[GIF]"
+    elif getattr(message, "sticker", None):
+        mark = "[стікер]"
+    else:
+        mark = "[файл]"
+    cap = getattr(message, "caption", None)
+    return mark + (f" {cap[:300]}" if cap else "")
+
+
+def remember_recent(user_id: int, text: str):
+    buf = recent_msgs.setdefault(user_id, [])
+    buf.append((time.time(), text))
+    del buf[:-EVIDENCE_KEEP]
+
+
+def forget_recent(*uids: int):
+    for x in uids:
+        recent_msgs.pop(x, None)
+
+
+def report_reason_kb():
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"rep_r:{k}")] for k, label in REPORT_REASONS.items()]
+    rows.append([InlineKeyboardButton(text="✖️ Скасувати", callback_data="rep_r:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def report_history(target: int) -> str:
+    mine = [r for r in reports if r.get("on") == target]
+    if not mine:
+        return "перша скарга"
+    by = {}
+    for r in mine:
+        k = REPORT_REASONS.get(r.get("reason"), "без причини").split(" ")[0]
+        by[k] = by.get(k, 0) + 1
+    u = users_db.get(target) or {}
+    return f"усього {len(mine)}: " + " ".join(f"{k}×{n}" for k, n in by.items()) + f" · {rating_line(u)}"
+
+
+@dp.callback_query(F.data.startswith("rep_r:"))
+async def report_reason_pick(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    reason = call.data.split(":", 1)[1]
+    pend = report_pending.get(user_id)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if reason == "cancel" or pend is None or time.time() - pend["ts"] > 600:
+        report_pending.pop(user_id, None)
+        await call.answer("Скасовано" if reason == "cancel" else "Скарга застаріла")
+        return
+    pend["reason"] = reason if reason in REPORT_REASONS else "other"
+    await call.answer()
+    if pend["msgs"]:
+        await call.message.answer(
+            "📎 Додати до скарги останні повідомлення співрозмовника як доказ?\n"
+            "<i>Їх побачить лише модератор. Фото й відео не передаються.</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Так, додати", callback_data="rep_e:1"),
+                InlineKeyboardButton(text="Ні", callback_data="rep_e:0"),
+            ]]),
+        )
+        return
+    await submit_report(call.message, user_id, with_evidence=False)
+
+
+@dp.callback_query(F.data.startswith("rep_e:"))
+async def report_evidence_pick(call: types.CallbackQuery):
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+    if call.from_user.id not in report_pending:
+        return
+    await submit_report(call.message, call.from_user.id, with_evidence=call.data.endswith("1"))
+
+
 async def submit_report(target_msg, user_id: int, with_evidence: bool):
     global report_counter
     pend = report_pending.pop(user_id, None)
@@ -591,11 +682,16 @@ async def setup_bot_commands():
         types.BotCommand(command="search", description="🔍 Шукати співрозмовника"),
         types.BotCommand(command="next", description="⏭ Наступний співрозмовник"),
         types.BotCommand(command="stop", description="❌ Завершити чат"),
+        types.BotCommand(command="where", description="📍 Де я?"),
+        types.BotCommand(command="restart", description="🔄 Перезапустити (якщо щось зависло)"),
         types.BotCommand(command="call", description="📞 Дзвінок співрозмовнику (18+, Premium)"),
         types.BotCommand(command="friends", description="👫 Друзі"),
         types.BotCommand(command="filters", description="🎯 Фільтри пошуку"),
         types.BotCommand(command="interests", description="🧩 Пошук за інтересами"),
         types.BotCommand(command="voice", description="🎙 Маска голосу"),
+        types.BotCommand(command="balance", description="💰 Мій баланс"),
+        types.BotCommand(command="gifts", description="🎁 Магазин подарунків"),
+        types.BotCommand(command="invite", description="🤝 Запросити друга"),
         types.BotCommand(command="premium", description="💎 Premium"),
         types.BotCommand(command="confess", description="🤫 Анонімне зізнання"),
         types.BotCommand(command="edit_profile", description="✏️ Мій профіль"),

@@ -1,3 +1,92 @@
+def fun_menu_kb():
+    rows = [
+        [InlineKeyboardButton(text="🔮 Гороскоп на сьогодні", callback_data="fun_horo")],
+        [InlineKeyboardButton(text="🃏 Карта дня", callback_data="fun_tarot"),
+         InlineKeyboardButton(text="💞 Сумісність знаків", callback_data="fun_compat")],
+        [InlineKeyboardButton(text="📰 Що нового", callback_data="fun_news"),
+         InlineKeyboardButton(text="🤫 Канал зізнань", url=confess_channel_link())],
+    ]
+    if HOROSCOPE_CHANNEL:
+        rows.append([InlineKeyboardButton(text="🌙 Канал «ANONimchyk Гороскоп»", url=f"https://t.me/{HOROSCOPE_CHANNEL.lstrip('@')}")])
+    if NEWS_CHANNEL:
+        rows.append([InlineKeyboardButton(text="📣 Канал «ANONimchyk News»", url=f"https://t.me/{NEWS_CHANNEL.lstrip('@')}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+FUN_MENU_TEXT = "✨ <b>Розваги</b>\nЧим зайнятись, поки шукаєш співрозмовника 👇\n<i>Гороскоп і карти — для настрою й розваги 😉</i>"
+
+
+@dp.message(F.text == BTN_FUN)
+@dp.message(Command("fun"))
+async def fun_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await send_banner(message.from_user.id, "fun")
+    await message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
+
+
+@dp.callback_query(F.data == "fun_menu")
+async def fun_menu_cb(call: types.CallbackQuery):
+    await call.message.answer(FUN_MENU_TEXT, reply_markup=fun_menu_kb())
+    await call.answer()
+
+
+def zodiac_kb(prefix: str):
+    keys = list(ZODIAC)
+    rows = [[InlineKeyboardButton(text=ZODIAC[k][0], callback_data=f"{prefix}{k}") for k in keys[i:i + 3]]
+            for i in range(0, 12, 3)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def horoscope_text(sign: str, day) -> str:
+    s = _seed("horo", sign, day.isoformat())
+    return (
+        f"🔮 <b>{ZODIAC[sign][0]} · {day.strftime('%d.%m')}</b>\n\n"
+        f"{H_DAY[s % len(H_DAY)]}\n\n"
+        f"💜 {H_LOVE[(s // 7) % len(H_LOVE)]}\n\n"
+        f"✨ {H_TIP[(s // 49) % len(H_TIP)]}\n\n"
+        f"🍀 Щасливе число: <b>{(s // 343) % 33 + 1}</b> · колір: <b>{H_COLORS[(s // 11) % len(H_COLORS)]}</b>"
+    )
+
+
+def horo_after_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Змінити знак", callback_data="fun_horo_pick"),
+         InlineKeyboardButton(text="✨ Розваги", callback_data="fun_menu")],
+    ])
+
+
+@dp.callback_query(F.data == "fun_horo")
+async def fun_horo(call: types.CallbackQuery):
+    u = init_user(call.from_user.id)
+    sign = u.get("zodiac")
+    await call.answer()
+    if sign in ZODIAC:
+        await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
+        stat_add("horoscope")
+        return
+    await call.message.answer("🔮 Обери свій знак — я запам'ятаю, і далі гороскоп буде в один дотик:", reply_markup=zodiac_kb("fun_z:"))
+
+
+@dp.callback_query(F.data == "fun_horo_pick")
+async def fun_horo_pick(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer("🔮 Обери свій знак:", reply_markup=zodiac_kb("fun_z:"))
+
+
+@dp.callback_query(F.data.startswith("fun_z:"))
+async def fun_zodiac_set(call: types.CallbackQuery):
+    sign = call.data.split(":", 1)[1]
+    if sign not in ZODIAC:
+        await call.answer()
+        return
+    u = init_user(call.from_user.id)
+    u["zodiac"] = sign
+    request_save()
+    await call.answer(f"Запам'ятав: {ZODIAC[sign][0]}")
+    await call.message.answer(horoscope_text(sign, kyiv_today()), reply_markup=horo_after_kb())
+    stat_add("horoscope")
+
+
 @dp.callback_query(F.data == "fun_tarot")
 async def fun_tarot(call: types.CallbackQuery):
     i = _seed("tarot", call.from_user.id, kyiv_today().isoformat()) % len(TAROT)
@@ -2212,97 +2301,6 @@ REPORT_REASONS = {
     "minor": "👶 Неповнолітній / пристає до неповнолітніх",
     "other": "❓ Інше",
 }
-
-
-def msg_mark(message) -> str:
-    text = getattr(message, "text", None)
-    if text is not None:
-        return text[:500]
-    if getattr(message, "photo", None):
-        mark = "[фото]"
-    elif getattr(message, "voice", None):
-        mark = "[голосове]"
-    elif getattr(message, "video_note", None):
-        mark = "[кружечок]"
-    elif getattr(message, "video", None):
-        mark = "[відео]"
-    elif getattr(message, "animation", None):
-        mark = "[GIF]"
-    elif getattr(message, "sticker", None):
-        mark = "[стікер]"
-    else:
-        mark = "[файл]"
-    cap = getattr(message, "caption", None)
-    return mark + (f" {cap[:300]}" if cap else "")
-
-
-def remember_recent(user_id: int, text: str):
-    buf = recent_msgs.setdefault(user_id, [])
-    buf.append((time.time(), text))
-    del buf[:-EVIDENCE_KEEP]
-
-
-def forget_recent(*uids: int):
-    for x in uids:
-        recent_msgs.pop(x, None)
-
-
-def report_reason_kb():
-    rows = [[InlineKeyboardButton(text=label, callback_data=f"rep_r:{k}")] for k, label in REPORT_REASONS.items()]
-    rows.append([InlineKeyboardButton(text="✖️ Скасувати", callback_data="rep_r:cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def report_history(target: int) -> str:
-    mine = [r for r in reports if r.get("on") == target]
-    if not mine:
-        return "перша скарга"
-    by = {}
-    for r in mine:
-        k = REPORT_REASONS.get(r.get("reason"), "без причини").split(" ")[0]
-        by[k] = by.get(k, 0) + 1
-    u = users_db.get(target) or {}
-    return f"усього {len(mine)}: " + " ".join(f"{k}×{n}" for k, n in by.items()) + f" · {rating_line(u)}"
-
-
-@dp.callback_query(F.data.startswith("rep_r:"))
-async def report_reason_pick(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    reason = call.data.split(":", 1)[1]
-    pend = report_pending.get(user_id)
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    if reason == "cancel" or pend is None or time.time() - pend["ts"] > 600:
-        report_pending.pop(user_id, None)
-        await call.answer("Скасовано" if reason == "cancel" else "Скарга застаріла")
-        return
-    pend["reason"] = reason if reason in REPORT_REASONS else "other"
-    await call.answer()
-    if pend["msgs"]:
-        await call.message.answer(
-            "📎 Додати до скарги останні повідомлення співрозмовника як доказ?\n"
-            "<i>Їх побачить лише модератор. Фото й відео не передаються.</i>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Так, додати", callback_data="rep_e:1"),
-                InlineKeyboardButton(text="Ні", callback_data="rep_e:0"),
-            ]]),
-        )
-        return
-    await submit_report(call.message, user_id, with_evidence=False)
-
-
-@dp.callback_query(F.data.startswith("rep_e:"))
-async def report_evidence_pick(call: types.CallbackQuery):
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await call.answer()
-    if call.from_user.id not in report_pending:
-        return
-    await submit_report(call.message, call.from_user.id, with_evidence=call.data.endswith("1"))
 
 
 # === КІНЕЦЬ part5.py ===
