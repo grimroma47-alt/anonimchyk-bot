@@ -1,3 +1,24 @@
+def top_text(user_id: int) -> str:
+    up, down = (top_week.get("votes") or {}).get(user_id, [0, 0])
+    total = up + down
+    lines = ["🏆 <b>Топ співрозмовників тижня</b>\n",
+             "Після чату довше 1,5 хв співрозмовники ставлять 👍 або 👎. "
+             f"Щонеділі о 20:00 трійка з найбільшим відсотком 👍 (від {TOP_MIN_VOTES} оцінок) отримує нагороди:",
+             "🥇 Premium на 7 днів · 🥈🥉 Premium на 3 дні + значок «🏆 Був у топі»\n",
+             f"<b>Твій тиждень:</b> 👍 {up} · 👎 {down}"]
+    if total < TOP_MIN_VOTES:
+        lines.append(f"До участі ще {TOP_MIN_VOTES - total} {_plural(TOP_MIN_VOTES - total, 'оцінка', 'оцінки', 'оцінок')}.")
+    else:
+        place = next((i for i, t in enumerate(top_ranking(), 1) if t[0] == user_id), None)
+        lines.append(f"Зараз ти на <b>{place}</b> місці ({round(up * 100 / total)}% 👍).")
+    last = (top_week.get("history") or [None])[-1]
+    if last and last.get("winners"):
+        lines.append("\n<b>Минулого тижня:</b>")
+        for uid, _up, _down, pct, medal in last["winners"]:
+            lines.append(f"{medal} {esc(users_db.get(uid, {}).get('nickname', '?'))} — {pct}%")
+    return "\n".join(lines)
+
+
 @dp.message(Command("best"))
 async def top_cmd(message: types.Message, state: FSMContext):
     await state.clear()
@@ -1330,14 +1351,20 @@ async def confess_got_text(message: types.Message, state: FSMContext):
     await state.update_data(confess_text=text)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Надіслати на перевірку", callback_data="conf_send")],
+            [InlineKeyboardButton(text="📝 Тільки пост у каналі", callback_data="conf_send:post")],
+            [InlineKeyboardButton(text="🎬 Пост і відео з озвучкою", callback_data="conf_send:video")],
+            [InlineKeyboardButton(text="🤫 Не публікувати — просто виговоритись", callback_data="conf_send:none")],
             [InlineKeyboardButton(text="✏️ Переписати", callback_data="conf_again"), InlineKeyboardButton(text="❌ Скасувати", callback_data="conf_cancel")],
         ]
     )
     await message.answer(
-        "Ось як це виглядатиме в каналі:\n\n"
+        "Ось твоє зізнання:\n\n"
         f"<blockquote>{esc(text)}</blockquote>\n\n"
-        "Публікуємо анонімно? Натискаючи «Надіслати», ти погоджуєшся на публікацію цього тексту в каналі та в озвучених відео ANONimchyk у соцмережах.",
+        "<b>Як можна використати твою історію?</b>\n"
+        "📝 <b>Пост</b> — опублікуємо текстом у каналі.\n"
+        "🎬 <b>Пост і відео</b> — ще й можемо озвучити у відео ANONimchyk (герой у масці, без імен).\n"
+        "🤫 <b>Не публікувати</b> — його прочитає лише модератор.\n\n"
+        "У будь-якому разі — повністю анонімно 💜",
         reply_markup=kb,
     )
 
@@ -1364,7 +1391,16 @@ async def confess_again(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-def confess_admin_kb(cid: int):
+CONFESS_CONSENT = {
+    "post": "📝 тільки пост",
+    "video": "🎬 пост і відео",
+    "none": "🤫 не публікувати",
+}
+
+
+def confess_admin_kb(cid: int, consent: str = "video"):
+    if consent == "none":
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 Усі зізнання", callback_data="adm_cf_priv_0")]])
     return InlineKeyboardMarkup(
         inline_keyboard=[[
             InlineKeyboardButton(text="✅ Опублікувати", callback_data=f"conf_ok:{cid}"),
@@ -1373,8 +1409,11 @@ def confess_admin_kb(cid: int):
     )
 
 
-@dp.callback_query(F.data == "conf_send")
+@dp.callback_query(F.data.startswith("conf_send"))
 async def confess_send(call: types.CallbackQuery, state: FSMContext):
+    consent = call.data.split(":", 1)[1] if ":" in call.data else "video"  # стара кнопка = згода на пост і відео
+    if consent not in CONFESS_CONSENT:
+        consent = "post"
     data = await state.get_data()
     text = data.get("confess_text")
     await state.clear()
@@ -1388,21 +1427,27 @@ async def confess_send(call: types.CallbackQuery, state: FSMContext):
     user_id = call.from_user.id
     cid = confess_db.get("next_id", 1)
     confess_db["next_id"] = cid + 1
-    confess_db.setdefault("items", {})[str(cid)] = {"uid": user_id, "text": text, "at": time.time(), "status": "pending"}
+    status = "private" if consent == "none" else "pending"
+    confess_db.setdefault("items", {})[str(cid)] = {
+        "uid": user_id, "text": text, "at": time.time(), "status": status, "consent": consent,
+    }
     confess_db.setdefault("last_by", {})[str(user_id)] = time.time()
     request_save()
     stat_add("confess")
     u = init_user(user_id)
     if ADMIN_ID:
+        head = "🤫 <b>Особисте зізнання</b> (не публікувати)" if consent == "none" else "🤫 <b>Нове зізнання</b>"
         await safe_send(
             ADMIN_ID,
-            f"🤫 <b>Нове зізнання #{cid}</b> (від {esc(u.get('custom_id', ''))})\n\n<blockquote>{esc(text)}</blockquote>",
-            reply_markup=confess_admin_kb(cid),
+            f"{head} #{cid} (від {esc(u.get('custom_id', ''))})\n"
+            f"Згода: <b>{CONFESS_CONSENT[consent]}</b>\n\n<blockquote>{esc(text)}</blockquote>",
+            reply_markup=confess_admin_kb(cid, consent),
         )
-    await call.message.answer(
-        "📨 Надіслано на перевірку! Щойно зізнання з'явиться в каналі — я тобі повідомлю 💜",
-        reply_markup=get_main_keyboard(),
-    )
+    if consent == "none":
+        reply = "🤫 Дякую, що поділився. Ми нічого не публікуватимемо — його прочитає лише модератор 💜"
+    else:
+        reply = "📨 Надіслано на перевірку! Щойно зізнання з'явиться в каналі — я тобі повідомлю 💜"
+    await call.message.answer(reply, reply_markup=get_main_keyboard())
     await call.answer()
 
 
@@ -1418,34 +1463,55 @@ def confess_post_kb():
     )
 
 
+async def _confess_publish(cid: str) -> str:
+    """Публікує зізнання в канал. Повертає текст для адміна."""
+    item = (confess_db.get("items") or {}).get(cid)
+    if not item or item.get("status") != "pending":
+        return "Вже оброблено."
+    if item.get("consent") == "none":
+        return "Автор просив не публікувати."
+    no = confess_db.get("pub_no", 0) + 1
+    try:
+        msg = await bot.send_message(CONFESS_CHANNEL, confess_post_text(no, item["text"]), disable_web_page_preview=True)
+    except TelegramAPIError as e:
+        return f"Не вдалося опублікувати: {e}"[:190]
+    confess_db["pub_no"] = no
+    item.update(status="published", no=no, msg_id=getattr(msg, "message_id", None), pub_at=time.time())
+    request_save()
+    await safe_send(
+        item["uid"],
+        f"✅ Твоє зізнання опубліковано як <b>#{no}</b>: {confess_channel_link(item.get('msg_id'))}\n\nДякуємо за довіру 💜",
+    )
+    return f"Опубліковано #{no}"
+
+
+async def _confess_reject(cid: str) -> str:
+    item = (confess_db.get("items") or {}).get(cid)
+    if not item or item.get("status") != "pending":
+        return "Вже оброблено."
+    item["status"] = "rejected"
+    item.pop("text", None)  # відхилене не зберігаємо
+    request_save()
+    await safe_send(
+        item["uid"],
+        "🤫 Цього разу зізнання не пройшло модерацію — можливо, в ньому були чиїсь дані або воно порушує правила. "
+        "Можеш написати нове 💜",
+    )
+    return "Відхилено"
+
+
 @dp.callback_query(F.data.startswith("conf_ok:"))
 async def confess_approve(call: types.CallbackQuery):
     if not _is_admin(call.from_user.id):
         await call.answer()
         return
-    cid = call.data.split(":", 1)[1]
-    item = (confess_db.get("items") or {}).get(cid)
-    if not item or item.get("status") != "pending":
-        await call.answer("Вже оброблено.", show_alert=True)
-        return
-    no = confess_db.get("pub_no", 0) + 1
-    try:
-        msg = await bot.send_message(CONFESS_CHANNEL, confess_post_text(no, item["text"]), disable_web_page_preview=True)
-    except TelegramAPIError as e:
-        await call.answer(f"Не вдалося опублікувати: {e}"[:190], show_alert=True)
-        return
-    confess_db["pub_no"] = no
-    item.update(status="published", no=no, msg_id=getattr(msg, "message_id", None))
-    request_save()
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await safe_send(
-        item["uid"],
-        f"✅ Твоє зізнання опубліковано як <b>#{no}</b>: {confess_channel_link(item.get('msg_id'))}\n\nДякуємо за довіру 💜",
-    )
-    await call.answer(f"Опубліковано #{no}")
+    res = await _confess_publish(call.data.split(":", 1)[1])
+    if res.startswith("Опубліковано"):
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            pass
+    await call.answer(res, show_alert=not res.startswith("Опубліковано"))
 
 
 @dp.callback_query(F.data.startswith("conf_no:"))
@@ -1453,24 +1519,225 @@ async def confess_reject(call: types.CallbackQuery):
     if not _is_admin(call.from_user.id):
         await call.answer()
         return
-    cid = call.data.split(":", 1)[1]
-    item = (confess_db.get("items") or {}).get(cid)
-    if not item or item.get("status") != "pending":
-        await call.answer("Вже оброблено.", show_alert=True)
-        return
-    item["status"] = "rejected"
-    item.pop("text", None)  # відхилене не зберігаємо
-    request_save()
+    res = await _confess_reject(call.data.split(":", 1)[1])
+    if res == "Відхилено":
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            pass
+    await call.answer(res, show_alert=res != "Відхилено")
+
+
+# ---------------------------------------------------------------------------
+# 📥 Зізнання в адмінці: фільтри, сторінки, публікація, відео, подарунок автору
+# ---------------------------------------------------------------------------
+CF_FILTERS = {
+    "new": "🆕 Нові",
+    "pub": "✅ Опубліковані",
+    "vid": "🎬 На відео",
+    "priv": "🤫 Особисті",
+    "rej": "❌ Відхилені",
+}
+CF_PER_PAGE = 5
+CF_GIFT_POST, CF_GIFT_VIDEO = "sp_card", "sp_key"  # 💌 за пост, 🗝 за відео
+
+
+def _cf_match(item: dict, flt: str) -> bool:
+    st = item.get("status")
+    if flt == "new":
+        return st == "pending"
+    if flt == "pub":
+        return st == "published"
+    if flt == "vid":
+        return bool(item.get("video"))
+    if flt == "priv":
+        return st == "private"
+    if flt == "rej":
+        return st == "rejected"
+    return False
+
+
+def _cf_items(flt: str) -> list:
+    items = [(cid, it) for cid, it in (confess_db.get("items") or {}).items() if _cf_match(it, flt)]
+    items.sort(key=lambda x: x[1].get("at", 0), reverse=True)
+    return items
+
+
+def _cf_icons(item: dict) -> str:
+    icons = {"post": "📝", "video": "🎬", "none": "🤫"}.get(item.get("consent", "video"), "")
+    if item.get("video"):
+        icons += " 🎥"
+    if item.get("gift"):
+        icons += " 🎁"
+    return icons
+
+
+@dp.callback_query(F.data.startswith("adm_cf_"))
+@admin_only
+async def adm_confessions(call: types.CallbackQuery):
     try:
-        await call.message.edit_reply_markup(reply_markup=None)
+        flt, page = call.data[len("adm_cf_"):].rsplit("_", 1)
+        page = int(page)
+    except ValueError:
+        flt, page = "new", 0
+    if flt not in CF_FILTERS:
+        flt = "new"
+    items = _cf_items(flt)
+    pages = max(1, (len(items) + CF_PER_PAGE - 1) // CF_PER_PAGE)
+    page = min(max(page, 0), pages - 1)
+    chunk = items[page * CF_PER_PAGE:(page + 1) * CF_PER_PAGE]
+    lines = [f"📥 <b>Зізнання — {CF_FILTERS[flt]}</b> ({len(items)})", ""]
+    if not chunk:
+        lines.append("Тут поки порожньо 🙂")
+    kb = []
+    for cid, it in chunk:
+        when = datetime.fromtimestamp(it.get("at", 0), KYIV_TZ).strftime("%d.%m %H:%M")
+        no = f" · канал #{it['no']}" if it.get("no") else ""
+        text = it.get("text") or "<i>(текст видалено)</i>"
+        if it.get("text"):
+            text = esc(text[:220] + ("…" if len(text) > 220 else ""))
+        lines.append(f"<b>#{cid}</b> · 🕐 {when}{no} · {_cf_icons(it)}\n<blockquote>{text}</blockquote>")
+        if it.get("text"):
+            kb.append([InlineKeyboardButton(text=f"📖 Відкрити #{cid}", callback_data=f"cfa_open:{cid}:{flt}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_cf_{flt}_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_cf_{flt}_{page + 1}"))
+    if nav:
+        kb.append(nav)
+    tabs = [
+        InlineKeyboardButton(text=f"{'• ' if k == flt else ''}{v} ({len(_cf_items(k))})", callback_data=f"adm_cf_{k}_0")
+        for k, v in CF_FILTERS.items()
+    ]
+    kb += [tabs[:2], tabs[2:4], tabs[4:]]
+    lines.append("\n<i>📝 пост · 🎬 згода на відео · 🤫 не публікувати · 🎥 беремо на відео · 🎁 подарунок надіслано</i>")
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+    try:
+        await call.message.edit_text("\n".join(lines), reply_markup=markup, disable_web_page_preview=True)
     except TelegramAPIError:
-        pass
+        await call.message.answer("\n".join(lines), reply_markup=markup, disable_web_page_preview=True)
+    await call.answer()
+
+
+def _cf_open_view(cid: str, flt: str):
+    it = (confess_db.get("items") or {}).get(cid)
+    if not it:
+        return "Зізнання не знайдено.", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm_cf_{flt}_0")]])
+    when = datetime.fromtimestamp(it.get("at", 0), KYIV_TZ).strftime("%d.%m.%Y %H:%M")
+    status = {"pending": "🆕 на перевірці", "published": "✅ опубліковано", "private": "🤫 особисте",
+              "rejected": "❌ відхилено"}.get(it.get("status"), it.get("status"))
+    lines = [
+        f"📖 <b>Зізнання #{cid}</b> · 🕐 {when}",
+        f"Статус: <b>{status}</b>" + (f" · канал #{it['no']}" if it.get("no") else ""),
+        f"Згода автора: <b>{CONFESS_CONSENT.get(it.get('consent', 'video'))}</b>",
+    ]
+    if it.get("video"):
+        lines.append("🎥 Беремо на відео")
+    if it.get("gift"):
+        lines.append(f"🎁 Подарунок надіслано: {GIFT_CATALOG.get(it['gift'], ('?',))[0]}")
+    lines.append(f"\n<blockquote>{esc(it.get('text') or '(текст видалено)')}</blockquote>")
+    kb = []
+    st = it.get("status")
+    if st == "pending":
+        kb.append([
+            InlineKeyboardButton(text="✅ Опублікувати", callback_data=f"cfa_ok:{cid}:{flt}"),
+            InlineKeyboardButton(text="❌ Відхилити", callback_data=f"cfa_no:{cid}:{flt}"),
+        ])
+    if it.get("consent", "video") == "video" and st in ("pending", "published") and not it.get("video"):
+        kb.append([InlineKeyboardButton(text="🎬 Беремо на відео", callback_data=f"cfa_vid:{cid}:{flt}")])
+    if st == "published" and not it.get("gift"):
+        gk = CF_GIFT_VIDEO if it.get("video") else CF_GIFT_POST
+        kb.append([InlineKeyboardButton(text=f"🎁 Подарунок автору: {GIFT_CATALOG[gk][0]}", callback_data=f"cfa_gift:{cid}:{flt}")])
+    kb.append([InlineKeyboardButton(text="⬅️ До списку", callback_data=f"adm_cf_{flt}_0")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+async def _cf_show(call: types.CallbackQuery, cid: str, flt: str):
+    text, kb = _cf_open_view(cid, flt)
+    try:
+        await call.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    except TelegramAPIError:
+        await call.message.answer(text, reply_markup=kb, disable_web_page_preview=True)
+
+
+def _cf_args(data: str):
+    parts = data.split(":")
+    cid = parts[1] if len(parts) > 1 else ""
+    flt = parts[2] if len(parts) > 2 and parts[2] in CF_FILTERS else "new"
+    return cid, flt
+
+
+@dp.callback_query(F.data.startswith("cfa_open:"))
+@admin_only
+async def cfa_open(call: types.CallbackQuery):
+    cid, flt = _cf_args(call.data)
+    await _cf_show(call, cid, flt)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("cfa_ok:"))
+@admin_only
+async def cfa_ok(call: types.CallbackQuery):
+    cid, flt = _cf_args(call.data)
+    res = await _confess_publish(cid)
+    await _cf_show(call, cid, flt)
+    await call.answer(res, show_alert=not res.startswith("Опубліковано"))
+
+
+@dp.callback_query(F.data.startswith("cfa_no:"))
+@admin_only
+async def cfa_no(call: types.CallbackQuery):
+    cid, flt = _cf_args(call.data)
+    res = await _confess_reject(cid)
+    await _cf_show(call, cid, flt)
+    await call.answer(res, show_alert=res != "Відхилено")
+
+
+@dp.callback_query(F.data.startswith("cfa_vid:"))
+@admin_only
+async def cfa_vid(call: types.CallbackQuery):
+    cid, flt = _cf_args(call.data)
+    it = (confess_db.get("items") or {}).get(cid)
+    if not it or it.get("consent", "video") != "video":
+        await call.answer("Автор не давав згоди на відео.", show_alert=True)
+        return
+    it["video"] = True
+    request_save()
+    await _cf_show(call, cid, flt)
+    await call.answer("🎬 Позначено: беремо на відео")
+
+
+@dp.callback_query(F.data.startswith("cfa_gift:"))
+@admin_only
+async def cfa_gift(call: types.CallbackQuery):
+    cid, flt = _cf_args(call.data)
+    it = (confess_db.get("items") or {}).get(cid)
+    if not it or it.get("status") != "published":
+        await call.answer("Подарунок — лише за опубліковане зізнання.", show_alert=True)
+        return
+    if it.get("gift"):
+        await call.answer("Подарунок за це зізнання вже надіслано 🙂", show_alert=True)
+        return
+    uid = it.get("uid")
+    if uid not in users_db:
+        await call.answer("Автора не знайдено.", show_alert=True)
+        return
+    key = CF_GIFT_VIDEO if it.get("video") else CF_GIFT_POST
+    it["gift"] = key  # ставимо одразу — щоб подвійне натискання не дало два подарунки
+    u = users_db[uid]
+    u.setdefault("gifts", {})
+    u["gifts"][key] = u["gifts"].get(key, 0) + 1
+    request_save()
+    why = "твою історію озвучать у відео" if it.get("video") else "твоє зізнання вийшло в каналі"
     await safe_send(
-        item["uid"],
-        "🤫 Цього разу зізнання не пройшло модерацію — можливо, в ньому були чиїсь дані або воно порушує правила. "
-        "Можеш написати нове 💜",
+        uid,
+        f"🎁 <b>Дякуємо за довіру!</b>\n\nЗа те, що {why}, тримай подарунок від команди ANONimchyk: "
+        f"<b>{GIFT_CATALOG[key][0]}</b> 💜\n\nВін уже у твоєму інвентарі (👤 Мій профіль) — "
+        "можеш подарувати його співрозмовнику під час чату.",
     )
-    await call.answer("Відхилено")
+    await _cf_show(call, cid, flt)
+    await call.answer(f"🎁 Надіслано {GIFT_CATALOG[key][0]}")
 
 # ---------------------------------------------------------------------------
 # 🎭 Зняти маску: за взаємною згодою показати одне одному нік, вік і фото профілю;
@@ -1979,296 +2246,6 @@ async def wd_card(message: types.Message, state: FSMContext):
             [InlineKeyboardButton(text="✖️ Скасувати", callback_data="wd_cancel")],
         ]),
     )
-
-
-@dp.callback_query(F.data == "wd_confirm")
-async def wd_confirm(call: types.CallbackQuery, state: FSMContext):
-    user_id = call.from_user.id
-    data = await state.get_data()
-    card, amount = data.get("wd_card"), float(data.get("wd_amount") or 0)
-    await state.clear()
-    if not card or amount <= 0:
-        await call.answer("Заявка застаріла — почни ще раз з гаманця.", show_alert=True)
-        return
-    u = init_user(user_id)
-    if wd_pending_of(user_id)[1] or amount < WITHDRAW_MIN or amount > withdrawable(u):
-        await call.answer("Сума вже недоступна — відкрий гаманець ще раз.", show_alert=True)
-        return
-    await call.answer()
-    u["balance"] = round(u["balance"] - amount, 2)
-    u["earn_ready"] = round(u.get("earn_ready", 0.0) - amount, 2)
-    no = str(withdraw_db.get("next", 1))
-    withdraw_db["next"] = int(no) + 1
-    w = {"user_id": user_id, "amount": amount, "last4": card[-4:], "created": time.time(), "status": "pending"}
-    withdraw_db.setdefault("items", {})[no] = w
-    request_save()
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await call.message.answer(
-        f"✅ Заявку №{no} на <b>{uah(amount)}</b> прийнято. Щойно гроші надійдуть на картку •••• {card[-4:]}, бот напише 💜",
-        reply_markup=get_main_keyboard(),
-    )
-    if ADMIN_ID:
-        try:
-            sent = await bot.send_message(
-                ADMIN_ID,
-                f"💸 <b>Заявка на виплату №{no}</b>\n\n"
-                f"👤 {admin_label(user_id)}\n"
-                f"🎂 Вік: {esc(u.get('age'))} · зароблено всього: {uah(u.get('earned_total', 0))}\n"
-                f"💰 Сума: <b>{uah(amount)}</b>\n"
-                f"💳 Картка: <code>{card}</code>\n\n"
-                "<i>Після переказу натисни «Виплачено» — номер картки зникне з цього повідомлення.</i>",
-                protect_content=True,
-                reply_markup=wd_admin_kb(no),
-            )
-            w["admin_msg"] = sent.message_id
-        except TelegramAPIError as e:
-            logging.warning("Заявка на виплату: не вдалося повідомити адміна: %s", e)
-
-
-def wd_admin_kb(no: str):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Виплачено", callback_data=f"wd_paid:{no}"),
-        InlineKeyboardButton(text="❌ Відхилити", callback_data=f"wd_rej:{no}"),
-    ]])
-
-
-@dp.callback_query(F.data.startswith("wd_paid:") | F.data.startswith("wd_rej:"))
-async def wd_admin_decide(call: types.CallbackQuery):
-    if not _is_admin(call.from_user.id):
-        await call.answer("Доступ заборонено", show_alert=True)
-        return
-    action, no = call.data.split(":", 1)
-    w = withdraw_db.get("items", {}).get(no)
-    if w is None or w["status"] != "pending":
-        await call.answer("Заявку вже оброблено.", show_alert=True)
-        return
-    paid = action == "wd_paid"
-    w["status"] = "paid" if paid else "rejected"
-    w["done"] = time.time()
-    u = init_user(w["user_id"])
-    if paid:
-        u["withdrawn_total"] = round(u.get("withdrawn_total", 0.0) + w["amount"], 2)
-        stat_add("withdrawn", w["amount"])
-        await safe_send(w["user_id"], f"✅ Виплату <b>{uah(w['amount'])}</b> надіслано на картку •••• {w['last4']}. Дякуємо, що ти з нами 💜")
-    else:
-        u["balance"] = round(u["balance"] + w["amount"], 2)
-        u["earn_ready"] = round(u.get("earn_ready", 0.0) + w["amount"], 2)
-        await safe_send(
-            w["user_id"],
-            f"❌ Заявку №{no} на виплату відхилено — {uah(w['amount'])} повернуто на баланс.\n"
-            "Якщо є питання — напиши в 🆘 Допомога.",
-        )
-    request_save()
-    try:
-        await call.message.edit_text(
-            f"💸 Заявка №{no}: {uah(w['amount'])} · картка •••• {w['last4']}\n"
-            f"👤 {admin_label(w['user_id'])}\n\n" + ("✅ Виплачено" if paid else "❌ Відхилено, гроші повернуто"),
-            reply_markup=None,
-        )
-    except TelegramAPIError:
-        pass
-    await call.answer("Готово")
-
-
-@dp.callback_query(F.data == "adm_wd")
-@admin_only
-async def adm_withdrawals(call: types.CallbackQuery):
-    items = withdraw_db.get("items", {})
-    pending = [(no, w) for no, w in items.items() if w["status"] == "pending"]
-    paid_sum = sum(w["amount"] for w in items.values() if w["status"] == "paid")
-    lines = [f"💸 <b>Виводи</b>\n\nВиплачено всього: {uah(paid_sum)}", f"На перевірці: {len(pending)}\n"]
-    for no, w in pending[:20]:
-        lines.append(
-            f"№{no} · {uah(w['amount'])} · •••• {w['last4']} · {admin_label(w['user_id'])}"
-            + ("" if w.get("admin_msg") else " · ⚠️ повідомлення з карткою не дійшло")
-        )
-    if pending:
-        lines.append("\n<i>Повний номер картки — у повідомленні заявки вище в чаті.</i>")
-    await call.message.answer("\n".join(lines))
-    await call.answer()
-
-
-# ---------------------------------------------------------------------------
-# Адмін: топ балансів і обнулення лічильника рулетки
-# ---------------------------------------------------------------------------
-@dp.callback_query(F.data == "adm_topbal")
-@admin_only
-async def adm_top_balances(call: types.CallbackQuery):
-    people = [(uid, u) for uid, u in users_db.items() if uid != ADMIN_ID]
-    top = sorted(people, key=lambda x: -x[1].get("balance", 0))[:15]
-    total = sum(u.get("balance", 0) for _uid, u in people)
-    ready = sum(withdrawable(u) for _uid, u in people)
-    lines = [
-        "💰 <b>Топ балансів</b>\n",
-        f"На балансах усього: <b>{total:.2f} грн</b>",
-        f"З них можна вивести на карту: <b>{ready:.2f} грн</b>\n",
-    ]
-    for i, (uid, u) in enumerate(top, 1):
-        if u.get("balance", 0) <= 0:
-            break
-        extra = f" · зароблено {u['earned_total']:.0f}" if u.get("earned_total") else ""
-        lines.append(f"{i}. {admin_label(uid)} — <b>{u['balance']:.2f} грн</b>{extra}")
-    await call.message.answer("\n".join(lines))
-    await call.answer()
-
-
-def roul_reset_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Так, обнулити", callback_data="adm_roul_reset_yes"),
-        InlineKeyboardButton(text="✖️ Ні", callback_data="adm_roul_reset_no"),
-    ]])
-
-
-@dp.callback_query(F.data == "adm_roul_reset")
-@admin_only
-async def adm_roulette_reset(call: types.CallbackQuery):
-    await call.message.answer(
-        f"🎰 Дохід з рулетки зараз: {lottery_revenue_total:.0f} грн.\nОбнулити лічильник (напр. після тестів)?",
-        reply_markup=roul_reset_kb(),
-    )
-    await call.answer()
-
-
-@dp.callback_query(F.data.in_({"adm_roul_reset_yes", "adm_roul_reset_no"}))
-@admin_only
-async def adm_roulette_reset_do(call: types.CallbackQuery):
-    global lottery_revenue_total
-    if call.data.endswith("_yes"):
-        lottery_revenue_total = 0.0
-        request_save()
-        text = "✅ Лічильник рулетки обнулено."
-    else:
-        text = "Залишено як є."
-    try:
-        await call.message.edit_text(text, reply_markup=None)
-    except TelegramAPIError:
-        pass
-    await call.answer()
-
-
-BOT_STARTED_AT = time.time()
-
-
-@dp.message(Command("version"))
-async def version_cmd(message: types.Message):
-    if not _is_admin(message.from_user.id):
-        return
-    up = int(time.time() - BOT_STARTED_AT)
-    blocked = sum(1 for u in users_db.values() if u.get("blocked_bot"))
-    await message.answer(
-        f"🤖 Версія бота: <b>{BOT_VERSION}</b>\n⏱ Працює без перезапуску: {up // 3600} год {up % 3600 // 60} хв\n"
-        f"{calls_status()}\n🚫 Заблокували бота: {blocked}"
-    )
-
-
-@dp.message(Command("resetroulette"))
-async def reset_roulette_cmd(message: types.Message):
-    if not _is_admin(message.from_user.id):
-        return
-    await message.answer(
-        f"🎰 Дохід з рулетки зараз: {lottery_revenue_total:.0f} грн.\nОбнулити лічильник (напр. після тестів)?",
-        reply_markup=roul_reset_kb(),
-    )
-
-
-# ---------------------------------------------------------------------------
-# 👥 Живі кімнати: велика кнопка з лічильником, «поки шукаємо — зазирни в кімнату»,
-# пошук у фоні (до 2 год) і теми від бота, коли в кімнаті тихо
-# ---------------------------------------------------------------------------
-BG_SEARCH_MAX = int(os.getenv("BG_SEARCH_MAX", str(2 * 3600)))  # скільки триває пошук у фоні від старту
-ROOM_QUIET_TOPIC = int(os.getenv("ROOM_QUIET_TOPIC", "300"))  # через скільки секунд тиші бот підкидає тему
-bg_notified: dict[int, float] = {}  # кому вже сказали, що пошук іде у фоні
-
-ROOM_QUESTIONS = [
-    "Яка найдивніша річ сталася з вами цього тижня?",
-    "Що вас точно підбадьорить, коли все йде не так?",
-    "Яку пісню ви б поставили на повтор прямо зараз?",
-    "Яке місце в Україні (чи у світі) варто побачити кожному?",
-    "Що ви вмієте, чого ніхто не очікує?",
-    "Яка ваша найкраща порада тому, кому зараз важко?",
-    "Котики, собаки чи ні те ні інше? Аргументуйте 😄",
-    "Який фільм ви переглянули б удруге просто зараз?",
-    "Що б ви зробили з вільним днем без телефона?",
-    "Яка ваша суперсила в компанії друзів?",
-    "Чай чи кава — і в який час доби?",
-    "Яку звичку ви хочете позбутися, а яку завести?",
-]
-
-
-HW_ROOM = {"spooky": "🎃 Страшилки"}  # тимчасова кімната на Хелловін
-
-
-def room_topics_now() -> dict:
-    return {**HW_ROOM, **ROOM_TOPICS} if halloween_active() else ROOM_TOPICS
-
-
-def rooms_online() -> int:
-    return sum(len(r["members"]) for r in rooms.values())
-
-
-def rooms_button_label() -> str:
-    n = rooms_online()
-    return f"{BTN_ROOMS} · {n}" if n >= 2 else BTN_ROOMS
-
-
-def rooms_intro_text(user_id: int) -> str:
-    text = (
-        "👥 <b>Кімнати за інтересами</b>\n\n"
-        f"Обери тему — потрапиш у групу до {ROOM_CAPACITY} людей, які говорять про те саме. "
-        "У кімнатах — текст, музика 🎵 і стікери 😀. Фото й відео — лише в приватному чаті."
-    )
-    if user_id in queue:
-        text += "\n\n🔔 Пошук співрозмовника не зупиниться — щойно когось знайду, покличу тебе."
-    return text
-
-
-def rooms_open_kb():
-    n = rooms_online()
-    label = f"👥 Зайти в кімнату · там {n}" if n else "👥 Зайти в кімнату"
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, callback_data="rooms_open")]])
-
-
-async def offer_rooms_while_waiting(user_id: int, mode: str):
-    """Поки черга порожня — пропонуємо кімнату, де вже хтось є (пошук триває)."""
-    if mode == "voice" or user_id in user_room or rooms_online() < 1:
-        return
-    await safe_send(
-        user_id,
-        f"👥 Поки шукаємо — зазирни в кімнату: там зараз <b>{rooms_online()}</b>. Пошук при цьому не зупиниться 🔔",
-        reply_markup=rooms_open_kb(),
-    )
-
-
-@dp.callback_query(F.data == "rooms_open")
-async def rooms_open_cb(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    await call.answer()
-    if user_id in banned_users:
-        return
-    if user_id in active_chats:
-        await call.message.answer("Спочатку заверши приватний чат.", reply_markup=get_chat_keyboard())
-        return
-    if user_id in user_room:
-        await call.message.answer("Ти вже в кімнаті 🙂", reply_markup=get_room_keyboard())
-        return
-    await call.message.answer(rooms_intro_text(user_id), reply_markup=get_room_topics_keyboard())
-
-
-async def pull_from_room(user_id: int, quiet: bool = False):
-    """Знайшовся співрозмовник — людина виходить з кімнати в приватний чат (інших попереджаємо)."""
-    room_id = user_room.get(user_id)
-    if room_id is None:
-        return
-    room = rooms.get(room_id)
-    remove_from_room(user_id)
-    if quiet or not room:
-        return
-    nick = esc((users_db.get(user_id) or {}).get("nickname", "Хтось"))
-    for member_id in list(room["members"]):
-        await safe_send(member_id, f"🚪 <b>{nick}</b> пішов у приватний чат.")
 
 
 # === КІНЕЦЬ part5.py ===

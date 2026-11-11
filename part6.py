@@ -1,3 +1,293 @@
+@dp.callback_query(F.data == "wd_confirm")
+async def wd_confirm(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    data = await state.get_data()
+    card, amount = data.get("wd_card"), float(data.get("wd_amount") or 0)
+    await state.clear()
+    if not card or amount <= 0:
+        await call.answer("Заявка застаріла — почни ще раз з гаманця.", show_alert=True)
+        return
+    u = init_user(user_id)
+    if wd_pending_of(user_id)[1] or amount < WITHDRAW_MIN or amount > withdrawable(u):
+        await call.answer("Сума вже недоступна — відкрий гаманець ще раз.", show_alert=True)
+        return
+    await call.answer()
+    u["balance"] = round(u["balance"] - amount, 2)
+    u["earn_ready"] = round(u.get("earn_ready", 0.0) - amount, 2)
+    no = str(withdraw_db.get("next", 1))
+    withdraw_db["next"] = int(no) + 1
+    w = {"user_id": user_id, "amount": amount, "last4": card[-4:], "created": time.time(), "status": "pending"}
+    withdraw_db.setdefault("items", {})[no] = w
+    request_save()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.message.answer(
+        f"✅ Заявку №{no} на <b>{uah(amount)}</b> прийнято. Щойно гроші надійдуть на картку •••• {card[-4:]}, бот напише 💜",
+        reply_markup=get_main_keyboard(),
+    )
+    if ADMIN_ID:
+        try:
+            sent = await bot.send_message(
+                ADMIN_ID,
+                f"💸 <b>Заявка на виплату №{no}</b>\n\n"
+                f"👤 {admin_label(user_id)}\n"
+                f"🎂 Вік: {esc(u.get('age'))} · зароблено всього: {uah(u.get('earned_total', 0))}\n"
+                f"💰 Сума: <b>{uah(amount)}</b>\n"
+                f"💳 Картка: <code>{card}</code>\n\n"
+                "<i>Після переказу натисни «Виплачено» — номер картки зникне з цього повідомлення.</i>",
+                protect_content=True,
+                reply_markup=wd_admin_kb(no),
+            )
+            w["admin_msg"] = sent.message_id
+        except TelegramAPIError as e:
+            logging.warning("Заявка на виплату: не вдалося повідомити адміна: %s", e)
+
+
+def wd_admin_kb(no: str):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Виплачено", callback_data=f"wd_paid:{no}"),
+        InlineKeyboardButton(text="❌ Відхилити", callback_data=f"wd_rej:{no}"),
+    ]])
+
+
+@dp.callback_query(F.data.startswith("wd_paid:") | F.data.startswith("wd_rej:"))
+async def wd_admin_decide(call: types.CallbackQuery):
+    if not _is_admin(call.from_user.id):
+        await call.answer("Доступ заборонено", show_alert=True)
+        return
+    action, no = call.data.split(":", 1)
+    w = withdraw_db.get("items", {}).get(no)
+    if w is None or w["status"] != "pending":
+        await call.answer("Заявку вже оброблено.", show_alert=True)
+        return
+    paid = action == "wd_paid"
+    w["status"] = "paid" if paid else "rejected"
+    w["done"] = time.time()
+    u = init_user(w["user_id"])
+    if paid:
+        u["withdrawn_total"] = round(u.get("withdrawn_total", 0.0) + w["amount"], 2)
+        stat_add("withdrawn", w["amount"])
+        await safe_send(w["user_id"], f"✅ Виплату <b>{uah(w['amount'])}</b> надіслано на картку •••• {w['last4']}. Дякуємо, що ти з нами 💜")
+    else:
+        u["balance"] = round(u["balance"] + w["amount"], 2)
+        u["earn_ready"] = round(u.get("earn_ready", 0.0) + w["amount"], 2)
+        await safe_send(
+            w["user_id"],
+            f"❌ Заявку №{no} на виплату відхилено — {uah(w['amount'])} повернуто на баланс.\n"
+            "Якщо є питання — напиши в 🆘 Допомога.",
+        )
+    request_save()
+    try:
+        await call.message.edit_text(
+            f"💸 Заявка №{no}: {uah(w['amount'])} · картка •••• {w['last4']}\n"
+            f"👤 {admin_label(w['user_id'])}\n\n" + ("✅ Виплачено" if paid else "❌ Відхилено, гроші повернуто"),
+            reply_markup=None,
+        )
+    except TelegramAPIError:
+        pass
+    await call.answer("Готово")
+
+
+@dp.callback_query(F.data == "adm_wd")
+@admin_only
+async def adm_withdrawals(call: types.CallbackQuery):
+    items = withdraw_db.get("items", {})
+    pending = [(no, w) for no, w in items.items() if w["status"] == "pending"]
+    paid_sum = sum(w["amount"] for w in items.values() if w["status"] == "paid")
+    lines = [f"💸 <b>Виводи</b>\n\nВиплачено всього: {uah(paid_sum)}", f"На перевірці: {len(pending)}\n"]
+    for no, w in pending[:20]:
+        lines.append(
+            f"№{no} · {uah(w['amount'])} · •••• {w['last4']} · {admin_label(w['user_id'])}"
+            + ("" if w.get("admin_msg") else " · ⚠️ повідомлення з карткою не дійшло")
+        )
+    if pending:
+        lines.append("\n<i>Повний номер картки — у повідомленні заявки вище в чаті.</i>")
+    await call.message.answer("\n".join(lines))
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Адмін: топ балансів і обнулення лічильника рулетки
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data == "adm_topbal")
+@admin_only
+async def adm_top_balances(call: types.CallbackQuery):
+    people = [(uid, u) for uid, u in users_db.items() if uid != ADMIN_ID]
+    top = sorted(people, key=lambda x: -x[1].get("balance", 0))[:15]
+    total = sum(u.get("balance", 0) for _uid, u in people)
+    ready = sum(withdrawable(u) for _uid, u in people)
+    lines = [
+        "💰 <b>Топ балансів</b>\n",
+        f"На балансах усього: <b>{total:.2f} грн</b>",
+        f"З них можна вивести на карту: <b>{ready:.2f} грн</b>\n",
+    ]
+    for i, (uid, u) in enumerate(top, 1):
+        if u.get("balance", 0) <= 0:
+            break
+        extra = f" · зароблено {u['earned_total']:.0f}" if u.get("earned_total") else ""
+        lines.append(f"{i}. {admin_label(uid)} — <b>{u['balance']:.2f} грн</b>{extra}")
+    await call.message.answer("\n".join(lines))
+    await call.answer()
+
+
+def roul_reset_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Так, обнулити", callback_data="adm_roul_reset_yes"),
+        InlineKeyboardButton(text="✖️ Ні", callback_data="adm_roul_reset_no"),
+    ]])
+
+
+@dp.callback_query(F.data == "adm_roul_reset")
+@admin_only
+async def adm_roulette_reset(call: types.CallbackQuery):
+    await call.message.answer(
+        f"🎰 Дохід з рулетки зараз: {lottery_revenue_total:.0f} грн.\nОбнулити лічильник (напр. після тестів)?",
+        reply_markup=roul_reset_kb(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.in_({"adm_roul_reset_yes", "adm_roul_reset_no"}))
+@admin_only
+async def adm_roulette_reset_do(call: types.CallbackQuery):
+    global lottery_revenue_total
+    if call.data.endswith("_yes"):
+        lottery_revenue_total = 0.0
+        request_save()
+        text = "✅ Лічильник рулетки обнулено."
+    else:
+        text = "Залишено як є."
+    try:
+        await call.message.edit_text(text, reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.answer()
+
+
+BOT_STARTED_AT = time.time()
+
+
+@dp.message(Command("version"))
+async def version_cmd(message: types.Message):
+    if not _is_admin(message.from_user.id):
+        return
+    up = int(time.time() - BOT_STARTED_AT)
+    blocked = sum(1 for u in users_db.values() if u.get("blocked_bot"))
+    await message.answer(
+        f"🤖 Версія бота: <b>{BOT_VERSION}</b>\n⏱ Працює без перезапуску: {up // 3600} год {up % 3600 // 60} хв\n"
+        f"{calls_status()}\n🚫 Заблокували бота: {blocked}"
+    )
+
+
+@dp.message(Command("resetroulette"))
+async def reset_roulette_cmd(message: types.Message):
+    if not _is_admin(message.from_user.id):
+        return
+    await message.answer(
+        f"🎰 Дохід з рулетки зараз: {lottery_revenue_total:.0f} грн.\nОбнулити лічильник (напр. після тестів)?",
+        reply_markup=roul_reset_kb(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 👥 Живі кімнати: велика кнопка з лічильником, «поки шукаємо — зазирни в кімнату»,
+# пошук у фоні (до 2 год) і теми від бота, коли в кімнаті тихо
+# ---------------------------------------------------------------------------
+BG_SEARCH_MAX = int(os.getenv("BG_SEARCH_MAX", str(2 * 3600)))  # скільки триває пошук у фоні від старту
+ROOM_QUIET_TOPIC = int(os.getenv("ROOM_QUIET_TOPIC", "300"))  # через скільки секунд тиші бот підкидає тему
+bg_notified: dict[int, float] = {}  # кому вже сказали, що пошук іде у фоні
+
+ROOM_QUESTIONS = [
+    "Яка найдивніша річ сталася з вами цього тижня?",
+    "Що вас точно підбадьорить, коли все йде не так?",
+    "Яку пісню ви б поставили на повтор прямо зараз?",
+    "Яке місце в Україні (чи у світі) варто побачити кожному?",
+    "Що ви вмієте, чого ніхто не очікує?",
+    "Яка ваша найкраща порада тому, кому зараз важко?",
+    "Котики, собаки чи ні те ні інше? Аргументуйте 😄",
+    "Який фільм ви переглянули б удруге просто зараз?",
+    "Що б ви зробили з вільним днем без телефона?",
+    "Яка ваша суперсила в компанії друзів?",
+    "Чай чи кава — і в який час доби?",
+    "Яку звичку ви хочете позбутися, а яку завести?",
+]
+
+
+HW_ROOM = {"spooky": "🎃 Страшилки"}  # тимчасова кімната на Хелловін
+
+
+def room_topics_now() -> dict:
+    return {**HW_ROOM, **ROOM_TOPICS} if halloween_active() else ROOM_TOPICS
+
+
+def rooms_online() -> int:
+    return sum(len(r["members"]) for r in rooms.values())
+
+
+def rooms_button_label() -> str:
+    n = rooms_online()
+    return f"{BTN_ROOMS} · {n}" if n >= 2 else BTN_ROOMS
+
+
+def rooms_intro_text(user_id: int) -> str:
+    text = (
+        "👥 <b>Кімнати за інтересами</b>\n\n"
+        f"Обери тему — потрапиш у групу до {ROOM_CAPACITY} людей, які говорять про те саме. "
+        "У кімнатах — текст, музика 🎵 і стікери 😀. Фото й відео — лише в приватному чаті."
+    )
+    if user_id in queue:
+        text += "\n\n🔔 Пошук співрозмовника не зупиниться — щойно когось знайду, покличу тебе."
+    return text
+
+
+def rooms_open_kb():
+    n = rooms_online()
+    label = f"👥 Зайти в кімнату · там {n}" if n else "👥 Зайти в кімнату"
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, callback_data="rooms_open")]])
+
+
+async def offer_rooms_while_waiting(user_id: int, mode: str):
+    """Поки черга порожня — пропонуємо кімнату, де вже хтось є (пошук триває)."""
+    if mode == "voice" or user_id in user_room or rooms_online() < 1:
+        return
+    await safe_send(
+        user_id,
+        f"👥 Поки шукаємо — зазирни в кімнату: там зараз <b>{rooms_online()}</b>. Пошук при цьому не зупиниться 🔔",
+        reply_markup=rooms_open_kb(),
+    )
+
+
+@dp.callback_query(F.data == "rooms_open")
+async def rooms_open_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    await call.answer()
+    if user_id in banned_users:
+        return
+    if user_id in active_chats:
+        await call.message.answer("Спочатку заверши приватний чат.", reply_markup=get_chat_keyboard())
+        return
+    if user_id in user_room:
+        await call.message.answer("Ти вже в кімнаті 🙂", reply_markup=get_room_keyboard())
+        return
+    await call.message.answer(rooms_intro_text(user_id), reply_markup=get_room_topics_keyboard())
+
+
+async def pull_from_room(user_id: int, quiet: bool = False):
+    """Знайшовся співрозмовник — людина виходить з кімнати в приватний чат (інших попереджаємо)."""
+    room_id = user_room.get(user_id)
+    if room_id is None:
+        return
+    room = rooms.get(room_id)
+    remove_from_room(user_id)
+    if quiet or not room:
+        return
+    nick = esc((users_db.get(user_id) or {}).get("nickname", "Хтось"))
+    for member_id in list(room["members"]):
+        await safe_send(member_id, f"🚪 <b>{nick}</b> пішов у приватний чат.")
+
+
 def bg_search_text() -> str:
     return (
         "🔔 Поки нікого немає — я шукаю <b>у фоні</b> ще до двох годин.\n\n"
@@ -1098,7 +1388,7 @@ async def setup_bot_commands():
         types.BotCommand(command="gifts", description="🎁 Магазин подарунків"),
         types.BotCommand(command="invite", description="🤝 Запросити друга"),
         types.BotCommand(command="recent", description="🔁 Минулі розмови"),
-        types.BotCommand(command="donate", description="💙 Підтримати проект"),
+        types.BotCommand(command="donate", description="💜 Підтримати проект"),
         types.BotCommand(command="premium", description="💎 Premium"),
         types.BotCommand(command="confess", description="🤫 Анонімне зізнання"),
         types.BotCommand(command="edit_profile", description="✏️ Мій профіль"),

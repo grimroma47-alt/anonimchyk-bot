@@ -928,6 +928,7 @@ async def gifts_cmd(message: types.Message, state: FSMContext):
         "🎁 <b>Магазин подарунків</b>\n\n"
         "Зліва — звичайні, справа — ✨ <b>особливі</b>: феєрверк на весь екран, маска-сюрприз, передбачення, "
         "листівка, ключик-таємниця, колекційний 🌙 Місяць з номером і смішні дрібнички.\n"
+        "🎬 — подарунок приходить з анімацією.\n"
         f"Купи про запас і даруй у чаті кнопкою «🎁 Подарувати». Отримувач одразу отримує "
         f"{GIFT_RECIPIENT_SHARE * 100:.0f}% вартості на баланс.\n\n💰 Твій баланс: {u['balance']:.2f} грн",
         reply_markup=get_gift_catalog_keyboard(),
@@ -2159,14 +2160,14 @@ async def recent_invite(call: types.CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
-# 💙 Підтримати проект (донат)
+# 💜 Підтримати проект (донат)
 # ---------------------------------------------------------------------------
 @dp.message(Command("donate"))
 async def donate_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     link = mono_jar_link()
     text = (
-        "💙 <b>Підтримати ANONimchyk</b>\n\n"
+        "💜 <b>Підтримати ANONimchyk</b>\n\n"
         "Бот безкоштовний, але сервер, реклама й нові функції коштують грошей. "
         "Якщо тобі тут подобається — можеш підтримати будь-якою сумою 🙏\n\n"
         "Це не покупка: на баланс нічого не нараховується, це просто подяка команді 💜"
@@ -2174,7 +2175,7 @@ async def donate_cmd(message: types.Message, state: FSMContext):
     kb = None
     if link:
         text += "\n\nУ коментарі до переказу можна написати «Донат» 🙂"
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💙 Підтримати через monobank", url=link)]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💜 Підтримати через monobank", url=link)]])
     else:
         text += "\n\nПосилання на підтримку з'явиться трохи пізніше."
     await message.answer(text, reply_markup=kb)

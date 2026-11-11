@@ -37,7 +37,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задано змінну середовища BOT_TOKEN")
 
-BOT_VERSION = "08.11-a"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
+BOT_VERSION = "10.11-a"  # видно в /admin і /version — щоб перевірити, що задеплоїлась нова версія
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram ID (для скарг і поповнень)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")  # пароль для входу в /admin
 
@@ -491,7 +491,7 @@ NICK_PRICE = SHOP["nick"][1]
 # решта лишається адміну (тобто просто не нараховується нікому).
 GIFT_CATALOG = {
     "rose": ("🌹 Троянда", 10),
-    "heart": ("❤️ Серце", 12),
+    "heart": ("💜 Серце", 12),
     "chocolate": ("🍫 Шоколадка", 15),
     "rabbit": ("🐰 Зайчик", 18),
     "dog": ("🐶 Собачка", 18),
@@ -959,6 +959,11 @@ def get_gift_menu_keyboard():
     )
 
 
+def anim_mark(key: str) -> str:
+    """🎬 біля подарунків, які приходять з анімацією на весь екран."""
+    return " 🎬" if key in GIFT_ANIM_FILES else ""
+
+
 def get_gift_catalog_keyboard():
     """Магазин подарунків: купити подарунок про запас (в інвентар)."""
     hw = halloween_active()
@@ -967,7 +972,7 @@ def get_gift_catalog_keyboard():
     ]
     left = [
         InlineKeyboardButton(
-            text=("⏳ " if key in LIMITED_GIFTS else "") + f"{GIFT_CATALOG[key][0]} — {GIFT_CATALOG[key][1]} грн",
+            text=("⏳ " if key in LIMITED_GIFTS else "") + f"{GIFT_CATALOG[key][0]} — {GIFT_CATALOG[key][1]} грн" + anim_mark(key),
             callback_data=f"buygift_{key}",
         )
         for key in regular
@@ -980,6 +985,7 @@ def get_gift_catalog_keyboard():
             label = f"{title} — {price} грн · {left_n} шт" if left_n > 0 else f"{title} — розпродано"
         else:
             label = f"{title} — {price} грн"
+        label += anim_mark(key)
         right.append(InlineKeyboardButton(text=label, callback_data=f"buygift_{key}"))
     # Ліва колонка — звичайні подарунки, права («ряд збоку») — ✨ особливі, які щось роблять
     rows = [[
@@ -1231,6 +1237,7 @@ def get_admin_keyboard():
             [InlineKeyboardButton(text="🔗 Посилання з мітками", callback_data="adm_links")],
             [InlineKeyboardButton(text="🎁 Подарувати подарунок", callback_data="adm_gift")],
             [InlineKeyboardButton(text="🚨 Скарги", callback_data="adm_reports_0")],
+            [InlineKeyboardButton(text="📥 Зізнання", callback_data="adm_cf_new_0")],
             [
                 InlineKeyboardButton(text="⛔ Забанити", callback_data="adm_ban"),
                 InlineKeyboardButton(text="✅ Розбанити", callback_data="adm_unban"),

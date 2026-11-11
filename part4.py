@@ -1985,13 +1985,16 @@ def meet_is_live(now: datetime | None = None) -> bool:
     return now.hour == MEET_HOUR
 
 
+ONLINE_STATS_DAYS = 30  # «👥 Онлайн»: люди, заходи й розмови — за останні 30 днів
+
+
 def week_visitors() -> int:
-    """Скільки різних людей заходило в бот за останні 7 днів (з сьогоднішнім, за Києвом).
+    """Скільки різних людей заходило в бот за останні ONLINE_STATS_DAYS днів (з сьогоднішнім, за Києвом).
     Кожна людина рахується один раз, скільки б разів не заходила."""
     try:
         today = kyiv_today()
         seen: set = set()
-        for i in range(7):
+        for i in range(ONLINE_STATS_DAYS):
             seen |= set((stats_days.get((today - timedelta(days=i)).isoformat()) or {}).get("active") or ())
         seen |= set(stats_day().get("active") or ())
         return max(1, len(seen))
@@ -2003,7 +2006,7 @@ def week_visits() -> int:
     """Скільки разів за 7 днів люди заходили в бот (захід = повернення після перерви від 30 хв)."""
     try:
         today = kyiv_today()
-        n = sum(int((stats_days.get((today - timedelta(days=i)).isoformat()) or {}).get("visits") or 0) for i in range(7))
+        n = sum(int((stats_days.get((today - timedelta(days=i)).isoformat()) or {}).get("visits") or 0) for i in range(ONLINE_STATS_DAYS))
         return n
     except Exception:  # noqa: BLE001
         return week_visitors()
@@ -2015,12 +2018,12 @@ VISITS_SHOW_RATIO = 1.5  # заходи показуємо, лише коли ї
 def week_lines() -> str:
     """🔥 люди за тиждень і (якщо цифра вже «жива») 👣 заходи за тиждень — окремими рядками."""
     people, visits = week_visitors(), week_visits()
-    text = f"🔥 За тиждень: <b>{people}</b> {people_word(people)}\n"
+    text = f"🔥 За місяць: <b>{people}</b> {people_word(people)}\n"
     if visits >= people * VISITS_SHOW_RATIO:
-        text += f"👣 Заходів за тиждень: <b>{visits}</b>\n"
+        text += f"👣 Заходів за місяць: <b>{visits}</b>\n"
     talk = week_talk_minutes()
     if talk >= TALK_SHOW_MIN:
-        text += f"💬 Проговорили за тиждень: <b>{talk_label(talk)}</b>\n"
+        text += f"💬 Проговорили за місяць: <b>{talk_label(talk)}</b>\n"
     return text
 
 
@@ -2030,7 +2033,7 @@ TALK_SHOW_MIN = 300  # рядок «Проговорили» з'являєтьс
 def week_talk_minutes() -> float:
     try:
         today = kyiv_today()
-        return sum(float((stats_days.get((today - timedelta(days=i)).isoformat()) or {}).get("talk_min") or 0) for i in range(7))
+        return sum(float((stats_days.get((today - timedelta(days=i)).isoformat()) or {}).get("talk_min") or 0) for i in range(ONLINE_STATS_DAYS))
     except Exception:  # noqa: BLE001
         return 0.0
 
@@ -2284,7 +2287,7 @@ async def top_publish(week: str):
             uid,
             f"🏆 <b>Ти в топі тижня!</b> {medal} місце\n\n"
             f"👍 {up} · 👎 {down} — {pct}% співрозмовників залишились задоволені.\n"
-            f"Твоя нагорода: <b>{prize}</b> + значок «🏆 Був у топі» в профілі.\n\nДякуємо, що робиш чат кращим ❤️",
+            f"Твоя нагорода: <b>{prize}</b> + значок «🏆 Був у топі» в профілі.\n\nДякуємо, що робиш чат кращим 💜",
         )
         if TOP_STICKER_FILE_ID:
             try:
@@ -2304,7 +2307,7 @@ async def top_publish(week: str):
     ]
     text = (
         "🏆 <b>Топ співрозмовників тижня</b>\n\n" + "\n".join(lines) +
-        "\n\nЇх оцінили найтепліше ❤️ Став 👍 після гарної розмови — "
+        "\n\nЇх оцінили найтепліше 💜 Став 👍 після гарної розмови — "
         "і наступного тижня тут можеш бути ти. Деталі: /best"
     )
     task = asyncio.get_running_loop().create_task(_top_broadcast(text))
@@ -2325,27 +2328,6 @@ async def top_tick():
     top_week["votes"] = {}
     top_week["pairs"] = set()
     request_save()
-
-
-def top_text(user_id: int) -> str:
-    up, down = (top_week.get("votes") or {}).get(user_id, [0, 0])
-    total = up + down
-    lines = ["🏆 <b>Топ співрозмовників тижня</b>\n",
-             "Після чату довше 1,5 хв співрозмовники ставлять 👍 або 👎. "
-             f"Щонеділі о 20:00 трійка з найбільшим відсотком 👍 (від {TOP_MIN_VOTES} оцінок) отримує нагороди:",
-             "🥇 Premium на 7 днів · 🥈🥉 Premium на 3 дні + значок «🏆 Був у топі»\n",
-             f"<b>Твій тиждень:</b> 👍 {up} · 👎 {down}"]
-    if total < TOP_MIN_VOTES:
-        lines.append(f"До участі ще {TOP_MIN_VOTES - total} {_plural(TOP_MIN_VOTES - total, 'оцінка', 'оцінки', 'оцінок')}.")
-    else:
-        place = next((i for i, t in enumerate(top_ranking(), 1) if t[0] == user_id), None)
-        lines.append(f"Зараз ти на <b>{place}</b> місці ({round(up * 100 / total)}% 👍).")
-    last = (top_week.get("history") or [None])[-1]
-    if last and last.get("winners"):
-        lines.append("\n<b>Минулого тижня:</b>")
-        for uid, _up, _down, pct, medal in last["winners"]:
-            lines.append(f"{medal} {esc(users_db.get(uid, {}).get('nickname', '?'))} — {pct}%")
-    return "\n".join(lines)
 
 
 # === КІНЕЦЬ part4.py ===
